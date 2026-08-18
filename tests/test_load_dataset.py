@@ -34,9 +34,11 @@ def test_load_csv_writes_context(tmp_path: Path) -> None:
     assert result["n_rows"] == 3
     assert result["n_cols"] == 2
     assert result["columns"] == ["episode", "success"]
+    assert result["dataset_id"] == "robot"
     # 数据写入 RunContext.df，元信息写入 RunContext.meta。
     assert ctx.df is not None
     assert ctx.df.shape == (3, 2)
+    assert ctx.dataset_id == "robot"
     assert ctx.meta["n_rows"] == 3
     assert ctx.meta["source"] == str(csv_path)
 
@@ -53,8 +55,29 @@ def test_load_parquet_writes_context(tmp_path: Path) -> None:
     assert result["success"] is True
     assert result["format"] == "parquet"
     assert result["n_rows"] == 3
+    assert result["dataset_id"] == "robot"
     assert ctx.df is not None
+    assert ctx.dataset_id == "robot"
     assert list(ctx.df.columns) == ["x", "label"]
+
+
+def test_load_replaces_previous_dataset(tmp_path: Path) -> None:
+    """新加载应覆盖旧数据集，并在返回中标注 replaced_previous。"""
+    a = tmp_path / "dataset_a.csv"
+    a.write_text("a\n1\n2\n", encoding="utf-8")
+    b = tmp_path / "dataset_b.csv"
+    b.write_text("b\nx\ny\n", encoding="utf-8")
+    ctx = RunContext()
+
+    load_dataset_impl(ctx, str(a))
+    result_b = load_dataset_impl(ctx, str(b))
+
+    # 当前只应持有 B，A 已被覆盖。
+    assert result_b["dataset_id"] == "dataset_b"
+    assert result_b["replaced_previous"] == "dataset_a"
+    assert ctx.dataset_id == "dataset_b"
+    assert list(ctx.df.columns) == ["b"]
+    assert "替换" in result_b["user_message"]
 
 
 def test_load_unsupported_format_returns_error(tmp_path: Path) -> None:
@@ -65,10 +88,14 @@ def test_load_unsupported_format_returns_error(tmp_path: Path) -> None:
     result = load_dataset_impl(ctx, str(bad))
 
     assert result["success"] is False
-    assert "error" in result
-    assert "suggestion" in result
-    assert ".csv" in result["suggestion"]
-    assert ".parquet" in result["suggestion"]
+    assert result["error"] == "unsupported_format"
+    assert "reason" in result
+    assert "user_message" in result
+    # user_message 应明确转达支持格式。
+    assert "csv" in result["user_message"]
+    assert result["supported_formats"] == [".csv", ".json", ".parquet", ".h5"]
+    # 错误返回不应附带文件内容预览。
+    assert "x" not in result
 
 
 def test_load_missing_file_returns_error(tmp_path: Path) -> None:
@@ -77,7 +104,9 @@ def test_load_missing_file_returns_error(tmp_path: Path) -> None:
     result = load_dataset_impl(ctx, str(tmp_path / "not_exist.csv"))
 
     assert result["success"] is False
-    assert "文件不存在" in result["error"]
+    assert result["error"] == "file_not_found"
+    assert "文件不存在" in result["reason"]
+    assert "user_message" in result
 
 
 def test_load_corrupted_parquet_returns_error(tmp_path: Path) -> None:
@@ -88,4 +117,5 @@ def test_load_corrupted_parquet_returns_error(tmp_path: Path) -> None:
     result = load_dataset_impl(ctx, str(bad))
 
     assert result["success"] is False
-    assert "error" in result
+    assert result["error"] == "parse_failed"
+    assert "user_message" in result

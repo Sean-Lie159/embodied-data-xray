@@ -21,7 +21,10 @@ def test_profile_data_is_registered_as_function_tool() -> None:
 
 
 def test_profile_data_returns_row_and_col_counts() -> None:
-    ctx = RunContext(df=pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]}))
+    ctx = RunContext(
+        dataset_id="robot",
+        df=pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]}),
+    )
 
     result = profile_data_impl(ctx)
 
@@ -29,6 +32,19 @@ def test_profile_data_returns_row_and_col_counts() -> None:
     assert result["n_rows"] == 3
     assert result["n_cols"] == 2
     assert [c["name"] for c in result["columns"]] == ["a", "b"]
+
+
+def test_profile_data_marks_source_dataset() -> None:
+    """profile_data 结果应带 dataset 字段，标明本次统计产自哪个数据集。"""
+    ctx = RunContext(
+        dataset_id="demo_a",
+        df=pd.DataFrame({"x": [1, 2]}),
+    )
+
+    result = profile_data_impl(ctx)
+
+    assert result["success"] is True
+    assert result["dataset"] == "demo_a"
 
 
 def test_profile_data_missing_value_stats() -> None:
@@ -76,5 +92,6 @@ def test_profile_data_unloaded_returns_guidance() -> None:
     result = profile_data_impl(ctx)
 
     assert result["success"] is False
-    assert "load_dataset" in result["suggestion"]
-    assert "尚未加载" in result["error"]
+    assert result["error"] == "no_data_loaded"
+    assert "load_dataset" in result["user_message"]
+    assert "尚未加载" in result["reason"]

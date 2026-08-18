@@ -92,7 +92,8 @@
 ### 3.4 `app/agent/` — Agent 定义与运行入口
 
 - 组装：读取 `get_settings()` → 通过 `app/llm/factory.build_model` 构建 Model → 构建 `Agent`（含 `name`、`instructions`、`model`、`tools`）。
-- 定义 `RunContext`（dataclass，位于 `app/agent/context.py`）：持有当前已加载的 `pd.DataFrame`、数据集元信息 `meta`、输出目录 `output_dir`，以及**累积各工具分析结果摘要的 `findings: list` 字段**。通过 `Runner.run(context=...)` 注入，供各工具经 `RunContextWrapper` 访问。**DataFrame 不会序列化给 LLM**。
+- 定义 `RunContext`（dataclass，位于 `app/agent/context.py`）：持有当前已加载的 `pd.DataFrame`、数据集标识 `dataset_id`、数据集元信息 `meta`、输出目录 `output_dir`，以及**累积各工具分析结果摘要的 `findings: list` 字段**。通过 `Runner.run(context=...)` 注入，供各工具经 `RunContextWrapper` 访问。**DataFrame 不会序列化给 LLM**。
+- **单数据集语义**：任一时刻 `RunContext` 只持有**一个**当前数据集，`load_dataset` 新加载会覆盖旧的 `df` / `dataset_id` / `meta`。旧数据集不再可被工具操作，其数字只能来自对话历史中工具真实返回过的结果。因此工具返回必须**自带数据来源标注**（`load_dataset` 返回 `dataset_id` 与 `replaced_previous`，`profile_data` 等分析工具返回 `dataset` 字段），避免模型把历史记忆误当当前数据。
 - `findings` 的用途：`profile_data`、`compute_stats`、`plot_chart` 等工具在产出结果时，把关键结论以简短摘要 append 到 `RunContext.findings`；`generate_report` 汇总时遍历该列表作为报告正文素材。
 - 暴露运行入口 `run_agent()`，封装 `Runner.run` / `Runner.run_streamed`，处理 `max_turns`、错误兜底。
 
@@ -202,8 +203,9 @@ def load_dataset(
         fmt: 可选，显式指定数据格式；省略时根据扩展名自动推断。
 
     Returns:
-        dict，包含成功与否、source、n_rows、n_cols、columns 列表；
-        失败时返回含 error 与建议的结构化错误信息。
+        dict，成功时含 dataset_id（当前数据集名）、source、n_rows、n_cols、
+        columns 列表、user_message；若覆盖了旧数据集还含 replaced_previous。
+        失败时返回含 error/reason/user_message 的结构化错误信息。
 
     Raises:
         不直接抛出；错误以结构化 dict 的 error 字段返回，便于 Agent 恢复。
@@ -223,8 +225,8 @@ def profile_data(
         max_unique: 每个字段最多展示的唯一值数量，防止上下文过大。
 
     Returns:
-        dict，包含行数/帧数、字段数、各列 dtype、缺失比例、唯一值数量、
-        样例值；未加载数据时返回结构化错误。
+        dict，包含 dataset（本次结果产自的数据集名）、行数/帧数、字段数、各列
+        dtype、缺失比例、唯一值数量、样例值；未加载数据时返回结构化错误。
     """
 ```
 
@@ -326,3 +328,13 @@ def generate_report(
 ---
 
 *本文档已定稿，遵循"先文档后代码"规则，按决议顺序进入编码阶段。*
+
+---
+
+## 9. 未来演进清单（暂不实现，由真实需求驱动）
+
+1. **RunContext 支持多数据集（命名管理）**：具身智能数据分析中"对比不同批次/版本
+   数据"是常见需求。若真实需求出现，将 `RunContext` 从"单数据集、覆盖式"升级为
+   "多数据集命名管理"，各工具增加 `dataset` 参数以指定操作目标。当前 MVP 阶段保持
+   单数据集 + 明确语义（数据来源自带标注）即可，等 `compute_stats`、`plot_chart`
+   稳定后再评估。

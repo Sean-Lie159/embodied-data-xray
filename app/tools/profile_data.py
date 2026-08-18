@@ -23,10 +23,11 @@ def profile_data_impl(context: RunContext, max_unique: int = 20) -> dict:
         max_unique: 每列最多展示的样例值数量，防止结果过大。
 
     Returns:
-        dict，包含 success、n_rows、n_cols，以及 columns 列表；每个元素含 name、
-        dtype、n_missing、pct_missing、n_unique、sample_values，数值列另有
-        numeric 子字典（mean/std/min/max/median）。未加载数据时返回 success=False
-        且提示先调用 load_dataset。
+        dict，包含 success、dataset（本次结果产自的数据集名）、n_rows、n_cols，
+        以及 columns 列表；每个元素含 name、dtype、n_missing、pct_missing、
+        n_unique、sample_values，数值列另有 numeric 子字典
+        （mean/std/min/max/median）。未加载数据时返回 success=False 且提示先调用
+        load_dataset。
 
     Raises:
         不直接抛出异常；错误以结构化 dict 的 error 字段返回，便于 Agent 恢复。
@@ -34,8 +35,9 @@ def profile_data_impl(context: RunContext, max_unique: int = 20) -> dict:
     if context.df is None:
         return {
             "success": False,
-            "error": "尚未加载任何数据集。",
-            "suggestion": "请先调用 load_dataset 加载数据后再执行 profile_data。",
+            "error": "no_data_loaded",
+            "reason": "尚未加载任何数据集",
+            "user_message": "尚未加载任何数据集。请先调用 load_dataset 加载数据，再执行 profile_data 分析概况。",
         }
 
     df = context.df
@@ -74,6 +76,7 @@ def profile_data_impl(context: RunContext, max_unique: int = 20) -> dict:
 
     return {
         "success": True,
+        "dataset": context.dataset_id,
         "n_rows": int(df.shape[0]),
         "n_cols": int(df.shape[1]),
         "columns": columns,

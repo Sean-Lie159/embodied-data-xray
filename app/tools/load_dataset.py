@@ -81,6 +81,36 @@ def _load_hdf5(path: str) -> pd.DataFrame:
         raise ValueError(f"无法读取 HDF5 文件：{path}（{exc}）") from exc
 
 
+def _error(
+    error: str,
+    reason: str,
+    user_message: str,
+    *,
+    supported_formats: list[str] | None = None,
+) -> dict[str, Any]:
+    """构造统一的错误返回结构。
+
+    Args:
+        error: 机器可读的错误类型标识。
+        reason: 具体原因（面向开发者/日志）。
+        user_message: 可直接转达给用户的中文说明。
+        supported_formats: 支持的格式列表（可选）。
+
+    Returns:
+        统一结构的错误 dict：success=False + error/reason/user_message。
+        错误返回**不附带文件内容预览**，避免模型把内容片段编造进回答。
+    """
+    result: dict[str, Any] = {
+        "success": False,
+        "error": error,
+        "reason": reason,
+        "user_message": user_message,
+    }
+    if supported_formats is not None:
+        result["supported_formats"] = supported_formats
+    return result
+
+
 def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) -> dict:
     """加载数据集到上下文，并返回精简元信息。
 
@@ -91,20 +121,22 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         fmt: 可选，显式指定格式（如 "csv"）；省略时根据扩展名自动推断。
 
     Returns:
-        dict，包含 success、source、format、n_rows、n_cols、columns；文件不存在
-        或格式不支持时返回 success=False 且含 error 与 suggestion 的结构化信息。
+        dict，成功时含 success=True、dataset_id、source、format、n_rows、n_cols、
+        columns、dtypes、user_message；若覆盖了旧数据集还含 replaced_previous。
+        失败时统一返回 success=False 且含 error、reason、user_message（以及可选
+        的 supported_formats）。错误返回不附带文件内容预览。
 
     Raises:
-        不直接抛出异常；错误以结构化 dict 的 error 字段返回，便于 Agent 恢复。
+        不直接抛出异常；错误以结构化 dict 返回，便于 Agent 恢复并如实转达。
     """
     source = Path(path)
 
     if not source.exists():
-        return {
-            "success": False,
-            "error": f"文件不存在：{path}",
-            "suggestion": "请确认路径正确。",
-        }
+        return _error(
+            "file_not_found",
+            f"文件不存在：{path}",
+            f"文件 {path} 不存在，请检查路径是否正确。",
+        )
 
     # 解析格式：优先显式 fmt，否则按扩展名推断。
     if fmt:
@@ -114,13 +146,15 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
     else:
         ext = source.suffix.lower()
 
+    supported = list(_SUPPORTED_FORMATS.keys())
     if ext not in _SUPPORTED_FORMATS:
-        supported = "、".join(_SUPPORTED_FORMATS)
-        return {
-            "success": False,
-            "error": f"暂不支持格式 {ext}（或文件 {path} 无扩展名）。",
-            "suggestion": f"支持格式：{supported}。",
-        }
+        fmt_names = "、".join(supported)
+        return _error(
+            "unsupported_format",
+            f"暂不支持格式 {ext}",
+            f"暂不支持 {ext} 格式，目前支持：{fmt_names}。请提供其中一种格式的文件路径。",
+            supported_formats=supported,
+        )
 
     try:
         if ext == ".csv":
@@ -134,14 +168,19 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         else:  # pragma: no cover - 防御性分支
             raise ValueError(f"未实现格式：{ext}")
     except Exception as exc:  # noqa: BLE001
-        return {
-            "success": False,
-            "error": f"解析文件失败：{path}（{exc}）",
-            "suggestion": "请确认文件内容与格式匹配且未损坏。",
-        }
+        return _error(
+            "parse_failed",
+            f"解析文件失败：{path}（{exc}）",
+            f"文件 {path} 解析失败，可能不是有效的 {ext.lstrip('.')} 数据，或文件已损坏。",
+            supported_formats=supported,
+        )
 
-    # 写入上下文：数据本体与元信息分离，元信息用于后续工具按需查询。
+    # 单数据集语义：记录被替换的旧数据集，再覆盖 df / dataset_id / meta。
+    replaced = context.dataset_id
+    dataset_id = source.stem
+
     context.df = df
+    context.dataset_id = dataset_id
     meta: dict[str, Any] = {
         "source": path,
         "format": ext.lstrip("."),
@@ -152,7 +191,21 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
     }
     context.meta = meta
 
-    return {"success": True, **meta}
+    result: dict[str, Any] = {
+        "success": True,
+        "dataset_id": dataset_id,
+        **meta,
+    }
+    # 若覆盖了旧数据集，明确标注，避免模型误以为新旧数据集同时可分析。
+    if replaced is not None:
+        result["replaced_previous"] = replaced
+        result["user_message"] = (
+            f"已加载数据集 {dataset_id}，并替换先前加载的 {replaced}。"
+            "当前仅可分析本数据集。"
+        )
+    else:
+        result["user_message"] = f"已加载数据集 {dataset_id}，当前可对其进行分析。"
+    return result
 
 
 @tool
