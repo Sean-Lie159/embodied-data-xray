@@ -1,0 +1,13 @@
+# 密钥与环境
+.env
+# 参考项目不进仓库
+reference/
+# 数据不进仓库
+data/
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# 系统
+.DS_Store

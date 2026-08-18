@@ -1,0 +1,10 @@
+openai-agents
+openai
+pydantic-settings
+pandas
+numpy
+pyarrow
+h5py
+matplotlib
+streamlit
+pytest
