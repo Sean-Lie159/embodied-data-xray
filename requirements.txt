@@ -6,5 +6,6 @@ numpy
 pyarrow
 h5py
 matplotlib
+plotly
 streamlit
 pytest
