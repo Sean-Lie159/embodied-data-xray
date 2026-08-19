@@ -113,8 +113,33 @@ async def run_turn(
     return final, next_input, result
 
 
+def _extract_tool_name(item: Any) -> str:
+    """宽容提取工具调用名，失败时降级为原始类型名。
+
+    Args:
+        item: 单个 RunResult item。
+
+    Returns:
+        工具名；无法提取时返回 item 的类型名（不静默丢弃）。
+    """
+    for attr in ("name", "tool_name", "function_name", "call_id"):
+        value = getattr(item, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # 尝试从原始字段提取。
+    raw = getattr(item, "raw_item", None)
+    if isinstance(raw, dict):
+        name = raw.get("name") or raw.get("tool_name") or raw.get("function")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return f"<{type(item).__name__}>"
+
+
 def format_tool_activity(result: RunResult | None) -> str:
     """从 RunResult 中提取工具调用过程，格式化为可读文本。
+
+    按类型宽容提取：只对工具调用类 item（type 含 tool_call 或类名含 ToolCall）
+    提取工具名；提取失败时降级显示原始类型名，而不是静默丢弃。
 
     Args:
         result: 单轮运行的完整结果；为 None 时返回空字符串。
@@ -126,7 +151,15 @@ def format_tool_activity(result: RunResult | None) -> str:
         return ""
     lines: list[str] = []
     for item in result.new_items:
-        if getattr(item, "type", None) == "tool_call_item":
-            name = getattr(item, "name", None) or getattr(item, "tool_name", None) or "?"
-            lines.append(f"调用工具: {name}")
+        item_type = getattr(item, "type", "") or ""
+        class_name = type(item).__name__.lower()
+        is_tool_call = (
+            "tool_call" in item_type.lower()
+            or "toolcall" in class_name
+            or "function_call" in item_type.lower()
+        )
+        if not is_tool_call:
+            continue
+        name = _extract_tool_name(item)
+        lines.append(f"调用工具: {name}")
     return " → ".join(lines)
