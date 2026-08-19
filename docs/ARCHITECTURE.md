@@ -350,6 +350,16 @@ def inspect_streams(
     """
 ```
 
+> **流登记表与按需读取（2026-08-19 更新）**：`load_dataset` 目录加载时会建立
+> 流登记表 `RunContext.meta["streams"]`（每条流含 {path, format, kind, channels,
+> role}）。`inspect_streams` 基于该登记表**按需读取**各流时间戳列实测采样率
+> （csv 用 usecols、parquet 用 pyarrow 列裁剪），计算后立即释放，**不装入
+> RunContext.df**（df 仍只装单主表）。实测结果回写
+> `meta["streams"][i]["measured_rate"]` 缓存，重复调用不重复读盘。单条流读取
+> 失败（文件缺失/格式损坏/无时间戳列）时该流标 unknown 并注明原因，不影响其他流。
+> 角色判断（`infer_role`）收集全部命中语义线索并组合输出（如 `left_wrist_cam` →
+> "腕部相机（左）"），无命中时标 unknown。
+
 ```python
 # app/tools/check_temporal_sync.py   【质检层】时间同步检查
 @tool
