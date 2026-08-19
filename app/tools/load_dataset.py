@@ -198,7 +198,12 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             continue
         sniff = _sniffing.sniff_table_columns(cols)
         table_sniffs.append(sniff)
-        table_info.append({"file": p.name, "columns": cols[:20], "sniff": sniff})
+        table_info.append({
+            "file": str(p),  # 完整路径，供流登记表按需定位
+            "name": p.name,
+            "columns": cols[:20],
+            "sniff": sniff,
+        })
         # 选择第一个有内容的表格作为主表（记录但不整表读入，除非是主表）。
         if main_table is None:
             main_table_path = p_str
@@ -252,6 +257,9 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         "guessed_type_confidence": caps_result["guessed_type_confidence"],
         "video_files": video_files,
         "video_meta": video_meta,
+        # 流登记表：每条流含 {path, format, kind, channels, role}，供
+        # inspect_streams 按需读取时间戳实测采样率。
+        "streams": _sniffing.build_streams_registry(probe, table_info, video_meta),
     }
     context.meta = meta
     context.dataset_id = dataset_id

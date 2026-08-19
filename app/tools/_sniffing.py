@@ -180,11 +180,23 @@ def sniff_table_columns(columns: list[str]) -> dict[str, Any]:
         "columns": action_cols,
     }
 
+    # 力/力矩通道推断（force / torque / ft / force_torque）。
+    force_cols = [
+        c for c in cols
+        if any(k in c for k in ("force", "torque", "ft_", "force_torque", "_ft", "fx", "fy", "fz", "tx", "ty", "tz"))
+    ]
+    force: dict[str, Any] = {
+        "present": bool(force_cols),
+        "confidence": "high" if any(("force" in c or "torque" in c) for c in force_cols) else "low",
+        "columns": force_cols,
+    }
+
     return {
         "has_imu": imu,
         "imu_axes": imu_axes,
         "has_pose": pose,
         "has_actions": actions,
+        "has_force": force,
         "matched_keywords": joined[:200],
     }
 
@@ -297,16 +309,28 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
 
     pose_present = any(s["has_pose"]["present"] for s in table_sniffs)
     actions_present = any(s["has_actions"]["present"] for s in table_sniffs)
+    force_present = any(s["has_force"]["present"] for s in table_sniffs)
+
+    # 汇总命中列名清单（供 inspect_streams 复用，不重复嗅探）。
+    imu_channels = sorted({c for s in table_sniffs for c in s["has_imu"]["columns"]})
+    action_channels = sorted({c for s in table_sniffs for c in s["has_actions"]["columns"]})
+    force_channels = sorted({c for s in table_sniffs for c in s["has_force"]["columns"]})
 
     capabilities: dict[str, Any] = {
         "has_video_streams": has_video,
         "has_imu": imu_present,
-        "has_force": False,  # 力觉需特定列，MVP 暂缺省
+        "has_force": force_present,
         "has_calibration": len(probe["sample_calibs"]) > 0,
         "has_actions": actions_present,
     }
     if imu_axes is not None:
         capabilities["imu_axes"] = imu_axes
+    if imu_channels:
+        capabilities["imu_channels"] = imu_channels
+    if action_channels:
+        capabilities["action_channels"] = action_channels
+    if force_channels:
+        capabilities["force_channels"] = force_channels
 
     # 推测类型：综合判断。
     guessed_type = "unknown"
@@ -328,3 +352,170 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
         "guessed_type_confidence": conf,
         "imu_confidence": imu_conf,
     }
+
+
+# 角色推断：触发词 → 角色名 + 基准置信度。
+# 注意：触发词应为足够长的词元，避免短子串误命中（如 "ft" 会命中 "left"）。
+# 方位词（left/right/front 等）由 _POSITION_WORDS 单独处理，不在此作为独立角色。
+_ROLE_PATTERNS: list[tuple[tuple[str, ...], str, float]] = [
+    (("wrist", "wristcam"), "腕部相机", 0.8),
+    (("head", "headcam", "eye"), "头部相机", 0.7),
+    (("rgb", "camera"), "RGB 相机", 0.6),
+    (("imu",), "IMU 传感器", 0.8),
+    (("force", "force_torque", "ft_sensor", "wrench", "torque"), "力/力矩传感器", 0.8),
+    (("action", "qpos", "qvel", "state", "obs"), "状态/动作流", 0.7),
+]
+
+# 方位修饰词：识别后作为角色后缀（如"腕部相机（左）"）。
+_POSITION_WORDS = {
+    "left": "左",
+    "right": "右",
+    "front": "前",
+    "back": "后",
+    "top": "上",
+    "bottom": "下",
+}
+
+
+def infer_role(source: str) -> dict[str, Any]:
+    """从文件名/路径推测设备角色，收集全部命中语义线索并组合输出。
+
+    与嗅探的置信度标注保持一致：角色为推测，附带依据（命中的关键词）与
+    confidence（high / low）。无命中时保持 unknown。
+
+    Args:
+        source: 文件路径或名称。
+
+    Returns:
+        dict，含 role（推测角色，可组合如"腕部相机（左）"）、confidence
+        （high/low）、evidence（命中的语义线索）。
+    """
+    name = Path(source).name.lower()
+
+    # 方位词单独收集（left/right/front/back/top/bottom）。
+    positions = [zh for en, zh in _POSITION_WORDS.items() if en in name]
+    positions = list(dict.fromkeys(positions))  # 去重保序
+
+    # 角色触发词收集（词元子串，但触发词本身足够长，避免短子串误命中）。
+    hits: list[tuple[str, float, str]] = []  # (角色, 置信度, 命中词)
+    for keys, role, conf in _ROLE_PATTERNS:
+        for k in keys:
+            if k in name and role not in [h[0] for h in hits]:
+                hits.append((role, conf, k))
+
+    if not hits and not positions:
+        return {
+            "role": "unknown",
+            "confidence": "low",
+            "evidence": "文件名无可识别模式",
+        }
+
+    # 主角色取置信度最高的命中；方位词作为后缀修饰。
+    hits.sort(key=lambda h: -h[1])
+    main_role, main_conf, main_word = hits[0]
+    pos_suffix = f"（{'、'.join(positions)}）" if positions else ""
+    role = f"{main_role}{pos_suffix}"
+
+    evidence_parts = [f"命中 {h[2]}" for h in hits]
+    if positions:
+        evidence_parts.append("方位词 " + "、".join(positions))
+    return {
+        "role": role,
+        "confidence": "high" if main_conf >= 0.75 else "low",
+        "evidence": "；".join(evidence_parts),
+    }
+
+
+_KIND_ROLE = {
+    "imu": "IMU 传感器",
+    "force": "力/力矩传感器",
+    "actions": "状态/动作流",
+    "pose": "位姿流",
+}
+
+
+def _role_for_kind(kind: str, path: str) -> dict[str, Any]:
+    """根据流的 kind 给出明确角色，并附加文件名方位词。
+
+    表格流的 kind 由列名嗅探确定（比文件名更可信），因此优先使用 kind 对应的
+    角色，避免 "wrist_imu" 这类命名被误判为"腕部相机"。
+
+    Args:
+        kind: 流类型（imu/force/actions/pose/unknown/video）。
+        path: 文件路径（用于提取方位修饰词）。
+
+    Returns:
+        角色 dict（role / confidence / evidence）。
+    """
+    if kind in _KIND_ROLE:
+        # 提取文件名中的方位词作为修饰（如"IMU 传感器（左）"）。
+        name = Path(path).name.lower()
+        positions = [zh for en, zh in _POSITION_WORDS.items() if en in name]
+        pos_suffix = f"（{'、'.join(dict.fromkeys(positions))}）" if positions else ""
+        return {
+            "role": f"{_KIND_ROLE[kind]}{pos_suffix}",
+            "confidence": "high",
+            "evidence": f"列名嗅探判定为 {kind}",
+        }
+    # 未知或视频流：退回文件名角色推断。
+    return infer_role(path)
+
+
+def build_streams_registry(
+    probe: dict[str, Any],
+    table_info: list[dict[str, Any]],
+    video_meta: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """构建流登记表（供 inspect_streams 按需读取）。
+
+    每条流含 {path, format, kind, channels, role}。表格流按列名嗅探的命中结果
+    归入对应 kind（imu/force/actions/pose/unknown）；视频流标记 kind="video"。
+
+    Args:
+        probe: probe_directory 的结果。
+        table_info: 表格嗅探信息列表（含 file 与 sniff）。
+        video_meta: 视频元数据列表。
+
+    Returns:
+        流登记表列表。
+    """
+    streams: list[dict[str, Any]] = []
+
+    # 表格流：根据嗅探结果判断 kind 与通道。
+    for t in table_info:
+        path = t["file"]
+        sniff = t["sniff"]
+        kind = "unknown"
+        channels: list[str] = []
+        if sniff["has_imu"]["present"]:
+            kind = "imu"
+            channels = sniff["has_imu"]["columns"]
+        elif sniff["has_force"]["present"]:
+            kind = "force"
+            channels = sniff["has_force"]["columns"]
+        elif sniff["has_actions"]["present"]:
+            kind = "actions"
+            channels = sniff["has_actions"]["columns"]
+        elif sniff["has_pose"]["present"]:
+            kind = "pose"
+            channels = sniff["has_pose"]["columns"]
+        streams.append({
+            "path": path,
+            "format": Path(path).suffix.lstrip(".").lower(),
+            "kind": kind,
+            "channels": channels,
+            "role": _role_for_kind(kind, path),
+        })
+
+    # 视频流。
+    for v in video_meta:
+        path = v.get("file", "unknown")
+        streams.append({
+            "path": path,
+            "format": "video",
+            "kind": "video",
+            "channels": [],
+            "role": infer_role(path),
+        })
+
+    return streams
