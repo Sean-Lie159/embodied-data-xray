@@ -381,6 +381,12 @@ def check_temporal_sync(
     """
 ```
 
+> **v1 范围说明（2026-08-19 更新）**：`check_temporal_sync` v1 仅做**可对齐的表格流**
+> 之间的时间戳一致性检查。**视频流不参与 v1 帧级对齐**（容器时间戳不可靠，内容级
+> 对齐属 v2），因此视频流不计入"可对齐流数"；纯视频数据集返回"不适用"。返回中
+> `streams_status` 逐条标注各流"参与对齐 / 未参与 + 原因"；因缺信息跳过的检查以
+> `status: "skipped" + reason` 独立呈现，不计入判定依据。
+
 ```python
 # app/tools/check_sensor_sanity.py   【质检层】传感器数据合理性
 @tool

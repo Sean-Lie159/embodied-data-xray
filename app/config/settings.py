@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     max_rows_in_context: int = 200
     max_turns: int = 15
 
+    # --- 质检阈值（check_temporal_sync / check_sensor_sanity 可调阈值）--------
+    # 丢帧率触发 fail 的阈值（0.02 = 2%）。
+    sync_frame_loss_ratio: float = Field(default=0.02, ge=0.0, le=1.0)
+    # 各流时间戳最大允许偏差（毫秒）。
+    sync_max_skew_ms: float = Field(default=10.0, ge=0.0)
+    # 漂移检测的窗口数（把每个 episode 按时间切为若干窗口）。
+    sync_drift_windows: int = Field(default=10, ge=1)
+    # 漂移判定斜率阈值（ms/s）：窗口残差偏移线性拟合斜率超过则判 fail。
+    sync_drift_slope_ms_per_s: float = Field(default=0.5, ge=0.0)
+    # pass 残差阈值：最高帧率流采样间隔的比例（0.5 = 采样间隔的一半）。
+    sync_residual_ratio: float = Field(default=0.5, ge=0.0)
+
     @model_validator(mode="after")
     def _validate_required(self) -> Settings:
         """校验必须的模型配置是否齐全，缺失时给出中文报错。"""
