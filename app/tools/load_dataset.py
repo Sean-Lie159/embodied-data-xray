@@ -1,22 +1,28 @@
 """数据集加载工具。
 
-接收文件路径，按扩展名分发到对应的 pandas 读取器（第一批支持 .csv / .json /
-.parquet / .h5），加载结果写入 ``RunContext.df``，元信息写入
-``RunContext.meta``，并返回精简的元信息 dict（不返回数据本体）。不支持的格式
-返回结构化错误并列出支持的格式。
+支持两种输入：
+1. **单文件**：按扩展名分发到 pandas 读取器（csv / json / parquet / h5）；
+2. **目录**：递归文件普查 + 能力嗅探（表格列名推断、json/yaml 标定检测、视频
+   ffprobe 元数据），生成能力标签与推测类型，写入 ``RunContext.meta``。
+
+加载结果写入 ``RunContext.df``，元信息写入 ``RunContext.meta``，返回精简的元信息
+dict（不返回数据本体）。目录加载时不把整个数据集读入内存，视频等大文件只记录路径。
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import yaml
 
 from agents import RunContextWrapper
 from agents.decorators import tool
 
 from app.agent.context import RunContext
+from app.tools import _sniffing
 
 # 本工具支持的扩展名 → 说明。
 _SUPPORTED_FORMATS: dict[str, str] = {
@@ -111,20 +117,191 @@ def _error(
     return result
 
 
+def _read_table_columns(path: Path) -> list[str] | None:
+    """只读表格列名（不读全量数据），用于嗅探。
+
+    Args:
+        path: 表格文件路径。
+
+    Returns:
+        列名列表；读取失败返回 None。
+    """
+    try:
+        ext = path.suffix.lower()
+        if ext == ".csv":
+            df = pd.read_csv(
+                path,
+                encoding=_detect_encoding(path.read_bytes()),
+                nrows=0,
+                engine="python",
+            )
+            return [str(c) for c in df.columns]
+        if ext == ".parquet":
+            df = pd.read_parquet(path, columns=None)
+            return [str(c) for c in df.columns[:50]]
+        if ext == ".json":
+            with open(path, encoding=_detect_encoding(path.read_bytes())) as f:
+                obj = json.load(f)
+            if isinstance(obj, dict) and "columns" in obj:
+                return [str(c) for c in obj["columns"]]
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                return [str(c) for c in obj[0].keys()]
+            return []
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_calibration(path: Path) -> Any:
+    """解析 json/yaml 标定候选文件。
+
+    Args:
+        path: 文件路径。
+
+    Returns:
+        解析后的对象；失败返回 None。
+    """
+    try:
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            with open(path, encoding="utf-8") as f:
+                return yaml.safe_load(f)
+        if path.suffix.lower() == ".json":
+            with open(path, encoding=_detect_encoding(path.read_bytes())) as f:
+                return json.load(f)
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
+    """目录加载：文件普查 + 能力嗅探，返回精简摘要。
+
+    Args:
+        context: 运行时上下文（写入 capabilities / guessed_type / df / meta）。
+        dir_path: 数据集目录。
+
+    Returns:
+        dict，含 success、dataset_id、file_survey（普查摘要）、capabilities、
+        guessed_type、video_files、table_info、user_message。
+    """
+    probe = _sniffing.probe_directory(dir_path)
+
+    # 表格列名嗅探。
+    table_sniffs: list[dict[str, Any]] = []
+    main_table: pd.DataFrame | None = None
+    main_table_path: str | None = None
+    table_info: list[dict[str, Any]] = []
+    for p_str in probe["sample_tables"]:
+        p = Path(p_str)
+        cols = _read_table_columns(p)
+        if cols is None:
+            continue
+        sniff = _sniffing.sniff_table_columns(cols)
+        table_sniffs.append(sniff)
+        table_info.append({"file": p.name, "columns": cols[:20], "sniff": sniff})
+        # 选择第一个有内容的表格作为主表（记录但不整表读入，除非是主表）。
+        if main_table is None:
+            main_table_path = p_str
+
+    # 若存在主表格且数据量不大，装载其头部作为 df 的轻量代表。
+    if main_table_path is not None:
+        try:
+            ext = Path(main_table_path).suffix.lower()
+            if ext == ".csv":
+                main_table = _load_csv(main_table_path)
+            elif ext == ".parquet":
+                main_table = pd.read_parquet(main_table_path)
+            elif ext == ".json":
+                main_table = pd.read_json(main_table_path)
+            # 仅保留前 max_rows_in_context 行，避免大表塞入内存。
+            cap_rows = getattr(context, "max_rows_in_context", 200)
+            if main_table is not None and len(main_table) > cap_rows:
+                main_table = main_table.head(cap_rows).copy()
+        except Exception:  # noqa: BLE001
+            main_table = None
+
+    # 标定检测。
+    calib_detected = False
+    for p_str in probe["sample_calibs"]:
+        obj = _parse_calibration(Path(p_str))
+        if _sniffing.is_calibration_file(obj):
+            calib_detected = True
+            break
+
+    # 视频嗅探（ffprobe，可降级）。
+    video_files: list[str] = []
+    video_meta: list[dict[str, Any]] = []
+    ffprobe_degraded: str | None = None
+    for p_str in probe["sample_videos"]:
+        video_files.append(p_str)
+        meta = _sniffing.probe_video(p_str)
+        if not meta.get("ffprobe_available", True):
+            ffprobe_degraded = meta.get("user_message")
+        video_meta.append({"file": Path(p_str).name, **meta})
+
+    caps_result = _sniffing.build_capabilities(probe, table_sniffs)
+    caps_result["capabilities"]["has_calibration"] = calib_detected
+
+    # 记录视频路径清单与元数据（不读入内存）。
+    dataset_id = dir_path.name
+    meta: dict[str, Any] = {
+        "source": str(dir_path),
+        "kind": "directory",
+        "capabilities": caps_result["capabilities"],
+        "guessed_type": caps_result["guessed_type"],
+        "guessed_type_confidence": caps_result["guessed_type_confidence"],
+        "video_files": video_files,
+        "video_meta": video_meta,
+    }
+    context.meta = meta
+    context.dataset_id = dataset_id
+    context.df = main_table
+
+    result: dict[str, Any] = {
+        "success": True,
+        "dataset_id": dataset_id,
+        "kind": "directory",
+        "file_survey": {
+            "total_files": probe["total_files"],
+            "ext_dist": probe["ext_dist"],
+            "subdirs": probe["subdirs"][:20],
+        },
+        "capabilities": caps_result["capabilities"],
+        "guessed_type": caps_result["guessed_type"],
+        "guessed_type_confidence": caps_result["guessed_type_confidence"],
+        "video_files": video_files,
+        "video_meta": video_meta,
+        "table_info": table_info,
+    }
+    if main_table is not None:
+        result["main_table"] = {
+            "file": main_table_path,
+            "n_rows": int(main_table.shape[0]),
+            "n_cols": int(main_table.shape[1]),
+        }
+    if ffprobe_degraded:
+        result["ffprobe_degraded"] = ffprobe_degraded
+    result["user_message"] = (
+        f"已探测数据集目录 {dataset_id}：{probe['total_files']} 个文件，"
+        f"推测类型 {caps_result['guessed_type']}。"
+        + (f" {ffprobe_degraded}" if ffprobe_degraded else "")
+    )
+    return result
+
+
 def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) -> dict:
     """加载数据集到上下文，并返回精简元信息。
 
     Args:
         context: 运行时上下文，加载成功的 DataFrame 会写入 context.df，元信息
             写入 context.meta。
-        path: 数据集路径，支持 .csv / .json / .parquet / .h5。
+        path: 数据集路径，支持单文件（.csv/.json/.parquet/.h5）或目录。
         fmt: 可选，显式指定格式（如 "csv"）；省略时根据扩展名自动推断。
 
     Returns:
-        dict，成功时含 success=True、dataset_id、source、format、n_rows、n_cols、
-        columns、dtypes、user_message；若覆盖了旧数据集还含 replaced_previous。
-        失败时统一返回 success=False 且含 error、reason、user_message（以及可选
-        的 supported_formats）。错误返回不附带文件内容预览。
+        dict，成功时含 success=True、dataset_id、source 及元信息；失败时统一
+        返回 success=False 且含 error、reason、user_message（以及可选的
+        supported_formats）。错误返回不附带文件内容预览。
 
     Raises:
         不直接抛出异常；错误以结构化 dict 返回，便于 Agent 恢复并如实转达。
@@ -137,6 +314,16 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
             f"文件不存在：{path}",
             f"文件 {path} 不存在，请检查路径是否正确。",
         )
+
+    # 目录输入：走文件普查与能力嗅探。
+    if source.is_dir():
+        replaced = context.dataset_id
+        result = _load_directory_impl(context, source)
+        if result.get("success"):
+            if replaced is not None:
+                result["replaced_previous"] = replaced
+                result["user_message"] += f"（替换先前加载的 {replaced}）"
+        return result
 
     # 解析格式：优先显式 fmt，否则按扩展名推断。
     if fmt:
@@ -216,15 +403,19 @@ def load_dataset(
 ) -> dict:
     """加载数据集到当前会话，返回元信息。
 
-    读取指定文件并按格式写入会话上下文，供后续统计与可视化工具使用。支持
-    .csv / .json / .parquet / .h5。
+    支持两种输入：
+    - 单文件：按格式读取（.csv / .json / .parquet / .h5）；
+    - 目录：递归文件普查 + 能力嗅探，生成能力标签与推测类型（不整表读入内存，
+      视频等大文件仅记录路径清单；若 ffprobe 不可用则跳过视频嗅探并提示）。
 
     Args:
-        path: 数据集路径。
-        fmt: 可选，显式指定格式（如 "csv"）；省略时按扩展名推断。
+        path: 数据集路径（文件或目录）。
+        fmt: 可选，单文件时显式指定格式（如 "csv"）；省略时按扩展名推断。
 
     Returns:
-        dict，包含 success、source、format、n_rows、n_cols、columns；失败时
-        返回 success=False 且含 error 与 suggestion。
+        dict，单文件含 success、dataset_id、source、format、n_rows、n_cols、
+        columns；目录含 success、dataset_id、file_survey、capabilities、
+        guessed_type、video_files；失败时返回 success=False 且含 error 与
+        user_message。
     """
     return load_dataset_impl(wrapper.context, path, fmt)

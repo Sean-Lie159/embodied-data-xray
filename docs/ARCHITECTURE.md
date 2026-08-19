@@ -1,6 +1,6 @@
 # 具身智能数据分析 Agent — 系统架构设计
 
-> 版本：v1.0（定稿，经用户确认）
+> 版本：v1.1（2026-08-19 更新工具层结构，经用户确认）
 > 关联文件：`AGENTS.md`（行为准则）、`README.md`（使用说明）
 > 技术栈（不可变更）：Python 3.12 / openai-agents / pandas / numpy / pyarrow / h5py / matplotlib / plotly / Streamlit / pytest
 
@@ -48,8 +48,8 @@
         ▼                       ▼                       ▼
 ┌───────────────┐      ┌────────────────┐      ┌────────────────┐
 │   app/tools/   │      │    app/llm/     │      │   app/config/   │
-│   Agent 的"手"  │      │  单一工厂函数     │      │ pydantic-settings│
-│  5 个领域工具   │      │  构造 Model      │      │ 从 .env 读密钥   │
+│ 质检层 + 统计层  │      │  单一工厂函数     │      │ pydantic-settings│
+│ 能力标签驱动    │      │  构造 Model      │      │ 从 .env 读密钥   │
 └───────────────┘      └────────────────┘      └────────────────┘
 ```
 
@@ -75,6 +75,17 @@
 | `max_rows_in_context` | 注入到 LLM 上下文的最大样本行数（默认如 200） |
 | `max_turns` | Agent 单次运行最大循环轮数（防死循环，默认 15） |
 
+**质检阈值配置**（质检工具判定 pass/warn/fail 的可调阈值，集中在此，便于按数据集类型调整）：
+
+| 配置项 | 说明 | 默认建议 |
+|---|---|---|
+| `sync.max_skew_ms` | 各流时间戳最大允许偏差（超过则 fail） | 10.0 |
+| `sync.max_drift_ppm` | 允许的时钟漂移率（ppm） | 1000 |
+| `sensor.missing_ratio_warn` | 传感器缺失率触发 warn 的阈值 | 0.05 |
+| `sensor.missing_ratio_fail` | 传感器缺失率触发 fail 的阈值 | 0.20 |
+| `sensor.outlier_zscore` | 传感器离群判定的 z-score 阈值 | 5.0 |
+| `sensor.silent_ms` | 判定"静默段"的最小持续时长 | 500 |
+
 参考实现要点（来自 csv-ai）：`Settings(BaseSettings)` + `SettingsConfigDict(env_file=".env", extra="ignore")` + `@lru_cache get_settings()`。
 
 ### 3.2 `app/llm/` — 模型接口层（单一工厂函数）
@@ -87,12 +98,19 @@
 
 ### 3.3 `app/tools/` — 领域工具（Agent 的"手"）
 
-每个工具一个模块，是**普通、带类型标注、可独立运行和测试**的 Python 函数，用 `@tool` 装饰器注册给 Agent。第一批 5 个工具在 §6 详细设计。工具只对 DataFrame / 元信息操作，返回**精简结果**（统计值、摘要、图表文件路径），绝不把整个 DataFrame 塞进对话上下文。
+每个工具一个模块，是**普通、带类型标注、可独立运行和测试**的 Python 函数，用 `@tool` 装饰器注册给 Agent。工具只对 DataFrame / 元信息操作，返回**精简结果**（统计值、判定、图表文件路径），绝不把整个 DataFrame 塞进对话上下文。
+
+工具层按职责分**两层**：
+
+- **质检层**（面向原始采集数据的"流"）：`inspect_streams`、`check_temporal_sync`、`check_sensor_sanity`。面向原始信号流（传感器/视频时间戳、IMU/力觉等），关注数据采集质量与时间同步，产出结构化判定（pass/warn/fail）。
+- **统计层**（面向状态/动作数据表）：`compute_stats` 职责收窄为**任务级统计**（成功率、轨迹长度、episode 分布等，作用在已规整为表的维度），不再承担传感器级信号检查。
+
+每个工具声明**前置条件**（`requires`，基于数据集能力标签）。能力标签不满足时返回结构化"不适用"结果，并推荐该数据集可用的分析，而不是抛异常或硬跑出无意义结果。
 
 ### 3.4 `app/agent/` — Agent 定义与运行入口
 
 - 组装：读取 `get_settings()` → 通过 `app/llm/factory.build_model` 构建 Model → 构建 `Agent`（含 `name`、`instructions`、`model`、`tools`）。
-- 定义 `RunContext`（dataclass，位于 `app/agent/context.py`）：持有当前已加载的 `pd.DataFrame`、数据集标识 `dataset_id`、数据集元信息 `meta`、输出目录 `output_dir`，以及**累积各工具分析结果摘要的 `findings: list` 字段**。通过 `Runner.run(context=...)` 注入，供各工具经 `RunContextWrapper` 访问。**DataFrame 不会序列化给 LLM**。
+- 定义 `RunContext`（dataclass，位于 `app/agent/context.py`）：持有当前已加载的 `pd.DataFrame`、数据集标识 `dataset_id`、数据集元信息 `meta`（含**能力标签 `capabilities`** 与 **推测类型名 `guessed_type` / 置信度**）、输出目录 `output_dir`，以及**累积各工具分析结果摘要的 `findings: list` 字段**。通过 `Runner.run(context=...)` 注入，供各工具经 `RunContextWrapper` 访问。**DataFrame 不会序列化给 LLM**。
 - **单数据集语义**：任一时刻 `RunContext` 只持有**一个**当前数据集，`load_dataset` 新加载会覆盖旧的 `df` / `dataset_id` / `meta`。旧数据集不再可被工具操作，其数字只能来自对话历史中工具真实返回过的结果。因此工具返回必须**自带数据来源标注**（`load_dataset` 返回 `dataset_id` 与 `replaced_previous`，`profile_data` 等分析工具返回 `dataset` 字段），避免模型把历史记忆误当当前数据。
 - `findings` 的用途：`profile_data`、`compute_stats`、`plot_chart` 等工具在产出结果时，把关键结论以简短摘要 append 到 `RunContext.findings`；`generate_report` 汇总时遍历该列表作为报告正文素材。
 - 暴露运行入口 `run_agent()`，封装 `Runner.run` / `Runner.run_streamed`，处理 `max_turns`、错误兜底。
@@ -175,7 +193,37 @@ DeepSeek / Kimi / OpenAI 均走 OpenAI 兼容的 `OpenAIChatCompletionsModel` + 
 
 ---
 
-## 6. 第一批工具的函数签名设计
+## 6. 工具层设计
+
+### 6.0 能力标签与前置条件机制
+
+**数据类型不做硬编码枚举**。Ego / UMI / 遥操 / 动捕等类型的组合会持续膨胀，穷举枚举不可维护。改为：`load_dataset` 加载时**嗅探**数据结构，在 `RunContext.meta` 记录能力标签，并给出**推测类型名（含置信度）**，供模型与工具决策。
+
+**能力标签**（`RunContext.meta.capabilities`，布尔或枚举）示例：
+
+| 能力标签 | 含义 |
+|---|---|
+| `has_video_streams` | 含视频/图像流（各摄像头） |
+| `has_imu` | 含 IMU 数据 |
+| `imu_axes` | IMU 轴数（如 3/6/9），无 IMU 时缺省 |
+| `has_force` | 含力觉/力矩数据 |
+| `has_calibration` | 含相机/手眼标定信息 |
+| `has_actions` | 含动作指令/控制信号 |
+| `action_space` | 动作空间描述（如 joint / ee / cartesian） |
+
+**推测类型名**（`RunContext.meta.guessed_type`）：如 `"Ego"` / `"UMI"` / `"遥操"` / `"动捕"` 或 `"unknown"`，并附 `guessed_type_confidence`（0~1）。类型名仅供交互提示，**不作为逻辑分支依据**——逻辑只依赖能力标签。
+
+**前置条件（requires）**：每个工具声明其所需能力标签。入口处校验，不满足时返回结构化"不适用"结果：
+
+```python
+{
+  "success": False,
+  "error": "not_applicable",
+  "reason": "缺少能力标签 has_imu",
+  "user_message": "当前数据集不含 IMU 数据，check_sensor_sanity 不适用。",
+  "suggested_tools": ["inspect_streams", "compute_stats"]   # 推荐该数据集可用的分析
+}
+```
 
 统一约定：
 
@@ -204,8 +252,10 @@ def load_dataset(
 
     Returns:
         dict，成功时含 dataset_id（当前数据集名）、source、n_rows、n_cols、
-        columns 列表、user_message；若覆盖了旧数据集还含 replaced_previous。
-        失败时返回含 error/reason/user_message 的结构化错误信息。
+        columns 列表、capabilities（能力标签字典，如 has_imu / has_video_streams
+        / imu_axes / action_space 等）、guessed_type（推测类型名）与
+        guessed_type_confidence（0~1）、user_message；若覆盖了旧数据集还含
+        replaced_previous。失败时返回含 error/reason/user_message 的结构化错误。
 
     Raises:
         不直接抛出；错误以结构化 dict 的 error 字段返回，便于 Agent 恢复。
@@ -231,22 +281,112 @@ def profile_data(
 ```
 
 ```python
-# app/tools/compute_stats.py
+# app/tools/compute_stats.py   【统计层】职责收窄为任务级统计
 @tool
 def compute_stats(
     wrapper: RunContextWrapper[RunContext],
-    column: str | None = None,
+    metric: str,
     group_by: str | None = None,
+    episode_filter: list[int] | None = None,
 ) -> dict:
-    """对已加载数据集执行统计计算（成功率、轨迹长度、分布等）。
+    """计算任务级统计指标（成功率、轨迹长度、episode 分布等）。
 
     Args:
-        column: 可选，指定要统计的列；省略时给出整体概况统计。
-        group_by: 可选，按某列分组后统计（如按 episode 分组）。
+        metric: 统计指标，如 success_rate / trajectory_length / duration_stats /
+            action_stats；具体可选值由实现阶段给出。
+        group_by: 可选，按某列分组后统计（如按 condition 分组）。
+        episode_filter: 可选，仅统计指定 episode。
 
     Returns:
-        dict，包含各统计项（count/mean/std/min/max/中位数等）与结果摘要，
-        便于模型直接引用数字撰写解读。
+        dict，包含 dataset（来源数据集名）、metric、结果数值与结果摘要，
+        便于模型直接引用数字撰写解读；能力标签不满足或参数非法时返回
+        结构化"不适用/错误"结果。
+    """
+```
+
+### 6.1 质检层工具统一返回格式
+
+所有质检工具（inspect_streams / check_temporal_sync / check_sensor_sanity）返回统一的
+"测量值 + 阈值 + 判定"结构，阈值从 config 读取（可调）：
+
+```python
+{
+  "success": True,
+  "dataset": "xxx",                 # 来源数据集
+  "check": "check_temporal_sync",   # 质检项
+  "result": "pass",                 # pass / warn / fail
+  "measurements": {                 # 测量值（实际计算出的指标）
+    "max_skew_ms": 3.2,
+    "num_unsynced_episodes": 0,
+  },
+  "thresholds": {                   # 判定所用的阈值（来自 config）
+    "max_skew_ms": 10.0,
+  },
+  "affected_episodes": [],          # 受影响的 episode 清单（fail/warn 时非空）
+  "user_message": "……",            # 可直接转达给用户的中文说明
+}
+```
+
+判定规则：测量值在安全阈值内 → `pass`；接近阈值 → `warn`；越界 → `fail`。
+`affected_episodes` 列出触发 warn/fail 的 episode 编号，供后续定位。
+
+### 6.2 质检层工具签名
+
+```python
+# app/tools/inspect_streams.py   【质检层】面向原始流的探测
+@tool
+def inspect_streams(
+    wrapper: RunContextWrapper[RunContext],
+) -> dict:
+    """探测数据集的流与能力（视频/IMU/力觉/动作/标定），返回能力标签与时钟来源。
+
+    Args:
+        无（基于 RunContext.meta.capabilities）。
+
+    Returns:
+        dict，包含 capabilities（能力标签字典）、clock_source（unified /
+        per-device / unknown，默认 unknown）、n_streams、各流简要信息；无法
+        识别时钟来源时 clock_source 记为 unknown。
+    """
+```
+
+```python
+# app/tools/check_temporal_sync.py   【质检层】时间同步检查
+@tool
+def check_temporal_sync(
+    wrapper: RunContextWrapper[RunContext],
+) -> dict:
+    """检查各流之间的时间同步与漂移。
+
+    前置条件：requires has_video_streams 或 has_imu 等多流能力。
+
+    Args:
+        无。
+
+    Returns:
+        dict，统一质检返回格式（measurements + thresholds + result +
+        affected_episodes），含漂移检测结果；报告区分两个置信级别：
+        - confidence="timestamp"：基于时间戳一致性推断（默认，较快速）；
+        - confidence="physical"：基于物理实测的互相关对齐（需额外数据，v2）。
+    """
+```
+
+```python
+# app/tools/check_sensor_sanity.py   【质检层】传感器数据合理性
+@tool
+def check_sensor_sanity(
+    wrapper: RunContextWrapper[RunContext],
+    sensor: str | None = None,
+) -> dict:
+    """检查传感器数据合理性（范围、缺失率、突变/离群、静默段等）。
+
+    前置条件：requires 对应能力标签（如 has_imu / has_force）。
+
+    Args:
+        sensor: 可选，指定要检查的传感器；省略时检查所有可用传感器。
+
+    Returns:
+        dict，统一质检返回格式；包含每路传感器的测量值与判定、受影响 episode。
     """
 ```
 
@@ -298,7 +438,7 @@ def generate_report(
     """
 ```
 
-> 说明：`RunContext` 定义于 `app/agent/context.py`，字段含 `df: pd.DataFrame | None`、`meta: dict`、`output_dir: str`、`findings: list`（各工具累积的分析结果摘要，供 `generate_report` 汇总）。此签名设计为定稿。
+> 说明：`RunContext` 定义于 `app/agent/context.py`，字段含 `df: pd.DataFrame | None`、`dataset_id`、`meta: dict`（含 `capabilities` 能力标签与 `guessed_type` 推测类型）、`output_dir: str`、`findings: list`（各工具累积的分析结果摘要，供 `generate_report` 汇总）。此签名设计为定稿。
 
 ---
 
@@ -312,18 +452,33 @@ def generate_report(
 | 模型接入 | 单一工厂 `build_model` 产 `OpenAIChatCompletionsModel` + `AsyncOpenAI` | 第三方兼容端点统一走 Chat Completions，切换服务商只改 `.env` |
 | 界面 | Streamlit，UI 与业务严格分层 | 未来可复用为 API/CLI |
 | 错误处理 | 工具返回结构化错误而非抛异常 | 保证 Agent 循环可恢复 |
+| 工具分层 | 质检层（原始流）+ 统计层（任务级表） | 面向对象不同，职责清晰、互不混淆 |
+| 数据类型识别 | 能力标签 + 推测类型名，不做枚举 | 组合持续膨胀，枚举不可维护；逻辑只依赖能力标签 |
+| 质检判定 | 测量值 + 阈值 + pass/warn/fail + affected_episodes | 阈值可调，结果可定位到具体 episode |
 
 ---
 
 ## 8. 定稿决议记录
 
-以下为编码前已确认的决议：
+以下为已确认的决议：
 
 1. **provider 接入方式**：不设抽象基类、不拆 provider 文件，收敛为 `app/llm/factory.build_model` 单一工厂函数。
 2. **`RunContext` 位置**：放 `app/agent/context.py`。
-3. **`compute_stats` 粒度**：保持单一工具 + 参数，不拆分。
-4. **max_turns 默认值**：定为 15。
-5. **首批 5 个工具**：维持 `load_dataset` / `profile_data` / `compute_stats` / `plot_chart` / `generate_report` 不变；开发顺序为 load → profile → stats → plot → report。
+3. **max_turns 默认值**：定为 15。
+4. **工具层结构（2026-08-19 更新）**：工具分两层——【质检层】面向原始采集数据流
+   （`inspect_streams` / `check_temporal_sync` / `check_sensor_sanity`），【统计层】
+   面向状态/动作数据表（`compute_stats` 职责收窄为任务级统计）。开发顺序建议：
+   load → profile → compute_stats → 质检层三件（inspect_streams → check_sensor_sanity
+   → check_temporal_sync）→ plot_chart → generate_report。
+5. **数据类型不做枚举（2026-08-19 更新）**：改为 `load_dataset` 嗅探后在
+   `RunContext.meta` 记录能力标签（`capabilities`）+ 推测类型名（`guessed_type` 含
+   置信度）；工具通过 `requires` 前置条件声明所需能力，不满足时返回结构化"不适用"结果。
+6. **质检返回统一格式（2026-08-19 更新）**：测量值 + 阈值 + 判定（pass/warn/fail）+
+   受影响 episode 清单；阈值写入 config 可调。
+7. **时钟语义（2026-08-19 更新）**：`inspect_streams` 输出 `clock_source`
+   （unified / per-device / unknown，默认 unknown）；`check_temporal_sync` 含漂移
+   检测，报告区分"基于时间戳一致性"（timestamp）与"基于物理实测"（physical）两个
+   置信级别。
 
 ---
 
@@ -338,3 +493,11 @@ def generate_report(
    "多数据集命名管理"，各工具增加 `dataset` 参数以指定操作目标。当前 MVP 阶段保持
    单数据集 + 明确语义（数据来源自带标注）即可，等 `compute_stats`、`plot_chart`
    稳定后再评估。
+2. **互相关物理对齐实测（v2）**：`check_temporal_sync` 的漂移检测目前基于时间戳
+   一致性（confidence="timestamp"）。v2 引入基于物理实测的互相关对齐
+   （confidence="physical"），对信号做互相关以实测各流时间偏移，用于时间戳不可信
+   或缺失时的兜底与校验。
+3. **UMI 专用指标**：UMI 数据集特有分析，如 **SLAM 跟踪丢失率**（跟踪质量随时间
+   变化、丢失段定位）等，作为 `check_sensor_sanity` 或独立工具的扩展。
+4. **Ego 视频专用分析**：Ego 视频流的专用分析（如视觉里程计/感知相关的质量评估、
+   帧率稳定性、曝光/运动模糊信号等），作为质检层或独立分析工具扩展。

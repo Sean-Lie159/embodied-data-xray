@@ -5,6 +5,7 @@ pandas
 numpy
 pyarrow
 h5py
+pyyaml
 matplotlib
 plotly
 streamlit
