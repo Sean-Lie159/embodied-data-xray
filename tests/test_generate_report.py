@@ -117,3 +117,40 @@ def test_findings_append_report(tmp_path: Path) -> None:
 
     # findings 追加了 type=report 条目。
     assert ctx.findings[-1]["type"] == "report"
+
+
+def test_report_stats_section_contains_semantic_notes(tmp_path: Path) -> None:
+    """报告统计章节应列出语义注释（推测标注）。"""
+    findings = [
+        {"tool": "compute_stats", "type": "stat", "metric": "success_rate",
+         "n_episodes": 5, "summary": "5 个 episode；成功率 1.0",
+         "semantic_notes": ["success 聚合规则为推测，建议人工确认"]},
+    ]
+    ctx = _ctx(findings=findings, output_dir=str(tmp_path))
+
+    r = generate_report_impl(ctx)
+    content = Path(r["file_path"]).read_text(encoding="utf-8")
+
+    # 统计章节含"推测"标注。
+    assert "success 聚合规则为推测" in content
+
+
+def test_limitations_generalizes_all_semantic_notes(tmp_path: Path) -> None:
+    """局限性章节应汇总所有 findings 的 semantic_notes（通用化，不只 stat）。"""
+    findings = [
+        {"tool": "compute_stats", "type": "stat", "metric": "success_rate",
+         "n_episodes": 5, "summary": "5 个 episode",
+         "semantic_notes": ["success 聚合规则为推测"]},
+        {"tool": "plot_chart", "type": "chart", "file_path": "outputs/x.png",
+         "title": "chart", "description": "desc",
+         "plot_spec": {"x_axis": "x", "y_axis": ["y"], "grouped_by": None, "n_series": 1},
+         "semantic_notes": ["该图表基于推测的时间戳对齐"]},
+    ]
+    ctx = _ctx(findings=findings, output_dir=str(tmp_path))
+
+    r = generate_report_impl(ctx)
+    content = Path(r["file_path"]).read_text(encoding="utf-8")
+
+    # 局限性章节应包含两个工具（stat 与 chart）的 semantic_notes。
+    assert "success 聚合规则为推测" in content
+    assert "该图表基于推测的时间戳对齐" in content

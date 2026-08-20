@@ -227,6 +227,7 @@ def compute_stats_impl(
         "metric": metric or "task_level",
         "n_episodes": metrics.get("episode_distribution", {}).get("n_episodes"),
         "summary": _make_finding_summary(metrics, metric),
+        "semantic_notes": list(semantic_notes),
     }
     context.findings.append(finding)
 

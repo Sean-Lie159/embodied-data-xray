@@ -99,6 +99,9 @@ def _build_stats_section(findings: list[dict]) -> tuple[str, int]:
         metric = f.get("metric", "task_level")
         summary = f.get("summary", "")
         lines.append(f"- **{metric}**: {summary}")
+        # 该条目的推测/注意事项标注（如 success 聚合规则为推测）。
+        for note in f.get("semantic_notes", []):
+            lines.append(f"  - 标注（推测/注意事项）: {note}")
     return "\n".join(lines), len(stat_items)
 
 
@@ -132,12 +135,22 @@ def _build_charts_section(findings: list[dict]) -> tuple[str, int]:
 
 
 def _build_limitations_section(context: RunContext, findings: list[dict]) -> tuple[str, int]:
-    """局限性说明章节：自动汇总 skipped/unknown/推测项。返回 (内容, 条目数)。"""
+    """局限性说明章节：自动汇总 skipped/unknown/推测项。返回 (内容, 条目数)。
+
+    通用化：收集**所有** findings 条目的 semantic_notes 字段（推测/注意事项类），
+    这是报告的诚实底线，不应依赖单个工具记得带。
+    """
     items: list[str] = []
 
-    # 从 findings 的 stat 条目 summary 中提取推测/无法确定/未检测标注。
+    # 通用化：汇总所有 findings 的 semantic_notes 字段（任意工具，不只 stat）。
     for f in findings:
-        if f.get("type") != "stat":
+        for note in f.get("semantic_notes", []):
+            tool = f.get("tool", "工具")
+            items.append(f"{tool} 标注：{note}")
+
+    # 兜底：从 stat 条目 summary 中提取推测/无法确定/未检测标注（无 semantic_notes 时）。
+    for f in findings:
+        if f.get("type") != "stat" or f.get("semantic_notes"):
             continue
         summary = f.get("summary", "")
         for kw in ("推测", "无法确定", "未检测", "未质检", "不可信"):
