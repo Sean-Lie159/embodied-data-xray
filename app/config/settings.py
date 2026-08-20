@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # 静止段窗口回退采样率（Hz）：流登记表无 measured_rate 时用此值估算 1 秒窗口。
     sanity_static_window_rate: float = Field(default=100.0, ge=1.0)
 
+    # --- 任务级统计（compute_stats）阈值 -------------------------------------
+    # 离群 episode 检测（IQR 法）的 k 值：Q1 - k*IQR / Q3 + k*IQR 之外视为离群。
+    stats_outlier_k: float = Field(default=1.5, ge=0.0)
+
     @model_validator(mode="after")
     def _validate_required(self) -> Settings:
         """校验必须的模型配置是否齐全，缺失时给出中文报错。"""

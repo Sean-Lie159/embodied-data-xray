@@ -474,6 +474,14 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
     if warns:
         user_message += " 存在疑点：" + "；".join(warns)
 
+    # 质检结果写回 meta["qc"]，供 compute_stats 等下游读取质检状态摘要。
+    qc = context.meta.setdefault("qc", {})
+    qc["check_sensor_sanity"] = {
+        "result": result,
+        "constant_channels": constant_channels,
+        "dataset": dataset_id,
+    }
+
     return {
         "success": True,
         "dataset": dataset_id,

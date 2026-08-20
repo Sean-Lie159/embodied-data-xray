@@ -396,6 +396,15 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     if drift_note:
         user_message += f" {drift_note}"
 
+    # 质检结果写回 meta["qc"]，供 compute_stats 等下游读取质检状态摘要。
+    qc = context.meta.setdefault("qc", {})
+    qc["check_temporal_sync"] = {
+        "result": result,
+        "verification_level": "timestamp_consistency",
+        "drift_detected": drift_flag,
+        "dataset": context.dataset_id,
+    }
+
     return {
         "success": True,
         "verification_level": "timestamp_consistency",

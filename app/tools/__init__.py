@@ -2,6 +2,7 @@
 
 from app.tools.check_sensor_sanity import check_sensor_sanity, check_sensor_sanity_impl
 from app.tools.check_temporal_sync import check_temporal_sync, check_temporal_sync_impl
+from app.tools.compute_stats import compute_stats, compute_stats_impl
 from app.tools.inspect_streams import inspect_streams, inspect_streams_impl
 from app.tools.load_dataset import load_dataset, load_dataset_impl
 from app.tools.profile_data import profile_data, profile_data_impl
@@ -17,4 +18,6 @@ __all__ = [
     "check_temporal_sync_impl",
     "check_sensor_sanity",
     "check_sensor_sanity_impl",
+    "compute_stats",
+    "compute_stats_impl",
 ]
