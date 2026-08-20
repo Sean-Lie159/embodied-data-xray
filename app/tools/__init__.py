@@ -5,6 +5,7 @@ from app.tools.check_temporal_sync import check_temporal_sync, check_temporal_sy
 from app.tools.compute_stats import compute_stats, compute_stats_impl
 from app.tools.inspect_streams import inspect_streams, inspect_streams_impl
 from app.tools.load_dataset import load_dataset, load_dataset_impl
+from app.tools.plot_chart import plot_chart, plot_chart_impl
 from app.tools.profile_data import profile_data, profile_data_impl
 
 __all__ = [
@@ -20,4 +21,6 @@ __all__ = [
     "check_sensor_sanity_impl",
     "compute_stats",
     "compute_stats_impl",
+    "plot_chart",
+    "plot_chart_impl",
 ]
