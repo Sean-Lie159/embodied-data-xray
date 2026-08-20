@@ -100,7 +100,7 @@ def plot_chart_impl(
         title_safe = _safe_title(title, f"{chart_type} chart")
         path = _output_path(context, chart_type)
         fig, ax = plt.subplots()
-        desc = _plot_generic_to_ax(context.df, chart_type, x, y, color, title_safe, fig, ax)
+        desc, plot_spec = _plot_generic_to_ax(context.df, chart_type, x, y, color, title_safe, fig, ax)
         _save_fig(fig, path)
 
     elif chart_type == "trajectory":
@@ -121,7 +121,7 @@ def plot_chart_impl(
                 "dataset": dataset_id,
                 "suggested_charts": ["line", "scatter", "histogram"],
             }
-        desc, traj_kind = result
+        desc, traj_kind, plot_spec = result
 
     elif chart_type == "multi_stream_overlay":
         title_safe = _safe_title(title, "multi-stream overlay")
@@ -134,7 +134,7 @@ def plot_chart_impl(
                 "user_message": "multi_stream_overlay 需要至少一个含时间戳与数值列的流。当前数据集无可绘制流，不适用。",
                 "dataset": dataset_id,
             }
-        desc, _ = result
+        desc, _, plot_spec = result
 
     else:
         return {
@@ -150,6 +150,7 @@ def plot_chart_impl(
         "chart_type": chart_type,
         "title": _safe_title(title, chart_type),
         "description": desc,
+        "plot_spec": plot_spec,
     }
     context.findings.append(finding)
 
@@ -160,6 +161,7 @@ def plot_chart_impl(
         "chart_type": chart_type,
         "title": _safe_title(title, chart_type),
         "description": desc,
+        "plot_spec": plot_spec,
         "findings": [finding],
         "user_message": f"已生成 {chart_type} 图表，保存至 {path}。{desc}。",
     }
@@ -167,8 +169,8 @@ def plot_chart_impl(
 
 def _plot_generic_to_ax(
     df, chart_type, x, y, color, title, fig, ax
-) -> str:
-    """把通用图绘制到 ax，返回说明。"""
+) -> tuple[str, dict[str, Any]]:
+    """把通用图绘制到 ax，返回 (说明, plot_spec)。"""
     if chart_type == "histogram":
         col = y or x
         if col is None:
@@ -179,14 +181,17 @@ def _plot_generic_to_ax(
         ax.hist(df[col].dropna(), bins=30)
         ax.set_xlabel(str(col)); ax.set_ylabel("count")
         ax.set_title(title)
-        return f"Histogram of '{col}'"
+        spec = {"x_axis": str(col), "y_axis": ["count"], "grouped_by": None, "n_series": 1}
+        return f"Histogram of '{col}'", spec
     xcol = x or _find_timestamp_col(df) or df.columns[0]
     ycol = y
     if ycol is None:
         nums = [c for c in df.columns if c != xcol and pd.api.types.is_numeric_dtype(df[c])]
         ycol = nums[0] if nums else xcol
-    if color and color in df.columns:
-        for g, grp in df.groupby(color):
+    grouped = color if (color and color in df.columns) else None
+    n_series = int(df[grouped].nunique()) if grouped else 1
+    if grouped:
+        for g, grp in df.groupby(grouped):
             if chart_type == "scatter":
                 ax.scatter(grp[xcol], grp[ycol], label=str(g))
             else:
@@ -199,10 +204,11 @@ def _plot_generic_to_ax(
             ax.plot(df[xcol], df[ycol])
     ax.set_xlabel(str(xcol)); ax.set_ylabel(str(ycol))
     ax.set_title(title)
-    return f"{chart_type.capitalize()} of '{ycol}' vs '{xcol}'"
+    spec = {"x_axis": str(xcol), "y_axis": [str(ycol)], "grouped_by": grouped, "n_series": n_series}
+    return f"{chart_type.capitalize()} of '{ycol}' vs '{xcol}'", spec
 
 
-def _plot_trajectory_to_file(df, title, path) -> tuple[str, str] | None:
+def _plot_trajectory_to_file(df, title, path) -> tuple[str, str, dict[str, Any]] | None:
     joint_cols = [c for c in df.columns if str(c).lower().startswith(_sniffing._JOINT_PREFIXES)]
     pose_cols = [c for c in df.columns if _sniffing._is_pose_column(str(c))]
 
@@ -210,13 +216,14 @@ def _plot_trajectory_to_file(df, title, path) -> tuple[str, str] | None:
         fig, ax = plt.subplots()
         ts_col = _find_timestamp_col(df)
         x_axis = df[ts_col] if ts_col else np.arange(len(df))
-        for c in joint_cols[:8]:
-            if pd.api.types.is_numeric_dtype(df[c]):
-                ax.plot(x_axis, df[c], label=str(c))
+        drawn = [c for c in joint_cols[:8] if pd.api.types.is_numeric_dtype(df[c])]
+        for c in drawn:
+            ax.plot(x_axis, df[c], label=str(c))
         ax.set_xlabel("time" if ts_col else "step"); ax.set_ylabel("joint position")
         ax.set_title(title); ax.legend()
         _save_fig(fig, path)
-        return ("Joint-space trajectory", "joint")
+        spec = {"x_axis": ts_col or "step", "y_axis": drawn, "grouped_by": None, "n_series": len(drawn)}
+        return ("Joint-space trajectory", "joint", spec)
 
     if pose_cols:
         xyz = [c for c in pose_cols if str(c).lower().split("_")[-1] in ("x", "y", "z")]
@@ -227,14 +234,16 @@ def _plot_trajectory_to_file(df, title, path) -> tuple[str, str] | None:
                 ax.plot(df[xyz[0]], df[xyz[1]], df[xyz[2]])
                 ax.set_xlabel(xyz[0]); ax.set_ylabel(xyz[1]); ax.set_zlabel(xyz[2])
                 desc = "End-effector 3D trajectory"
+                spec = {"x_axis": xyz[0], "y_axis": [xyz[1], xyz[2]], "grouped_by": None, "n_series": 1}
             else:
                 ax = fig.add_subplot(111)
                 ax.plot(df[xyz[0]], df[xyz[1]])
                 ax.set_xlabel(xyz[0]); ax.set_ylabel(xyz[1])
                 desc = "End-effector XY trajectory"
+                spec = {"x_axis": xyz[0], "y_axis": [xyz[1]], "grouped_by": None, "n_series": 1}
             ax.set_title(title)
             _save_fig(fig, path)
-            return (desc, "end_effector")
+            return (desc, "end_effector", spec)
         num_pose = [c for c in pose_cols if pd.api.types.is_numeric_dtype(df[c])]
         if len(num_pose) >= 2:
             fig, ax = plt.subplots()
@@ -242,14 +251,16 @@ def _plot_trajectory_to_file(df, title, path) -> tuple[str, str] | None:
             ax.set_xlabel(num_pose[0]); ax.set_ylabel(num_pose[1])
             ax.set_title(title)
             _save_fig(fig, path)
-            return ("End-effector trajectory", "end_effector")
+            spec = {"x_axis": num_pose[0], "y_axis": [num_pose[1]], "grouped_by": None, "n_series": 1}
+            return ("End-effector trajectory", "end_effector", spec)
     return None
 
 
-def _plot_multi_stream_to_file(context, title, path) -> tuple[str, str] | None:
+def _plot_multi_stream_to_file(context, title, path) -> tuple[str, str, dict[str, Any]] | None:
     streams = [s for s in context.meta.get("streams", []) if s.get("kind") != "video"]
     fig, ax = plt.subplots()
     plotted = 0
+    stream_info: list[dict[str, Any]] = []
     if streams:
         for s in streams:
             if not s.get("path"):
@@ -269,6 +280,8 @@ def _plot_multi_stream_to_file(context, title, path) -> tuple[str, str] | None:
             t_rel = t - t[0] if len(t) else t
             label = Path(s.get("path", "")).name
             ax.plot(t_rel, df[ycol].to_numpy(float), label=f"{label} ({ycol})")
+            rate = (s.get("measured_rate") or {}).get("sample_rate_hz") if isinstance(s.get("measured_rate"), dict) else None
+            stream_info.append({"name": label, "column": ycol, "sample_rate_hz": rate})
             plotted += 1
     else:
         # 无流登记表：用主表。
@@ -281,6 +294,7 @@ def _plot_multi_stream_to_file(context, title, path) -> tuple[str, str] | None:
                 t = df[ts_col].to_numpy(float) if ts_col else np.arange(len(df))
                 t_rel = t - t[0] if len(t) else t
                 ax.plot(t_rel, df[ycol].to_numpy(float), label=f"main ({ycol})")
+                stream_info.append({"name": "main", "column": ycol, "sample_rate_hz": None})
                 plotted = 1
     if plotted == 0:
         plt.close(fig)
@@ -288,7 +302,14 @@ def _plot_multi_stream_to_file(context, title, path) -> tuple[str, str] | None:
     ax.set_xlabel("relative time (s)"); ax.set_ylabel("value")
     ax.set_title(title); ax.legend()
     _save_fig(fig, path)
-    return (f"Multi-stream overlay of {plotted} streams", "multi_stream_overlay")
+    spec = {
+        "x_axis": "relative_time",
+        "y_axis": [si["column"] for si in stream_info],
+        "grouped_by": None,
+        "n_series": plotted,
+        "streams": stream_info,
+    }
+    return (f"Multi-stream overlay of {plotted} streams", "multi_stream_overlay", spec)
 
 
 @tool

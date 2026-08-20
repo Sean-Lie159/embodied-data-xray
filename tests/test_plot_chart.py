@@ -120,3 +120,60 @@ def test_unsupported_chart_type(tmp_path: Path) -> None:
 
     assert r["success"] is False
     assert r["error"] == "unsupported_chart_type"
+
+
+def test_plot_spec_matches_actual_line(tmp_path: Path) -> None:
+    """plot_spec 应如实记录实际绘图方式（line 图）。"""
+    df = pd.DataFrame({"timestamp": [0, 0.1, 0.2], "value": [0, 1, 2], "group": ["a", "a", "b"]})
+    ctx = _ctx(df, output_dir=str(tmp_path))
+
+    r = plot_chart_impl(ctx, "line", x="timestamp", y="value", color="group")
+
+    spec = r["plot_spec"]
+    assert spec["x_axis"] == "timestamp"
+    assert spec["y_axis"] == ["value"]
+    assert spec["grouped_by"] == "group"
+    assert spec["n_series"] == 2  # 两组
+
+
+def test_plot_spec_trajectory_joint(tmp_path: Path) -> None:
+    """plot_spec 应记录关节轨迹的实际坐标（x=时间/step，y=关节列）。"""
+    df = pd.DataFrame({
+        "qpos1": [0.1, 0.2, 0.3], "qpos2": [0.0, 0.1, 0.2], "timestamp": [0, 0.1, 0.2],
+    })
+    ctx = _ctx(df, output_dir=str(tmp_path))
+
+    r = plot_chart_impl(ctx, "trajectory")
+
+    spec = r["plot_spec"]
+    # x 轴是时间戳（存在）或 step，y 轴是关节列。
+    assert spec["x_axis"] in ("timestamp", "step")
+    assert spec["y_axis"] == ["qpos1", "qpos2"]
+    assert spec["grouped_by"] is None
+
+
+def test_plot_spec_multi_stream_has_streams(tmp_path: Path) -> None:
+    """multi_stream_overlay 的 plot_spec 应附各流名称、列与采样率。"""
+    t = np.arange(0, 1.0, 0.01)
+    imu_path = tmp_path / "imu.csv"
+    pd.DataFrame({"timestamp": t, "accel_x": np.sin(t)}).to_csv(imu_path, index=False)
+    ft_path = tmp_path / "ft.csv"
+    pd.DataFrame({"timestamp": t + 0.005, "fx": np.cos(t)}).to_csv(ft_path, index=False)
+
+    meta = {
+        "capabilities": {"has_imu": True, "has_force": True},
+        "streams": [
+            {"path": str(imu_path), "format": "csv", "kind": "imu", "channels": ["accel_x"]},
+            {"path": str(ft_path), "format": "csv", "kind": "force", "channels": ["fx"]},
+        ],
+    }
+    ctx = _ctx(pd.DataFrame({"timestamp": t, "main": np.sin(t)}), meta=meta,
+               output_dir=str(tmp_path))
+
+    r = plot_chart_impl(ctx, "multi_stream_overlay")
+
+    spec = r["plot_spec"]
+    assert spec["x_axis"] == "relative_time"
+    assert spec["n_series"] == 2
+    assert len(spec["streams"]) == 2
+    assert all("name" in s and "column" in s and "sample_rate_hz" in s for s in spec["streams"])
