@@ -1,5 +1,6 @@
 """领域工具包：Agent 的"手"。每个工具一个模块，返回精简结果。"""
 
+from app.tools.check_sensor_sanity import check_sensor_sanity, check_sensor_sanity_impl
 from app.tools.check_temporal_sync import check_temporal_sync, check_temporal_sync_impl
 from app.tools.inspect_streams import inspect_streams, inspect_streams_impl
 from app.tools.load_dataset import load_dataset, load_dataset_impl
@@ -14,4 +15,6 @@ __all__ = [
     "inspect_streams_impl",
     "check_temporal_sync",
     "check_temporal_sync_impl",
+    "check_sensor_sanity",
+    "check_sensor_sanity_impl",
 ]

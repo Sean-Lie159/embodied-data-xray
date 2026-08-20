@@ -19,7 +19,13 @@ from app.agent.agent import build_agent, format_tool_activity, run_turn
 from app.agent.context import RunContext
 from app.config import get_settings
 from app.llm import build_model
-from app.tools import check_temporal_sync, inspect_streams, load_dataset, profile_data
+from app.tools import (
+    check_sensor_sanity,
+    check_temporal_sync,
+    inspect_streams,
+    load_dataset,
+    profile_data,
+)
 
 _EXIT_COMMANDS = {"exit", "quit", "q", "退出", "再见"}
 
@@ -27,7 +33,13 @@ _EXIT_COMMANDS = {"exit", "quit", "q", "退出", "再见"}
 def _build_main_agent():
     settings = get_settings()
     model = build_model(settings)
-    tools = [load_dataset, profile_data, inspect_streams, check_temporal_sync]
+    tools = [
+        load_dataset,
+        profile_data,
+        inspect_streams,
+        check_temporal_sync,
+        check_sensor_sanity,
+    ]
     return build_agent(model, tools)
 
 
@@ -38,7 +50,7 @@ async def chat_loop() -> None:
 
     print("=" * 56)
     print("具身智能数据分析 Agent")
-    print("已加载工具: load_dataset, profile_data, inspect_streams, check_temporal_sync")
+    print("已加载工具: load_dataset, profile_data, inspect_streams, check_temporal_sync, check_sensor_sanity")
     print("输入 exit / quit / 退出 结束对话。")
     print("=" * 56)
 

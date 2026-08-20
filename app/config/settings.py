@@ -57,6 +57,22 @@ class Settings(BaseSettings):
     # pass 残差阈值：最高帧率流采样间隔的比例（0.5 = 采样间隔的一半）。
     sync_residual_ratio: float = Field(default=0.5, ge=0.0)
 
+    # --- 传感器合理性（check_sensor_sanity）阈值 -----------------------------
+    # 静止段判定：滑动窗口内加速度计模长的方差低于该值视为静止（g² 或 (m/s²)² 量级）。
+    sanity_static_var_threshold: float = Field(default=0.02, ge=0.0)
+    # 静止段占比低于该值时，依赖静止段的检查降级为 warn（数据可能全程在运动）。
+    sanity_static_ratio_warn: float = Field(default=0.05, ge=0.0, le=1.0)
+    # 静止段加速度模长相对重力参考值的允许相对偏差（如 0.1 = 10%）。
+    sanity_gravity_tolerance: float = Field(default=0.1, ge=0.0)
+    # 量程饱和削顶判定：连续重复出现的极值点（等于信号最大/最小值）比例超过该值 → fail。
+    sanity_saturation_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
+    # 恒定通道判定：归一化方差低于该值视为传感器掉线/恒定。
+    sanity_constant_var: float = Field(default=1e-6, ge=0.0)
+    # NaN/Inf 比例超过该值 → fail。
+    sanity_nan_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
+    # 静止段窗口回退采样率（Hz）：流登记表无 measured_rate 时用此值估算 1 秒窗口。
+    sanity_static_window_rate: float = Field(default=100.0, ge=1.0)
+
     @model_validator(mode="after")
     def _validate_required(self) -> Settings:
         """校验必须的模型配置是否齐全，缺失时给出中文报错。"""
