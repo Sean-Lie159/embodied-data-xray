@@ -21,6 +21,7 @@ from agents.decorators import tool
 
 from app.agent.context import RunContext
 from app.config import get_settings
+from app.tools import _data_access
 
 # episode 列候选（用于识别 episode 划分）。
 _EPISODE_COLS = ("episode", "ep", "eps", "episode_id", "traj_id", "trajectory_id")
@@ -35,54 +36,6 @@ def _find_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
     for c in df.columns:
         if str(c).lower().strip() in candidates:
             return str(c)
-    return None
-
-
-def _has_action_columns(df: pd.DataFrame) -> bool:
-    """判断 df 是否含状态/动作相关列（episode/success/关节）。"""
-    if _find_col(df, _EPISODE_COLS) is not None:
-        return True
-    if _find_col(df, _SUCCESS_COLS) is not None:
-        return True
-    return any(str(c).lower().startswith(_JOINT_PREFIXES) for c in df.columns)
-
-
-def _read_actions_table(context: RunContext) -> pd.DataFrame | None:
-    """确定任务级统计的数据表：优先含状态/动作列的主表，否则从流登记表按需读取。
-
-    Args:
-        context: 运行时上下文。
-
-    Returns:
-        状态/动作数据表；无则返回 None。
-    """
-    # 优先 context.df，但仅当它含状态/动作列（episode/success/关节）。
-    if context.df is not None and _has_action_columns(context.df):
-        return context.df
-
-    # 从流登记表读 actions 流（状态/动作在独立表中），读全表（不只 channels）。
-    streams = context.meta.get("streams", [])
-    for s in streams:
-        if s.get("kind") == "actions":
-            path = s.get("path", "")
-            fmt = s.get("format", "")
-            try:
-                from app.tools.load_dataset import _detect_encoding
-
-                if fmt == "csv":
-                    encoding = _detect_encoding(Path(path).read_bytes())
-                    return pd.read_csv(path, encoding=encoding, engine="python")
-                if fmt == "parquet":
-                    return pd.read_parquet(path)
-                if fmt == "json":
-                    return pd.read_json(path)
-            except Exception:  # noqa: BLE001
-                continue
-    return None
-
-    # 兜底：主表存在但无状态/动作列时，仍返回主表（后续语义注明会提示 episode 缺失）。
-    if context.df is not None:
-        return context.df
     return None
 
 
@@ -155,7 +108,7 @@ def compute_stats_impl(
     capabilities = context.meta.get("capabilities", {})
     dataset_id = context.dataset_id
 
-    df = _read_actions_table(context)
+    df, _source = _data_access.locate_action_table(context)
 
     # 前置条件：无状态/动作表 → 不适用。
     if df is None:

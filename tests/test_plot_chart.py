@@ -177,3 +177,31 @@ def test_plot_spec_multi_stream_has_streams(tmp_path: Path) -> None:
     assert spec["n_series"] == 2
     assert len(spec["streams"]) == 2
     assert all("name" in s and "column" in s and "sample_rate_hz" in s for s in spec["streams"])
+
+
+def test_trajectory_from_separate_actions_table(tmp_path: Path) -> None:
+    """主表为 IMU、关节列在独立 tasks.csv 时，trajectory 应出图（而非 not_applicable）。"""
+    # 主表：IMU（无关节列）。
+    imu = pd.DataFrame({
+        "timestamp": [0, 0.1, 0.2],
+        "accel_x": [0.1, 0.2, 0.3], "accel_y": [0.0, 0.1, 0.2], "accel_z": [9.8, 9.8, 9.8],
+    })
+    # 独立 actions 表：tasks.csv（含关节列）。
+    tasks_path = tmp_path / "tasks.csv"
+    pd.DataFrame({
+        "qpos1": [0.1, 0.2, 0.3], "qpos2": [0.0, 0.1, 0.2], "timestamp": [0, 0.1, 0.2],
+    }).to_csv(tasks_path, index=False)
+
+    meta = {
+        "capabilities": {"has_imu": True, "has_actions": True},
+        "streams": [
+            {"path": str(tasks_path), "format": "csv", "kind": "actions", "channels": ["qpos1", "qpos2"]},
+        ],
+    }
+    ctx = _ctx(imu, meta=meta, output_dir=str(tmp_path))
+
+    r = plot_chart_impl(ctx, "trajectory")
+
+    assert r["success"] is True
+    # y 轴应是独立表的关节列。
+    assert r["plot_spec"]["y_axis"] == ["qpos1", "qpos2"]

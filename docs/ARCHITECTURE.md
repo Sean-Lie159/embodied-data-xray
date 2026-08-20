@@ -107,6 +107,8 @@
 
 每个工具声明**前置条件**（`requires`，基于数据集能力标签）。能力标签不满足时返回结构化"不适用"结果，并推荐该数据集可用的分析，而不是抛异常或硬跑出无意义结果。
 
+**共享数据访问约定（2026-08-20 新增）**：凡需访问状态/动作数据的工具（如 compute_stats、plot_chart 的 trajectory），一律经共享数据访问函数 `app/tools/_data_access.py` 的 `locate_action_table` 定位数据表（主表含目标列则用主表，否则按流登记表按需读取独立表），**不得各自直接读 `context.df`**——避免"状态/动作在独立表时误用主表"的问题。
+
 ### 3.4 `app/agent/` — Agent 定义与运行入口
 
 - 组装：读取 `get_settings()` → 通过 `app/llm/factory.build_model` 构建 Model → 构建 `Agent`（含 `name`、`instructions`、`model`、`tools`）。

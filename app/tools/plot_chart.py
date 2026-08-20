@@ -30,7 +30,7 @@ from agents import RunContextWrapper  # noqa: E402
 from agents.decorators import tool  # noqa: E402
 
 from app.agent.context import RunContext  # noqa: E402
-from app.tools import _sniffing  # noqa: E402
+from app.tools import _data_access, _sniffing  # noqa: E402
 
 # 常见时间戳列名（复用约定）。
 _TIMESTAMP_COLS = ("timestamp", "time", "ts", "ts_ns", "t", "stamp", "frame_time")
@@ -104,7 +104,9 @@ def plot_chart_impl(
         _save_fig(fig, path)
 
     elif chart_type == "trajectory":
-        if context.df is None:
+        # 定位状态/动作表（主表含关节/位姿列则用主表，否则按流登记表读独立表）。
+        traj_df, _source = _data_access.locate_action_table(context)
+        if traj_df is None:
             return {
                 "success": False, "error": "no_data_loaded",
                 "user_message": "绘制 trajectory 需要已加载的数据表。请先调用 load_dataset。",
@@ -112,7 +114,7 @@ def plot_chart_impl(
             }
         title_safe = _safe_title(title, "trajectory")
         path = _output_path(context, chart_type)
-        result = _plot_trajectory_to_file(context.df, title_safe, path)
+        result = _plot_trajectory_to_file(traj_df, title_safe, path)
         if result is None:
             return {
                 "success": False, "error": "not_applicable",
