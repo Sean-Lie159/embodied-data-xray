@@ -23,6 +23,7 @@ from app.tools import (
     check_sensor_sanity,
     check_temporal_sync,
     compute_stats,
+    generate_report,
     inspect_streams,
     load_dataset,
     plot_chart,
@@ -43,6 +44,7 @@ def _build_main_agent():
         check_sensor_sanity,
         compute_stats,
         plot_chart,
+        generate_report,
     ]
     return build_agent(model, tools)
 
@@ -54,7 +56,7 @@ async def chat_loop() -> None:
 
     print("=" * 56)
     print("具身智能数据分析 Agent")
-    print("已加载工具: load_dataset, profile_data, inspect_streams, check_temporal_sync, check_sensor_sanity, compute_stats, plot_chart")
+    print("已加载工具: load_dataset, profile_data, inspect_streams, check_temporal_sync, check_sensor_sanity, compute_stats, plot_chart, generate_report")
     print("输入 exit / quit / 退出 结束对话。")
     print("=" * 56)
 
