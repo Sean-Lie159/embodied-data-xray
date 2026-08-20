@@ -396,13 +396,40 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     if drift_note:
         user_message += f" {drift_note}"
 
-    # 质检结果写回 meta["qc"]，供 compute_stats 等下游读取质检状态摘要。
+    # 质检结果写回 meta["qc"]，供 compute_stats / generate_report 读取质检明细。
     qc = context.meta.setdefault("qc", {})
     qc["check_temporal_sync"] = {
         "result": result,
         "verification_level": "timestamp_consistency",
         "drift_detected": drift_flag,
         "dataset": context.dataset_id,
+        "detail": {
+            "stream_checks": {
+                k: {
+                    "n_samples": v.get("n_samples"),
+                    "disorder_count": v.get("disorder_count"),
+                    "duplicate_count": v.get("duplicate_count"),
+                    "frame_loss_ratio": v.get("frame_loss_ratio"),
+                    "actual_rate_hz": v.get("actual_rate_hz"),
+                } if v.get("present") else {"status": "skipped", "reason": v.get("reason")}
+                for k, v in stream_checks.items()
+            },
+            "residuals": {
+                k: {"residual_max_ms": v.get("residual_max_ms"),
+                    "residual_mean_ms": v.get("residual_mean_ms")}
+                for k, v in align["residuals"].items() if not v.get("is_baseline")
+            },
+            "drift": {
+                k: {"drift_slope_ms_per_s": v.get("drift_slope_ms_per_s"),
+                    "drift_detected": v.get("drift_detected")}
+                for k, v in drift["detail"].items()
+            },
+            "thresholds": {
+                "frame_loss_ratio": settings.sync_frame_loss_ratio,
+                "residual_threshold_ms": round(residual_threshold_ms, 3),
+                "drift_slope_ms_per_s": settings.sync_drift_slope_ms_per_s,
+            },
+        },
     }
 
     return {

@@ -28,68 +28,143 @@ def _output_report_path(context: RunContext) -> Path:
 
 
 def _build_dataset_overview(context: RunContext) -> str:
-    """数据集概况章节。"""
+    """数据集画像章节：文件普查摘要 + 流明细表 + 模态矩阵。"""
     caps = context.meta.get("capabilities", {})
     streams = context.meta.get("streams", [])
-    lines = [f"- **dataset_id**: {context.dataset_id or 'unknown'}"]
+    lines = [f"**dataset_id**: {context.dataset_id or 'unknown'}",
+             f"**推测类型**: {context.meta.get('guessed_type', 'unknown')}"]
 
-    # 流清单。
+    # ---- 文件普查摘要（os 层面读大小，不进 df）----
+    n_files = 0
+    total_bytes = 0
+    fmt_dist: dict[str, int] = {}
+    for s in streams:
+        path = s.get("path")
+        if not path:
+            continue
+        n_files += 1
+        fmt = s.get("format", "?")
+        fmt_dist[fmt] = fmt_dist.get(fmt, 0) + 1
+        try:
+            total_bytes += Path(path).stat().st_size
+        except OSError:
+            pass
+    lines.append(f"- **文件数**: {n_files}")
+    lines.append(f"- **总大小**: {_fmt_size(total_bytes)}")
+    if fmt_dist:
+        fmt_desc = ", ".join(f"{k}: {v}" for k, v in sorted(fmt_dist.items()))
+        lines.append(f"- **格式分布**: {fmt_desc}")
+
+    # ---- 流明细表 ----
+    lines.append("")
+    lines.append("**流明细**")
     if streams:
-        stream_desc = []
+        lines.append("| 流 | 角色 | 格式 | 采样率/帧率 | 来源文件 |")
+        lines.append("|---|---|---|---|---|")
         for s in streams:
-            kind = s.get("kind", "unknown")
             name = Path(s.get("path", "")).name if s.get("path") else "(main)"
-            stream_desc.append(f"{name}({kind})")
-        lines.append(f"- **流清单**: {', '.join(stream_desc)}")
+            role = (s.get("role") or {}).get("role", s.get("kind", "unknown"))
+            fmt = s.get("format", "?")
+            mr = s.get("measured_rate")
+            rate = (mr or {}).get("sample_rate_hz") if isinstance(mr, dict) else None
+            rate_str = f"{rate} Hz" if rate is not None else "未知"
+            src = s.get("path", "N/A")
+            lines.append(f"| {name} | {role} | {fmt} | {rate_str} | `{src}` |")
     else:
-        lines.append("- **流清单**: 无流登记表（仅主表）")
+        lines.append("（无流登记表）")
 
-    # 能力标签摘要。
-    cap_desc = []
-    if caps.get("has_imu"):
-        cap_desc.append(f"IMU（{caps.get('imu_axes', '?')} 轴）")
-    if caps.get("has_force"):
-        cap_desc.append("力/力矩")
-    if caps.get("has_actions"):
-        cap_desc.append("状态/动作")
-    if caps.get("has_video_streams"):
-        cap_desc.append("视频流")
-    if caps.get("has_calibration"):
-        cap_desc.append("标定")
-    lines.append(f"- **能力标签**: {', '.join(cap_desc) if cap_desc else '无'}")
+    # ---- 模态矩阵（能力标签有无对照表）----
+    lines.append("")
+    lines.append("**模态矩阵**")
+    rows = [
+        ("视频流", caps.get("has_video_streams")),
+        ("IMU", caps.get("has_imu")),
+        ("力/力矩", caps.get("has_force")),
+        ("标定", caps.get("has_calibration")),
+        ("状态/动作", caps.get("has_actions")),
+        ("语言标注", caps.get("has_language")),
+    ]
+    lines.append("| 模态 | 有无 |")
+    lines.append("|---|---|")
+    for label, present in rows:
+        mark = "✓" if present else "✗"
+        lines.append(f"| {label} | {mark} |")
 
-    guessed = context.meta.get("guessed_type", "unknown")
-    lines.append(f"- **推测类型**: {guessed}")
     return "\n".join(lines)
 
 
+def _fmt_size(nbytes: int) -> str:
+    """格式化字节数为可读大小。"""
+    for unit in ("B", "KB", "MB", "GB"):
+        if nbytes < 1024 or unit == "GB":
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024.0
+    return f"{nbytes:.1f} GB"
+
+
 def _build_qc_section(context: RunContext) -> tuple[str, int]:
-    """质检结果章节，返回 (内容, 条目数)。"""
+    """质检结果章节（检查明细表）。返回 (内容, 条目数)。"""
     qc = context.meta.get("qc", {})
     if not qc:
         return "（未运行质检工具，无质检结果。）", 0
 
     lines = []
     count = 0
+
     if "check_temporal_sync" in qc:
         ts = qc["check_temporal_sync"]
         result = ts.get("result", "unknown")
         vlevel = ts.get("verification_level", "")
         note = "（基于时间戳一致性，物理级未验证）" if vlevel == "timestamp_consistency" else ""
         lines.append(f"- 时间对齐（check_temporal_sync）: **{result}**{note}")
+        detail = ts.get("detail") or {}
+        # 各流时间戳检查明细。
+        sc = detail.get("stream_checks", {})
+        if sc:
+            lines.append("")
+            lines.append("  各流时间戳检查：")
+            lines.append("  | 流 | 乱序 | 重复 | 丢帧率 | 实测采样率(Hz) |")
+            lines.append("  |---|---|---|---|---|")
+            for name, v in sc.items():
+                if v.get("status") == "skipped":
+                    lines.append(f"  | {Path(name).name} | - | - | - | - (skipped: {v.get('reason','')}) |")
+                else:
+                    lines.append(f"  | {Path(name).name} | {v.get('disorder_count','?')} | {v.get('duplicate_count','?')} | {v.get('frame_loss_ratio','?')} | {v.get('actual_rate_hz','?')} |")
+        # 残差与漂移。
+        resid = detail.get("residuals", {})
+        for name, v in resid.items():
+            lines.append(f"  - 对齐残差（{Path(name).name} 相对基线）: max={v.get('residual_max_ms','?')} ms, mean={v.get('residual_mean_ms','?')} ms")
+        for name, v in detail.get("drift", {}).items():
+            lines.append(f"  - 漂移（{Path(name).name}）: 斜率 {v.get('drift_slope_ms_per_s','?')} ms/s, 检出={v.get('drift_detected','?')}")
         count += 1
+
     if "check_sensor_sanity" in qc:
         sn = qc["check_sensor_sanity"]
         result = sn.get("result", "unknown")
         const = sn.get("constant_channels", [])
         extra = f"，恒定通道 {len(const)} 个" if const else ""
         lines.append(f"- 传感器合理性（check_sensor_sanity）: **{result}**{extra}")
+        detail = sn.get("detail") or {}
+        streams_detail = detail.get("streams", {})
+        if streams_detail:
+            lines.append("")
+            lines.append("  各流检查明细：")
+            lines.append("  | 流 | 类型 | 单位 | 重力 | 陀螺仪 | 饱和 | 饱和比例 | NaN比例 |")
+            lines.append("  |---|---|---|---|---|---|---|---|")
+            for name, v in streams_detail.items():
+                if v.get("type") == "imu":
+                    lines.append(f"  | {Path(name).name} | imu | {v.get('accel_unit','?')} | {v.get('gravity_verdict','?')} | {v.get('gyro_verdict','?')} | {v.get('saturation_verdict','?')} | {v.get('gyro_saturation_ratio','?')} | {v.get('nan_ratio','?')} |")
+                else:
+                    lines.append(f"  | {Path(name).name} | force | - | - | - | {v.get('saturation_verdict','?')} | {v.get('saturation_ratio','?')} | {v.get('nan_ratio','?')} |")
+        if const:
+            lines.append(f"  - 恒定通道（疑似掉线）: {', '.join(const)}")
         count += 1
+
     return "\n".join(lines), count
 
 
 def _build_stats_section(findings: list[dict]) -> tuple[str, int]:
-    """任务级统计章节，保留推测标注。返回 (内容, 条目数)。"""
+    """任务级统计章节，保留推测标注与关键数字。返回 (内容, 条目数)。"""
     stat_items = [f for f in findings if f.get("type") == "stat"]
     if not stat_items:
         return "（无任务级统计。）", 0
@@ -98,7 +173,32 @@ def _build_stats_section(findings: list[dict]) -> tuple[str, int]:
     for f in stat_items:
         metric = f.get("metric", "task_level")
         summary = f.get("summary", "")
+        m = f.get("metrics") or {}
         lines.append(f"- **{metric}**: {summary}")
+
+        # 关键数字明细（全部来自 metrics 的真实计算）。
+        n_ep = m.get("n_episodes")
+        sr = m.get("success_rate")
+        if n_ep is not None:
+            lines.append(f"  - episode 数: {n_ep}")
+        if sr is not None:
+            lines.append(f"  - 成功率: {sr}")
+
+        rom = m.get("joint_range_of_motion")
+        if rom:
+            lines.append("  - 关节活动范围:")
+            for col, v in rom.items():
+                lines.append(f"    - {col}: min={v.get('min')}, max={v.get('max')}, range={v.get('range')}")
+
+        ed = m.get("episode_duration")
+        if ed:
+            lines.append(f"  - episode 时长分布: min={ed.get('min')}, 中位={ed.get('median')}, max={ed.get('max')}")
+
+        oe = m.get("outlier_episodes")
+        if oe:
+            outlier_desc = ", ".join(f"episode {o.get('episode')}(时长 {o.get('duration')})" for o in oe.get("outliers", []))
+            lines.append(f"  - 离群 episode ({oe.get('method','IQR')}, k={oe.get('k')}): {outlier_desc if outlier_desc else '无'}")
+
         # 该条目的推测/注意事项标注（如 success 聚合规则为推测）。
         for note in f.get("semantic_notes", []):
             lines.append(f"  - 标注（推测/注意事项）: {note}")

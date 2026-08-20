@@ -184,10 +184,19 @@ def compute_stats_impl(
             duration_col = str(c)
             break
     outlier_episodes: list[Any] = []
+    episode_duration: dict[str, Any] | None = None
     if duration_col is not None:
         # 每 episode 的时长（取末帧时长或均值）。
         ep_dur = df.groupby(ep_series)[duration_col].last()
         ep_dur = ep_dur.dropna()
+        if len(ep_dur) >= 1:
+            episode_duration = {
+                "min": round(float(ep_dur.min()), 4),
+                "median": round(float(ep_dur.median()), 4),
+                "max": round(float(ep_dur.max()), 4),
+                "per_episode": {str(k): round(float(v), 4) for k, v in ep_dur.items()},
+            }
+            metrics["episode_duration"] = episode_duration
         if len(ep_dur) >= 4:
             q1 = float(ep_dur.quantile(0.25))
             q3 = float(ep_dur.quantile(0.75))
@@ -228,6 +237,14 @@ def compute_stats_impl(
         "n_episodes": metrics.get("episode_distribution", {}).get("n_episodes"),
         "summary": _make_finding_summary(metrics, metric),
         "semantic_notes": list(semantic_notes),
+        # 关键统计数字（供报告渲染明细），内容全部来自 metrics 的真实计算。
+        "metrics": {
+            "n_episodes": metrics.get("episode_distribution", {}).get("n_episodes"),
+            "success_rate": metrics.get("success_rate", {}).get("overall"),
+            "joint_range_of_motion": metrics.get("joint_range_of_motion"),
+            "outlier_episodes": metrics.get("outlier_episodes"),
+            "episode_duration": metrics.get("episode_duration"),
+        },
     }
     context.findings.append(finding)
 

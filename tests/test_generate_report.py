@@ -154,3 +154,64 @@ def test_limitations_generalizes_all_semantic_notes(tmp_path: Path) -> None:
     # 局限性章节应包含两个工具（stat 与 chart）的 semantic_notes。
     assert "success 聚合规则为推测" in content
     assert "该图表基于推测的时间戳对齐" in content
+
+
+def test_report_profile_contains_stream_details(tmp_path: Path) -> None:
+    """数据集画像章节应含流明细表（角色/格式/采样率/来源文件）。"""
+    findings = [
+        {"tool": "compute_stats", "type": "stat", "metric": "success_rate",
+         "n_episodes": 5, "summary": "5 个 episode"},
+    ]
+    meta = {
+        "capabilities": {"has_imu": True, "imu_axes": 6, "has_force": True, "has_actions": True},
+        "streams": [
+            {"path": "imu.csv", "format": "csv", "kind": "imu",
+             "role": {"role": "IMU 传感器"}, "measured_rate": {"sample_rate_hz": 100.0}},
+            {"path": "ft.csv", "format": "csv", "kind": "force",
+             "role": {"role": "力/力矩传感器"}, "measured_rate": None},
+        ],
+        "guessed_type": "IMU 数据",
+    }
+    ctx = _ctx(output_dir=str(tmp_path), findings=findings, meta=meta)
+
+    r = generate_report_impl(ctx)
+    content = Path(r["file_path"]).read_text(encoding="utf-8")
+
+    # 画像含流明细表（流名/角色/采样率）。
+    assert "流明细" in content
+    assert "IMU 传感器" in content
+    assert "100.0 Hz" in content or "100 Hz" in content
+    # 模态矩阵。
+    assert "模态矩阵" in content
+    assert "视频流" in content
+
+
+def test_report_qc_section_contains_measurements(tmp_path: Path) -> None:
+    """质检章节应含测量值与阈值（检查明细表）。"""
+    findings = [
+        {"tool": "compute_stats", "type": "stat", "metric": "success_rate",
+         "n_episodes": 5, "summary": "5 个 episode"},
+    ]
+    qc = {
+        "check_temporal_sync": {
+            "result": "warn", "verification_level": "timestamp_consistency",
+            "detail": {
+                "stream_checks": {
+                    "imu.csv": {"present": True, "disorder_count": 0, "duplicate_count": 0,
+                                "frame_loss_ratio": 0.01, "actual_rate_hz": 100.0},
+                },
+                "residuals": {"ft.csv": {"residual_max_ms": 5.0, "residual_mean_ms": 5.0}},
+                "drift": {"imu.csv": {"drift_slope_ms_per_s": 2.0, "drift_detected": False}},
+                "thresholds": {"frame_loss_ratio": 0.02, "residual_threshold_ms": 5.0},
+            },
+        },
+    }
+    ctx = _ctx(output_dir=str(tmp_path), findings=findings, qc=qc)
+
+    r = generate_report_impl(ctx)
+    content = Path(r["file_path"]).read_text(encoding="utf-8")
+
+    # 质检章节含测量值（丢帧率、残差）与阈值。
+    assert "0.01" in content  # 丢帧率测量值
+    assert "5.0 ms" in content  # 残差测量值
+    assert "残差" in content

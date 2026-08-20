@@ -474,12 +474,41 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
     if warns:
         user_message += " 存在疑点：" + "；".join(warns)
 
-    # 质检结果写回 meta["qc"]，供 compute_stats 等下游读取质检状态摘要。
+    # 质检结果写回 meta["qc"]，供 compute_stats / generate_report 读取质检明细。
     qc = context.meta.setdefault("qc", {})
+    detail_streams: dict[str, Any] = {}
+    for k, c in checks.items():
+        if k == "_constant_channels" or c.get("type") not in ("imu", "force"):
+            continue
+        if c.get("type") == "imu":
+            detail_streams[k] = {
+                "type": "imu",
+                "accel_unit": c.get("accel_unit"),
+                "gravity_verdict": (c.get("gravity_check") or {}).get("verdict"),
+                "gyro_verdict": (c.get("gyro_check") or {}).get("verdict"),
+                "saturation_verdict": (c.get("saturation_check") or {}).get("verdict"),
+                "gyro_saturation_ratio": (c.get("saturation_check") or {}).get("gyro_saturation_ratio"),
+                "nan_ratio": c.get("nan_ratio"),
+            }
+        else:  # force
+            detail_streams[k] = {
+                "type": "force",
+                "saturation_ratio": c.get("saturation_ratio"),
+                "saturation_verdict": c.get("verdict"),
+                "nan_ratio": c.get("nan_ratio"),
+            }
     qc["check_sensor_sanity"] = {
         "result": result,
         "constant_channels": constant_channels,
         "dataset": dataset_id,
+        "detail": {
+            "streams": detail_streams,
+            "thresholds": {
+                "saturation_ratio": settings.sanity_saturation_ratio,
+                "nan_ratio": settings.sanity_nan_ratio,
+                "gravity_tolerance": settings.sanity_gravity_tolerance,
+            },
+        },
     }
 
     return {
