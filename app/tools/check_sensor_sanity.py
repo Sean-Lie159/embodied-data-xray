@@ -102,6 +102,27 @@ def _constant_columns(
     return constant
 
 
+def _saturation_ratio(data: dict[str, np.ndarray]) -> float:
+    """计算量程饱和削顶比例（连续重复出现的极值点比例，取各通道最大值）。
+
+    Args:
+        data: {列名: 数值数组}。
+
+    Returns:
+        饱和削顶比例（0~1）；无有效数据返回 0.0。
+    """
+    sat = 0.0
+    for c, v in data.items():
+        vc = v[~np.isnan(v)]
+        if vc.size == 0:
+            continue
+        vmax, vmin = float(np.max(vc)), float(np.min(vc))
+        if vmax > vmin:
+            flat = (v == vmax) | (v == vmin)
+            sat = max(sat, float(np.mean(flat)))
+    return round(sat, 4)
+
+
 def _stationary_mask(
     norms: np.ndarray, window: int, var_threshold: float
 ) -> tuple[np.ndarray, float]:
@@ -351,6 +372,21 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
                 else:
                     gyro_check["verdict"] = "pass"
 
+        # IMU 通道量程饱和削顶检测（陀螺仪 + 加速度计，快速运动下陀螺仪削顶是高频问题）。
+        accel_sat = _saturation_ratio({c: data[c] for c in accel_cols if c in data})
+        gyro_sat = _saturation_ratio({c: data[c] for c in gyro_cols if c in data})
+        imu_sat = max(accel_sat, gyro_sat)
+        saturation_check: dict[str, Any] = {
+            "accel_saturation_ratio": accel_sat,
+            "gyro_saturation_ratio": gyro_sat,
+            "threshold": settings.sanity_saturation_ratio,
+        }
+        if imu_sat > settings.sanity_saturation_ratio:
+            saturation_check["verdict"] = "fail"
+            failures.append(f"{key}: IMU 量程饱和削顶比例 {round(imu_sat*100,1)}% 超阈")
+        else:
+            saturation_check["verdict"] = "pass"
+
         checks[key] = {
             "type": "imu",
             "accel_unit": unit,
@@ -360,6 +396,7 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
             "nan_ratio": nan_ratio,
             "gravity_check": gravity_check,
             "gyro_check": gyro_check,
+            "saturation_check": saturation_check,
             "per_axis_accel": per_axis_accel,
         }
         if nan_ratio > settings.sanity_nan_ratio:
@@ -385,22 +422,12 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
         nan_ratio = _nan_inf_ratio(arr)
 
         # 饱和削顶：连续重复出现的极值点比例。
-        sat_ratio = 0.0
-        for c in cols:
-            v = data[c]
-            vc = v[~np.isnan(v)]
-            if vc.size == 0:
-                continue
-            vmax, vmin = float(np.max(vc)), float(np.min(vc))
-            if vmax > vmin:
-                # 等于极值且前后相同（连续削顶）的比例。
-                flat = (v == vmax) | (v == vmin)
-                sat_ratio = max(sat_ratio, float(np.mean(flat)))
+        sat_ratio = _saturation_ratio({c: data[c] for c in cols})
 
         force_check = {
             "type": "force",
             "nan_ratio": nan_ratio,
-            "saturation_ratio": round(sat_ratio, 4),
+            "saturation_ratio": sat_ratio,
             "threshold": settings.sanity_saturation_ratio,
         }
         if sat_ratio > settings.sanity_saturation_ratio:

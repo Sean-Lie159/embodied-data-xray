@@ -209,3 +209,32 @@ def test_per_axis_output_present(tmp_path: Path) -> None:
     k = _first_check(r)
     assert "per_axis_accel" in r["checks"][k]
     assert "accel_z" in r["checks"][k]["per_axis_accel"]
+
+
+def test_imu_gyro_saturation_detected(tmp_path: Path) -> None:
+    """IMU 陀螺仪量程饱和削顶应被检出（fail）。"""
+    t = np.arange(0, 2.0, 0.01)
+    n = len(t)
+    df = pd.DataFrame({
+        "accel_x": np.full(n, 0.0), "accel_y": np.full(n, 0.0), "accel_z": np.full(n, 9.8),
+        # gyro_x 大量削顶在 ±0.2（大量等于极值点）。
+        "gyro_x": np.clip(np.sin(3 * t), -0.2, 0.2),
+        "gyro_y": 0.05 * np.cos(t),
+        "gyro_z": 0.05 * np.sin(2 * t),
+    })
+    p = tmp_path / "imu_sat.csv"
+    df.to_csv(p, index=False)
+    meta = {
+        "capabilities": {"has_imu": True},
+        "streams": [{
+            "path": str(p), "format": "csv", "kind": "imu",
+            "channels": ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"],
+        }],
+    }
+    r = check_sensor_sanity_impl(RunContext(dataset_id="sat", df=None, meta=meta))
+    k = _first_check(r)
+    sat = r["checks"][k]["saturation_check"]
+    # 陀螺仪削顶比例应 > 0。
+    assert sat["gyro_saturation_ratio"] > 0.0
+    # 检出削顶 → fail。
+    assert r["result"] == "fail"
