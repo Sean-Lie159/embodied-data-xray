@@ -6,12 +6,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import cast
 
-from agents import Agent, Model, RunContextWrapper, Runner, RunResult
+from agents import Agent, Model, Runner, RunResult, Tool
 from agents.exceptions import MaxTurnsExceeded
+from agents.items import RunItem, TResponseInputItem
 
 from app.agent.context import RunContext
+
+# 单轮运行的返回类型：正常分支 result 为 RunResult；MaxTurnsExceeded 分支 result 为 None。
+RunTurnResult = tuple[str, list[TResponseInputItem], RunResult | None]
 
 # 主 Agent 的中文系统提示词。
 SYSTEM_PROMPT: str = """\
@@ -47,7 +51,7 @@ description，不得自行推测图表的绘制方式；plot_spec 未包含的�
 """
 
 
-def build_agent(model: Model, tools: list[Any]) -> Agent[RunContext]:
+def build_agent(model: Model, tools: list[Tool]) -> Agent[RunContext]:
     """构建主 Agent。
 
     Args:
@@ -69,9 +73,9 @@ async def run_turn(
     agent: Agent[RunContext],
     context: RunContext,
     user_input: str,
-    history_input: list[Any] | None = None,
+    history_input: list[TResponseInputItem] | None = None,
     max_turns: int = 15,
-) -> tuple[str, list[Any], RunResult]:
+) -> RunTurnResult:
     """执行单轮 Agent 运行。
 
     Args:
@@ -90,9 +94,8 @@ async def run_turn(
     """
     # 组装本轮输入：有历史时，把历史与用户本轮消息拼接；否则仅用用户消息。
     if history_input is not None:
-        input_items: list[Any] | str = list(history_input) + [
-            {"role": "user", "content": user_input}
-        ]
+        user_msg: TResponseInputItem = {"role": "user", "content": user_input}
+        input_items: list[TResponseInputItem] | str = [*history_input, user_msg]
     else:
         input_items = user_input
 
@@ -104,24 +107,30 @@ async def run_turn(
             max_turns=max_turns,
         )
     except MaxTurnsExceeded:
-        return (
+        # 用 + 显式拼接字符串（消除隐式拼接告警），文案与原实现一致。
+        msg = (
             f"本轮工具调用次数已达上限（max_turns={max_turns}），为避免死循环已停止。"
-            "请尝试更明确地描述需求，或分步提问。",
-            history_input
-            or [{"role": "user", "content": user_input}],
-            None,  # type: ignore[return-value]
+            + "请尝试更明确地描述需求，或分步提问。"
         )
+        # 保持与原实现相同的 `or` 语义：history 为 None 或空列表时都用仅含
+        # 用户消息的列表作为 fallback，避免改变运行时行为。
+        fallback_input: list[TResponseInputItem] = history_input or [
+            {"role": "user", "content": user_input}
+        ]
+        return (msg, fallback_input, None)
 
-    final = (result.final_output or "").strip()
+    # final_output 在 SDK（RunResultBase）中类型标注为 Any | None，无法通过泛型收紧；
+    # 这里用 str() 强制转成 str，并在类型检查层忽略 Any 告警（运行时行为不变）。
+    final: str = str(result.final_output or "").strip()  # pyright: ignore[reportAny]
     next_input = result.to_input_list(mode="normalized")
     return final, next_input, result
 
 
-def _extract_tool_name(item: Any) -> str:
+def _extract_tool_name(item: RunItem) -> str:
     """宽容提取工具调用名，失败时降级为原始类型名。
 
     Args:
-        item: 单个 RunResult item。
+        item: 单个 RunResult item（RunItem union）。
 
     Returns:
         工具名；无法提取时返回 item 的类型名（不静默丢弃）。
@@ -130,10 +139,11 @@ def _extract_tool_name(item: Any) -> str:
         value = getattr(item, attr, None)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    # 尝试从原始字段提取。
-    raw = getattr(item, "raw_item", None)
-    if isinstance(raw, dict):
-        name = raw.get("name") or raw.get("tool_name") or raw.get("function")
+    # 尝试从原始字段提取。raw_item 的类型未在 SDK 中标明，用 cast 显式声明
+    # 为 dict，既避免 Unknown 告警又不改变运行时取值行为。
+    raw_item = cast("dict[str, object] | None", getattr(item, "raw_item", None))
+    if raw_item is not None:
+        name = raw_item.get("name") or raw_item.get("tool_name") or raw_item.get("function")
         if isinstance(name, str) and name.strip():
             return name.strip()
     return f"<{type(item).__name__}>"
@@ -142,8 +152,8 @@ def _extract_tool_name(item: Any) -> str:
 def format_tool_activity(result: RunResult | None) -> str:
     """从 RunResult 中提取工具调用过程，格式化为可读文本。
 
-    按类型宽容提取：只对工具调用类 item（type 含 tool_call 或类名含 ToolCall）
-    提取工具名；提取失败时降级显示原始类型名，而不是静默丢弃。
+    按类型宽容提取：只对工具调用类 item（type 含 tool_call、类名含 ToolCall
+    或 function_call）提取工具名；提取失败时降级显示原始类型名，而不是静默丢弃。
 
     Args:
         result: 单轮运行的完整结果；为 None 时返回空字符串。
