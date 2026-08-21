@@ -64,6 +64,31 @@ def test_areply_async_returns_chat_turn(monkeypatch) -> None:
     assert turn.reply == "回复"
 
 
+def test_areply_handles_max_turns_exceeded(monkeypatch) -> None:
+    """MaxTurnsExceeded 时 run_turn 返回 result=None，areply 应返回友好提示而不崩溃。
+
+    契约：run_turn 触发超限时返回 (友好提示, fallback_input, None)。调用方不得
+    对 result 解引用，应判空后返回空工具轨迹与友好提示。
+    """
+    async def fake_run_turn(agent, context, user_input, history_input=None, max_turns=15):
+        return (
+            "本轮工具调用次数已达上限（max_turns=15），为避免死循环已停止。请尝试更明确地描述需求，或分步提问。",
+            [{"role": "user", "content": user_input}],
+            None,
+        )
+
+    monkeypatch.setattr(chat_service, "run_turn", fake_run_turn)
+
+    import asyncio
+
+    service = ChatService()
+    turn = asyncio.run(service.areply("分析一下"))
+    assert "已达上限" in turn.reply
+    assert turn.tool_activity == ""
+    assert turn.tool_calls == []
+    assert isinstance(turn.findings, list)
+
+
 def test_dataset_summary_shape() -> None:
     """dataset_summary 应返回能力标签与流清单摘要。"""
     service = ChatService()

@@ -16,6 +16,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+from agents import RunResult
+
 from app.agent.agent import build_agent, format_tool_activity, run_turn
 from app.agent.context import RunContext
 from app.config import get_settings
@@ -110,8 +112,17 @@ class ChatService:
         }
 
 
-def _extract_tool_names(result) -> list[str]:
-    """从 RunResult 中提取本轮调用的工具名列表。"""
+def _extract_tool_names(result: RunResult | None) -> list[str]:
+    """从 RunResult 中提取本轮调用的工具名列表。
+
+    Args:
+        result: 单轮运行的完整结果；MaxTurnsExceeded 时 run_turn 返回 None。
+
+    Returns:
+        工具名列表；result 为 None 时返回空列表（不抛 AttributeError）。
+    """
+    if result is None:
+        return []
     names: list[str] = []
     for item in result.new_items:
         it = getattr(item, "type", "") or ""

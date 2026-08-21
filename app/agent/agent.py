@@ -14,7 +14,8 @@ from agents.items import RunItem, TResponseInputItem
 
 from app.agent.context import RunContext
 
-# 单轮运行的返回类型：正常分支 result 为 RunResult；MaxTurnsExceeded 分支 result 为 None。
+# 单轮运行的返回类型。契约：正常分支 result 为 RunResult（含本轮完整结果）；
+# MaxTurnsExceeded 分支 result 为 None（此时 final_output 已由本函数生成友好提示）。
 RunTurnResult = tuple[str, list[TResponseInputItem], RunResult | None]
 
 # 主 Agent 的中文系统提示词。
@@ -87,7 +88,9 @@ async def run_turn(
 
     Returns:
         (final_output, next_input, result) 三元组：final_output 为最终回答文本，
-        next_input 为可传给下一轮 run 的 input 列表，result 为完整 RunResult。
+        next_input 为可传给下一轮 run 的 input 列表，result 为完整 RunResult；
+        当触发 MaxTurnsExceeded 时 result 为 None，此时 final_output 已由本函数
+        生成友好的超限提示，调用方不得再对 result 解引用（需判空）。
 
     Raises:
         ConfigError: 工具或模型配置异常。
