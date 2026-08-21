@@ -38,3 +38,24 @@ def test_streamlit_app_no_agent_call_without_input() -> None:
     # 无 chat_input 输入 → 不应产生 assistant 消息。
     chat_msgs = [m for m in at.chat_message if m.name == "assistant"]
     assert len(chat_msgs) == 0
+
+
+def test_streamlit_app_user_input_renders_chat() -> None:
+    """模拟一次用户输入：应无异常渲染，且聊天记录出现（assistant 消息）。
+
+    这是 UI 改动的回归保障：验证用户输入后，agent 回复能在聊天区正常渲染。
+    会触发一次真实模型调用（轻量"你好"），依赖 .env 配置的模型可用。
+    """
+    at = _app()
+    at.run()
+    # 模拟用户输入。
+    at.chat_input[0].set_value("你好").run()
+    # 无未处理异常。
+    assert not at.exception
+    # 用户与助手消息都应出现。
+    user_msgs = [m for m in at.chat_message if m.name == "user"]
+    assistant_msgs = [m for m in at.chat_message if m.name == "assistant"]
+    assert len(user_msgs) >= 1
+    assert len(assistant_msgs) >= 1
+    # 助手消息有非空内容。
+    assert any((m.markdown[0].value if m.markdown else "") for m in assistant_msgs)
