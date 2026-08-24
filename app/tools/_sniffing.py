@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import json
-import random
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -23,10 +22,16 @@ import pandas as pd
 # 视频扩展名（用于视频嗅探）。
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
 
+# 音频扩展名（仅登记路径与格式，不做深度嗅探）。
+_AUDIO_EXTS = {".m4a", ".wav", ".mp3", ".flac", ".aac", ".ogg"}
+
+# 图片扩展名（仅登记路径与格式）。
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+
 # 表格扩展名（用于列名嗅探）。
 _TABLE_EXTS = {".csv", ".json", ".parquet"}
 
-# 标定相关扩展名。
+# 标定相关扩展名（json/yaml 可能含标定键，需进一步解析判定）。
 _CALIB_EXTS = {".yaml", ".yml", ".json"}
 
 # 标定文件关键键。
@@ -36,45 +41,68 @@ _CALIB_KEYS = {"intrinsic", "extrinsic", "k", "d", "intrinsics", "extrinsics", "
 _ACTION_STATE_COLS = ("qpos", "qvel", "qacc", "action", "obs", "state", "cmd")
 
 
-def _random_sample(paths: list[Path], k: int = 3) -> list[Path]:
-    """从列表中随机抽 k 个（不足则全取）。"""
-    if len(paths) <= k:
-        return list(paths)
-    return random.sample(paths, k)
-
-
 def probe_directory(root: Path) -> dict[str, Any]:
-    """递归普查目录，返回扩展名分布与目录结构。
+    """递归普查目录，返回完整文件清单（按类型分组）与扩展名分布。
+
+    返回完整路径清单、不抽样、不省略；所有列表按相对路径排序，保证同一目录
+    两次加载结果完全一致（确定性）。
 
     Args:
         root: 数据集根目录。
 
     Returns:
-        dict，包含 total_files、ext_dist（扩展名→数量）、subdirs（子目录清单）、
-        以及按类别抽取的样例文件路径清单。
+        dict，含 total_files、ext_dist（扩展名→数量）、subdirs（子目录清单）、
+        以及按类型分组的完整文件路径清单：tables / videos / audios / images /
+        cals（标定候选）/ others（其余）。所有路径均为完整路径字符串，按相对
+        root 的顺序排序，保证确定性。
     """
     ext_counter: Counter[str] = Counter()
     subdirs: list[str] = []
-    all_files: list[Path] = []
+    grouped: dict[str, list[Path]] = {
+        "tables": [],
+        "videos": [],
+        "audios": [],
+        "images": [],
+        "cals": [],
+        "others": [],
+    }
     for item in root.rglob("*"):
         if item.is_dir():
             subdirs.append(str(item.relative_to(root)))
         elif item.is_file():
-            all_files.append(item)
-            ext_counter[item.suffix.lower()] += 1
+            ext = item.suffix.lower()
+            ext_counter[ext] += 1
+            # 标定候选（json/yaml）优先归入 cals，避免被当作数据表。
+            if ext in _CALIB_EXTS:
+                grouped["cals"].append(item)
+            elif ext in _TABLE_EXTS:
+                grouped["tables"].append(item)
+            elif ext in _VIDEO_EXTS:
+                grouped["videos"].append(item)
+            elif ext in _AUDIO_EXTS:
+                grouped["audios"].append(item)
+            elif ext in _IMAGE_EXTS:
+                grouped["images"].append(item)
+            else:
+                grouped["others"].append(item)
 
-    # 按类别抽样例文件。
-    tables = [p for p in all_files if p.suffix.lower() in _TABLE_EXTS]
-    videos = [p for p in all_files if p.suffix.lower() in _VIDEO_EXTS]
-    cals = [p for p in all_files if p.suffix.lower() in _CALIB_EXTS]
+    # 固定排序（按相对 root 的路径），再转完整路径字符串：保证确定性。
+    subdirs.sort()
+    for key in grouped:
+        grouped[key].sort(key=lambda p: str(p.relative_to(root)))
+    for key in grouped:
+        grouped[key] = [str(p) for p in grouped[key]]
 
     return {
-        "total_files": len(all_files),
-        "ext_dist": dict(ext_counter),
+        "total_files": sum(len(v) for v in grouped.values()),
+        "ext_dist": dict(sorted(ext_counter.items())),
         "subdirs": subdirs,
-        "sample_tables": [str(p) for p in _random_sample(tables)],
-        "sample_videos": [str(p) for p in _random_sample(videos)],
-        "sample_calibs": [str(p) for p in _random_sample(cals)],
+        "tables": grouped["tables"],
+        "videos": grouped["videos"],
+        "audios": grouped["audios"],
+        "images": grouped["images"],
+        "cals": grouped["cals"],
+        "others": grouped["others"],
     }
 
 
@@ -291,15 +319,17 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
     """汇总能力标签与推测类型。
 
     Args:
-        probe: probe_directory 的结果。
-        table_sniffs: 各抽样表格的 sniff_table_columns 结果列表。
+        probe: probe_directory 的结果（含按类型分组的完整清单）。
+        table_sniffs: 各表格的 sniff_table_columns 结果列表。
 
     Returns:
         dict，含 capabilities（能力标签）与 guessed_type / guessed_type_confidence。
     """
-    has_video = len(probe["sample_videos"]) > 0 or any(
+    has_video = len(probe["videos"]) > 0 or any(
         v in _VIDEO_EXTS for v in probe["ext_dist"]
     )
+    has_audio = len(probe["audios"]) > 0
+    has_image = len(probe["images"]) > 0
 
     # 汇总表格嗅探：取多数 / 任一。
     imu_present = any(s["has_imu"]["present"] for s in table_sniffs)
@@ -318,9 +348,11 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
 
     capabilities: dict[str, Any] = {
         "has_video_streams": has_video,
+        "has_audio": has_audio,
+        "has_image": has_image,
         "has_imu": imu_present,
         "has_force": force_present,
-        "has_calibration": len(probe["sample_calibs"]) > 0,
+        "has_calibration": len(probe["cals"]) > 0,
         "has_actions": actions_present,
     }
     if imu_axes is not None:
@@ -465,23 +497,30 @@ def build_streams_registry(
     probe: dict[str, Any],
     table_info: list[dict[str, Any]],
     video_meta: list[dict[str, Any]],
+    audio_meta: list[dict[str, Any]] | None = None,
+    image_meta: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """构建流登记表（供 inspect_streams 按需读取）。
 
     每条流含 {path, format, kind, channels, role}。表格流按列名嗅探的命中结果
-    归入对应 kind（imu/force/actions/pose/unknown）；视频流标记 kind="video"。
+    归入对应 kind（imu/force/actions/pose/unknown）；视频流标记 kind="video"；
+    音频/图片流只登记路径与格式（kind="audio"/"image"），不读取内容。
+
+    流登记表覆盖全部表格文件（读头部判类型）与全部视频/音频/图片文件，不做抽样。
 
     Args:
-        probe: probe_directory 的结果。
-        table_info: 表格嗅探信息列表（含 file 与 sniff）。
-        video_meta: 视频元数据列表。
+        probe: probe_directory 的结果（用于完整清单与确定性）。
+        table_info: 表格嗅探信息列表（含 file 与 sniff），覆盖全部表格文件。
+        video_meta: 视频元数据列表（覆盖全部视频文件）。
+        audio_meta: 音频元数据列表（覆盖全部音频文件）。
+        image_meta: 图片元数据列表（覆盖全部图片文件）。
 
     Returns:
         流登记表列表。
     """
     streams: list[dict[str, Any]] = []
 
-    # 表格流：根据嗅探结果判断 kind 与通道。
+    # 表格流：根据嗅探结果判断 kind 与通道（覆盖全部表格文件）。
     for t in table_info:
         path = t["file"]
         sniff = t["sniff"]
@@ -507,13 +546,35 @@ def build_streams_registry(
             "role": _role_for_kind(kind, path),
         })
 
-    # 视频流。
+    # 视频流（覆盖全部视频文件）。
     for v in video_meta:
         path = v.get("file", "unknown")
         streams.append({
             "path": path,
             "format": "video",
             "kind": "video",
+            "channels": [],
+            "role": infer_role(path),
+        })
+
+    # 音频流：只登记路径与格式，不读取内容。
+    for a in audio_meta or []:
+        path = a.get("file", "unknown")
+        streams.append({
+            "path": path,
+            "format": Path(path).suffix.lstrip(".").lower(),
+            "kind": "audio",
+            "channels": [],
+            "role": infer_role(path),
+        })
+
+    # 图片流：只登记路径与格式，不读取内容。
+    for im in image_meta or []:
+        path = im.get("file", "unknown")
+        streams.append({
+            "path": path,
+            "format": Path(path).suffix.lstrip(".").lower(),
+            "kind": "image",
             "channels": [],
             "role": infer_role(path),
         })

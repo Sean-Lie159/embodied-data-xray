@@ -186,12 +186,12 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     """
     probe = _sniffing.probe_directory(dir_path)
 
-    # 表格列名嗅探。
+    # 表格列名嗅探：覆盖全部表格文件（读头部判类型，成本可忽略），不做抽样。
     table_sniffs: list[dict[str, Any]] = []
     main_table: pd.DataFrame | None = None
     main_table_path: str | None = None
     table_info: list[dict[str, Any]] = []
-    for p_str in probe["sample_tables"]:
+    for p_str in probe["tables"]:
         p = Path(p_str)
         cols = _read_table_columns(p)
         if cols is None:
@@ -225,29 +225,37 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             main_table = None
 
-    # 标定检测。
+    # 标定检测：覆盖全部标定候选文件（json/yaml）。
     calib_detected = False
-    for p_str in probe["sample_calibs"]:
+    for p_str in probe["cals"]:
         obj = _parse_calibration(Path(p_str))
         if _sniffing.is_calibration_file(obj):
             calib_detected = True
             break
 
-    # 视频嗅探（ffprobe，可降级）。
+    # 视频嗅探（ffprobe，可降级），覆盖全部视频文件。
     video_files: list[str] = []
     video_meta: list[dict[str, Any]] = []
     ffprobe_degraded: str | None = None
-    for p_str in probe["sample_videos"]:
+    for p_str in probe["videos"]:
         video_files.append(p_str)
         meta = _sniffing.probe_video(p_str)
         if not meta.get("ffprobe_available", True):
             ffprobe_degraded = meta.get("user_message")
-        video_meta.append({"file": Path(p_str).name, **meta})
+        video_meta.append({"file": p_str, **meta})
+
+    # 音频/图片：只登记路径与格式，不读取内容（覆盖全部文件）。
+    audio_meta: list[dict[str, Any]] = []
+    image_meta: list[dict[str, Any]] = []
+    for p_str in probe["audios"]:
+        audio_meta.append({"file": p_str, "format": Path(p_str).suffix.lstrip(".").lower()})
+    for p_str in probe["images"]:
+        image_meta.append({"file": p_str, "format": Path(p_str).suffix.lstrip(".").lower()})
 
     caps_result = _sniffing.build_capabilities(probe, table_sniffs)
     caps_result["capabilities"]["has_calibration"] = calib_detected
 
-    # 记录视频路径清单与元数据（不读入内存）。
+    # 记录路径清单与元数据（不读入内存）。
     dataset_id = dir_path.name
     meta: dict[str, Any] = {
         "source": str(dir_path),
@@ -257,9 +265,13 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         "guessed_type_confidence": caps_result["guessed_type_confidence"],
         "video_files": video_files,
         "video_meta": video_meta,
-        # 流登记表：每条流含 {path, format, kind, channels, role}，供
-        # inspect_streams 按需读取时间戳实测采样率。
-        "streams": _sniffing.build_streams_registry(probe, table_info, video_meta),
+        "audio_files": [a["file"] for a in audio_meta],
+        "image_files": [i["file"] for i in image_meta],
+        # 流登记表：覆盖全部表格（读头部判类型）+ 视频/音频/图片（只登记路径）。
+        # 每条流含 {path, format, kind, channels, role}，供 inspect_streams 按需读取。
+        "streams": _sniffing.build_streams_registry(
+            probe, table_info, video_meta, audio_meta, image_meta
+        ),
     }
     context.meta = meta
     context.dataset_id = dataset_id
@@ -273,12 +285,21 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             "total_files": probe["total_files"],
             "ext_dist": probe["ext_dist"],
             "subdirs": probe["subdirs"][:20],
+            # 完整文件清单，按类型分组（全部路径，不抽样、不省略）。
+            "tables": probe["tables"],
+            "videos": probe["videos"],
+            "audios": probe["audios"],
+            "images": probe["images"],
+            "cals": probe["cals"],
+            "others": probe["others"],
         },
         "capabilities": caps_result["capabilities"],
         "guessed_type": caps_result["guessed_type"],
         "guessed_type_confidence": caps_result["guessed_type_confidence"],
         "video_files": video_files,
         "video_meta": video_meta,
+        "audio_files": [a["file"] for a in audio_meta],
+        "image_files": [i["file"] for i in image_meta],
         "table_info": table_info,
     }
     if main_table is not None:
