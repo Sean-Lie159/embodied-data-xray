@@ -25,17 +25,19 @@ _REAL_FILES = [
     "tracking_metainfo.csv", "信息.jpg",
 ]
 
-# 各 csv 的表头（保证列名嗅探可读；内容无关紧要）。
+# 各 csv 的表头 + 数据行（保证列名嗅探可读；内容无关紧要）。
+# 除 controller_poses.csv 仅为表头（验证空流检测）外，其余表格均含 ≥3 行数据，
+# 避免触发空流检测，从而能验证 accel/gyro 被识别为 IMU。
 _CSV_HEADERS = {
-    "accel.csv": "accel_x,accel_y,accel_z\n",
-    "audio_metainfo.csv": "key,value\n",
-    "controller_poses.csv": "pose_x,pose_y,pose_z\n",
-    "ctrl_metainfo.csv": "key,value\n",
-    "gyro.csv": "gyro_x,gyro_y,gyro_z\n",
-    "hand_tracking.csv": "hand_x,hand_y,hand_z\n",
-    "head_pose.csv": "ee_pos_x,ee_pos_y,ee_pos_z\n",
-    "rgb_metainfo.csv": "key,value\n",
-    "tracking_metainfo.csv": "key,value\n",
+    "accel.csv": "timestamp_ns,accel_x,accel_y,accel_z\n0,1,2,3\n4,5,6,7\n8,9,10,11\n",
+    "audio_metainfo.csv": "packet_index,pts_us,capture_utc_ns\n0,0,1\n1,1,2\n2,2,3\n",
+    "controller_poses.csv": "pose_x,pose_y,pose_z\n",  # 仅表头 → 空流
+    "ctrl_metainfo.csv": "frame_index,pts_us\n0,0\n1,1\n2,2\n",
+    "gyro.csv": "timestamp_ns,gyro_x,gyro_y,gyro_z\n0,1,2,3\n4,5,6,7\n8,9,10,11\n",
+    "hand_tracking.csv": "frame_number,left_joint0_id,left_joint0_name,left_active\n0,0,PALM,1\n1,0,PALM,1\n2,0,PALM,1\n",
+    "head_pose.csv": "timestamp_ns,ee_pos_x,ee_pos_y,ee_pos_z\n0,1,2,3\n4,5,6,7\n8,9,10,11\n",
+    "rgb_metainfo.csv": "frame_index,pts_us\n0,0\n1,1\n2,2\n",
+    "tracking_metainfo.csv": "frame_index,pts_us\n0,0\n1,1\n2,2\n",
 }
 
 # 各 json 的标定内容（含标定关键键）。

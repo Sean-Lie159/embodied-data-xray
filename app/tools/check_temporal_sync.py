@@ -248,15 +248,44 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     streams = context.meta.get("streams", [])
     capabilities = context.meta.get("capabilities", {})
 
-    # 逐流读取时间戳（表格流读文件；视频流 v1 不做帧级对齐）。
+    # 视频 ↔ metainfo 配对映射（type=media_metainfo），用于视频流时间戳级对齐。
+    video_metainfo: dict[str, str] = {}
+    for pair in context.meta.get("stream_pairs", []):
+        if pair.get("type") == "media_metainfo":
+            video_metainfo[pair.get("media", "")] = pair.get("metainfo", "")
+
+    # 逐流读取时间戳（表格流读文件；视频流若存在配对 metainfo 表，经该表参与
+    # 时间戳级对齐，注明时间戳来自曝光元数据而非容器）。
     per_stream: dict[str, dict[str, Any]] = {}
     streams_status: dict[str, str] = {}
     for s in streams:
         key = s.get("path") or s.get("kind")
         if s.get("kind") == "video":
-            per_stream[key] = {"kind": "video", "ts": None,
-                               "source": s.get("path")}
-            streams_status[key] = "未参与：v1 不做视频帧级对齐（容器时间戳不可靠，内容级对齐属 v2）"
+            meta_path = video_metainfo.get(s.get("path", ""))
+            if meta_path:
+                # 经配对 metainfo 表读取时间戳（exposure_start_utc_ns / pts_us 等）。
+                meta_ts = _read_timestamp_only(meta_path, "csv")
+                if meta_ts is not None:
+                    arr = pd_to_numeric(meta_ts)  # 已为 ndarray（见 pd_to_numeric）
+                    arr = arr[~np.isnan(arr)]
+                    per_stream[key] = {
+                        "kind": "video",
+                        "ts": arr if len(arr) > 0 else None,
+                        "source": meta_path,
+                        "timestamp_origin": "exposure_metadata",
+                    }
+                    streams_status[key] = (
+                        "参与对齐：经配对 metainfo 表读取曝光时间戳"
+                        "（时间戳来自曝光元数据而非容器）"
+                    )
+                else:
+                    per_stream[key] = {"kind": "video", "ts": None,
+                                       "source": s.get("path")}
+                    streams_status[key] = "未参与：配对的 metainfo 表无法读取时间戳"
+            else:
+                per_stream[key] = {"kind": "video", "ts": None,
+                                   "source": s.get("path")}
+                streams_status[key] = "未参与：v1 不做视频帧级对齐（容器时间戳不可靠，内容级对齐属 v2）"
         else:
             ts = _read_stream_timestamps(s)
             per_stream[key] = {
@@ -270,16 +299,16 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
             else:
                 streams_status[key] = "参与对齐"
 
-    # 可对齐流数：仅统计能实际读到时间戳列的表格流；视频流不计入。
+    # 可对齐流数：统计能实际读到时间戳列的流（含经 metainfo 配对的视频流）。
     alignable = [k for k, p in per_stream.items() if p["ts"] is not None]
     n_alignable = len(alignable)
     if n_alignable < 2:
         return {
             "success": False,
             "error": "not_applicable",
-            "reason": f"需要至少两路可对齐流（能读到时间戳列的表格流），当前可对齐流数 {n_alignable}",
-            "user_message": "check_temporal_sync 需要至少两路可对齐的数据流（能实际读取时间戳列的表格流，如 IMU 与力/力矩）。"
-            f"当前可对齐流数 {n_alignable}（视频流不计入，v1 不做视频帧级对齐），不适用。",
+            "reason": f"需要至少两路可对齐流（能读到时间戳列的表格流或经 metainfo 配对的视频流），当前可对齐流数 {n_alignable}",
+            "user_message": "check_temporal_sync 需要至少两路可对齐的数据流（能实际读取时间戳列的表格流，如 IMU 与力/力矩；或经配对 metainfo 表参与对齐的视频流）。"
+            f"当前可对齐流数 {n_alignable}（无配对 metainfo 的视频流不计入，v1 不做视频帧级对齐），不适用。",
             "streams_status": streams_status,
         }
 

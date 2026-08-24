@@ -22,7 +22,8 @@ def _make_dataset(tmp_path: Path, name: str = "robot_dataset") -> Path:
     (root / "imu" / "imu.csv").write_text(
         "accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z\n"
         "0,0,0,0,0,0\n"
-        "1,1,1,1,1,1\n",
+        "1,1,1,1,1,1\n"
+        "2,2,2,2,2,2\n",
         encoding="utf-8",
     )
     (root / "calib" / "cam0.yaml").write_text(

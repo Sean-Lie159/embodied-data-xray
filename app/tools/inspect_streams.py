@@ -22,8 +22,9 @@ from agents.decorators import tool
 from app.agent.context import RunContext
 from app.tools import _sniffing
 
-# 常见时间戳列名（用于实测采样率）。
-_TIMESTAMP_COLS = ("timestamp", "time", "ts", "ts_ns", "t", "stamp", "frame_time")
+# 常见时间戳列名（用于实测采样率）。直接复用 _sniffing 的权威集合，避免两份
+# 不同步导致真实数据的时间戳列（timestamp_ns / exposure_start_utc_ns 等）漏匹配。
+_TIMESTAMP_COLS = _sniffing._TIMESTAMP_COLS
 
 
 def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
@@ -237,9 +238,20 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
             "role": s.get("role", {}),
             "channels": s.get("channels", []),
             "sample_rate": rate,
+            # 第 2 层内容指纹透出：语义标签 + 依据 + 置信 + 状态 + 轴数 + 时间戳列。
+            "semantic_label": s.get("semantic_label"),
+            "label_evidence": s.get("label_evidence"),
+            "label_confidence": s.get("label_confidence"),
+            "status": s.get("status", "active"),
+            "imu_axes": s.get("imu_axes"),
+            "timestamp_column": s.get("timestamp_column"),
         }
         if kind == "video":
             continue  # 视频已在上方 video_streams 处理
+        if s.get("status") == "empty":
+            # 空流（行数 ≤ 阈值）显式标注，不计入可对齐流数。
+            other_streams.append(entry)
+            continue
         if kind == "imu":
             imu_streams.append(entry)
         elif kind == "force":
@@ -251,13 +263,17 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         else:
             other_streams.append(entry)
 
-    # IMU 汇总。
+    # IMU 汇总。优先用流配对（accel+gyro=六轴）标注轴数，否则用能力标签。
+    imu_6axis_pair = any(
+        p.get("type") == "imu_6axis" for p in context.meta.get("stream_pairs", [])
+    )
     imus: list[dict[str, Any]] = []
     if imu_streams:
-        imus.append({
-            "axes": capabilities.get("imu_axes"),
-            "streams": imu_streams,
-        })
+        axes = 6 if imu_6axis_pair else capabilities.get("imu_axes")
+        imu_entry: dict[str, Any] = {"axes": axes, "streams": imu_streams}
+        if imu_6axis_pair:
+            imu_entry["pairing"] = "accel + gyro 配对为一组六轴 IMU"
+        imus.append(imu_entry)
     elif capabilities.get("has_imu"):
         # 有 IMU 能力但无登记流（旧数据），用能力标签兜底。
         imus.append({
@@ -278,13 +294,27 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
     else:
         force = {"present": False, "channels": [], "n_channels": 0}
 
-    # 其他流（动作/位姿/未知）一并给出，便于模型理解完整设备清单。
+    # 其他流（动作/位姿/未知/空流）一并给出，便于模型理解完整设备清单。
     other_stream_list = [*action_streams, *other_streams]
+    # 空流清单：单独列出，明确标注未使用。
+    empty_streams = [
+        {"source": s.get("path"), "semantic_label": s.get("semantic_label"),
+         "label_evidence": s.get("label_evidence")}
+        for s in streams if s.get("status") == "empty"
+    ]
 
     # --- 标定 -------------------------------------------------------------
     has_calib = bool(capabilities.get("has_calibration"))
     calibration = {"present": has_calib, "parameters": "unknown"}
-    if has_calib and context.meta.get("source"):
+    calib_detail = context.meta.get("calibration_detail")
+    if has_calib and calib_detail:
+        names = [c.get("name") for c in calib_detail]
+        calibration["parameters"] = (
+            f"已检测到 {len(calib_detail)} 个标定文件：{names}；"
+            f"依据 {calib_detail[0].get('evidence', '')}"
+        )
+        calibration["files"] = calib_detail
+    elif has_calib and context.meta.get("source"):
         calibration["parameters"] = "已检测到标定文件（参数详见源目录 calib 文件）"
 
     # --- 汇总 -----------------------------------------------------------
@@ -293,6 +323,11 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "n_imus": len(imus),
         "has_force": force["present"],
         "has_calibration": has_calib,
+        "has_imu_6axis_pair": imu_6axis_pair,
+        "has_media_metainfo_pair": any(
+            p.get("type") == "media_metainfo" for p in context.meta.get("stream_pairs", [])
+        ),
+        "n_empty_streams": len(empty_streams),
         "clock_source": clock_source,
         "n_table_streams": len([s for s in streams if s.get("kind") != "video"]),
     }
@@ -306,11 +341,13 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "force_channels": force,
         "calibration": calibration,
         "table_streams": other_stream_list,
+        "empty_streams": empty_streams,
+        "stream_pairs": context.meta.get("stream_pairs", []),
         "summary": summary,
         "user_message": (
             f"已生成设备清单：{len(video_streams)} 路视频、{len(imus)} 个 IMU、"
             f"力通道 {'有' if force['present'] else '无'}、标定{'有' if has_calib else '无'}；"
-            f"时钟来源 {clock_source}。"
+            f"空流 {len(empty_streams)} 条（已标记未使用）；时钟来源 {clock_source}。"
         ),
     }
 

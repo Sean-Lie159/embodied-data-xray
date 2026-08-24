@@ -185,6 +185,41 @@ def _read_table_nrows(path: Path) -> int | None:
         return None
 
 
+def _read_table_sample(path: Path) -> pd.DataFrame | None:
+    """读取表格前若干行样本（用于第 2 层内容指纹），不读全量。
+
+    Args:
+        path: 表格文件路径。
+
+    Returns:
+        前 `_FINGERPRINT_SAMPLE_ROWS` 行样本 DataFrame；读取失败返回 None。
+    """
+    from app.tools._sniffing import _FINGERPRINT_SAMPLE_ROWS
+
+    try:
+        ext = path.suffix.lower()
+        if ext == ".csv":
+            return pd.read_csv(
+                path,
+                encoding=_detect_encoding(path.read_bytes()),
+                nrows=_FINGERPRINT_SAMPLE_ROWS,
+                engine="python",
+            )
+        if ext == ".parquet":
+            return pd.read_parquet(path, columns=None).head(_FINGERPRINT_SAMPLE_ROWS)
+        if ext == ".json":
+            with open(path, encoding=_detect_encoding(path.read_bytes())) as f:
+                obj = json.load(f)
+            if isinstance(obj, list):
+                return pd.DataFrame(obj[:_FINGERPRINT_SAMPLE_ROWS])
+            if isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], list):
+                return pd.DataFrame(obj["data"][:_FINGERPRINT_SAMPLE_ROWS])
+            return None
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _parse_calibration(path: Path) -> Any:
     """解析 json/yaml 标定候选文件。
 
@@ -219,24 +254,30 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     """
     probe = _sniffing.probe_directory(dir_path)
 
-    # 表格列名嗅探：覆盖全部表格文件（读头部判类型，成本可忽略），不做抽样。
-    table_sniffs: list[dict[str, Any]] = []
+    # 表格语义识别（四层架构）：覆盖全部表格文件。第 1 层词典线索（raw_sniff）
+    # 与第 2 层内容指纹裁判（klass）分别保留——原始线索供主表选择，klass 供流登记。
+    table_sniffs: list[dict[str, Any]] = []  # 第 2 层 classify 结果
     table_info: list[dict[str, Any]] = []
-    # 主表候选：（路径、列名、嗅探结果、行数、列数）。
+    # 主表候选：（路径、列名、原始嗅探、分类结果、行数、列数）。
     candidates: list[dict[str, Any]] = []
     for p_str in probe["tables"]:
         p = Path(p_str)
         cols = _read_table_columns(p)
         if cols is None:
             continue
-        sniff = _sniffing.sniff_table_columns(cols)
-        table_sniffs.append(sniff)
         nrows = _read_table_nrows(p)
         ncols = len(cols)
+        raw_sniff = _sniffing.sniff_table_columns(cols)  # 第 1 层词典线索
+        sample = _read_table_sample(p)  # 第 2 层内容指纹样本
+        klass = _sniffing.classify_table_stream(
+            p.name, cols, sample, nrows or 0
+        )
+        table_sniffs.append(klass)
         candidates.append({
             "file": str(p),
             "name": p.name,
-            "sniff": sniff,
+            "sniff": raw_sniff,
+            "klass": klass,
             "nrows": nrows,
             "ncols": ncols,
         })
@@ -244,7 +285,8 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             "file": str(p),  # 完整路径，供流登记表按需定位
             "name": p.name,
             "columns": cols[:20],
-            "sniff": sniff,
+            "sniff": klass,
+            "nrows": nrows,
         })
 
     # 主表选择（显式策略）：含状态/动作列 > 行数×列数最大 > 字母序。
@@ -320,13 +362,24 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             ],
         }
 
-    # 标定检测：覆盖全部标定候选文件（json/yaml）。
+    # 标定检测：覆盖全部标定候选文件（json/yaml）。第 1 层词典快检 + 第 2 层
+    # 内容指纹（fingerprint_calibration）确认，二者任一命中即判为标定。
     calib_detected = False
+    calib_detail: list[dict[str, Any]] = []
     for p_str in probe["cals"]:
         obj = _parse_calibration(Path(p_str))
-        if _sniffing.is_calibration_file(obj):
+        is_cal = _sniffing.is_calibration_file(obj) or bool(
+            _sniffing.fingerprint_calibration(obj).get("present")
+        )
+        if is_cal:
             calib_detected = True
-            break
+            fp = _sniffing.fingerprint_calibration(obj)
+            calib_detail.append({
+                "path": p_str,
+                "name": Path(p_str).name,
+                "keys_found": fp.get("keys_found", []),
+                "evidence": fp.get("evidence", ""),
+            })
 
     # 视频嗅探（ffprobe，可降级），覆盖全部视频文件。
     video_files: list[str] = []
@@ -350,6 +403,15 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     caps_result = _sniffing.build_capabilities(probe, table_sniffs)
     caps_result["capabilities"]["has_calibration"] = calib_detected
 
+    # 流配对规则（mp4↔metainfo、accel+gyro=六轴IMU）。
+    stream_pairs = _sniffing.pair_streams(probe["videos"], probe["tables"], probe["audios"])
+    caps_result["capabilities"]["has_imu_6axis_pair"] = any(
+        p["type"] == "imu_6axis" for p in stream_pairs
+    )
+    caps_result["capabilities"]["has_media_metainfo_pair"] = any(
+        p["type"] == "media_metainfo" for p in stream_pairs
+    )
+
     # 记录路径清单与元数据（不读入内存）。
     dataset_id = dir_path.name
     meta: dict[str, Any] = {
@@ -363,10 +425,16 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         "audio_files": [a["file"] for a in audio_meta],
         "image_files": [i["file"] for i in image_meta],
         # 流登记表：覆盖全部表格（读头部判类型）+ 视频/音频/图片（只登记路径）。
-        # 每条流含 {path, format, kind, channels, role}，供 inspect_streams 按需读取。
+        # 每条流含 {path, format, kind, channels, role, semantic_label,
+        # label_evidence, label_confidence, status, timestamp_column,
+        # quaternion_groups, imu_axes}，供 inspect_streams 按需读取。
         "streams": _sniffing.build_streams_registry(
             probe, table_info, video_meta, audio_meta, image_meta
         ),
+        # 流配对规则结果（mp4↔metainfo、accel+gyro=六轴IMU）。
+        "stream_pairs": stream_pairs,
+        # 标定文件细节（第 2 层指纹确认的键与依据）。
+        "calibration_detail": calib_detail,
         # 主表信息：选择依据、装载完整性声明（供后续统计工具继承）。
         "main_table": {
             "file": main_table_path,
@@ -406,6 +474,9 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         "image_files": [i["file"] for i in image_meta],
         "table_info": table_info,
         "main_table_selection": main_table_selection,
+        # 流配对与标定细节透出，供 agent 了解配对关系与标定依据。
+        "stream_pairs": stream_pairs,
+        "calibration_detail": calib_detail,
     }
     if main_table is not None:
         result["main_table"] = {
