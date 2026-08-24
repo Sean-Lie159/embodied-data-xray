@@ -740,7 +740,10 @@ def probe_video(path: str) -> dict[str, Any]:
             "ffprobe", "-v", "error", "-print_format", "json",
             "-show_streams", "-show_format", path,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, encoding="utf-8",
+            errors="replace",
+        )
         if proc.returncode != 0:
             return {
                 "ffprobe_available": True,
@@ -767,14 +770,107 @@ def probe_video(path: str) -> dict[str, Any]:
     except (ValueError, ZeroDivisionError):
         fps = None
 
+    nb_frames_raw = video_stream.get("nb_frames")
+    duration_raw = fmt.get("duration")
+    try:
+        duration_s = float(duration_raw) if duration_raw is not None else None
+    except (ValueError, TypeError):
+        duration_s = None
+
+    # 帧数可信度甄别：ffprobe 对部分 mp4 会返回 nb_frames=1（明显错误），或缺失、
+    # 或与 duration×fps 推算值偏差超过一个数量级。不可信时改用 duration×fps 估算，
+    # 并显式标注来源（probe / estimated），禁止把估算值伪装成实测。
+    estimated = _estimate_frame_count(nb_frames_raw, fps, duration_s)
+    nb_frames = estimated["nb_frames"]
+    nb_frames_source = estimated["source"]
+    nb_frames_basis = estimated["basis"]
+    nb_frames_trusted = estimated["trusted"]
+
     return {
         "ffprobe_available": True,
         "fps": fps,
         "width": video_stream.get("width"),
         "height": video_stream.get("height"),
-        "nb_frames": video_stream.get("nb_frames"),
-        "duration": fmt.get("duration"),
+        "nb_frames": nb_frames,
+        "nb_frames_source": nb_frames_source,
+        "nb_frames_basis": nb_frames_basis,
+        "nb_frames_trusted": nb_frames_trusted,
+        "duration": duration_raw,
         "codec": video_stream.get("codec_name"),
+    }
+
+
+def _estimate_frame_count(
+    nb_frames_raw: Any,
+    fps: Any,
+    duration_s: float | None,
+) -> dict[str, Any]:
+    """甄别视频帧数探测结果可信度，必要时用 duration×fps 估算。
+
+    ffprobe 对部分 mp4 会返回 nb_frames=1（明显错误），或该字段缺失，或与其
+    duration×fps 推算值偏差超过一个数量级。这些情况标记为不可信并改用估算值，
+    同时把来源（probe / estimated）与依据一并返回，供下游透出"估算"字样。
+
+    Args:
+        nb_frames_raw: ffprobe 原始 nb_frames（可能是 None / int / 字符串）。
+        fps: 平均帧率（float 或 None）。
+        duration_s: 时长（秒，float 或 None）。
+
+    Returns:
+        dict，含 nb_frames（展示用值）、source（"probe" / "estimated"）、
+        basis（依据说明）、trusted（是否可信）。
+    """
+    try:
+        nb = int(nb_frames_raw) if nb_frames_raw not in (None, "") else None
+    except (ValueError, TypeError):
+        nb = None
+
+    # 推算值：duration × fps（两者皆有时才可用）。
+    estimated_n = None
+    if duration_s and fps:
+        estimated_n = int(round(duration_s * fps))
+
+    # 可信：nb 存在、>1，且与推算值偏差不超过一个数量级（或无法推算时 nb 合理）。
+    trusted = False
+    reason = ""
+    if nb is None:
+        reason = "ffprobe 未返回 nb_frames"
+    elif nb <= 1:
+        reason = f"ffprobe 返回 nb_frames={nb}（明显错误，单帧视频极罕见）"
+    elif estimated_n is not None and (
+        nb == 0 or estimated_n == 0 or max(nb, estimated_n) / max(min(nb, estimated_n), 1) > 10
+    ):
+        reason = (
+            f"ffprobe 返回 nb_frames={nb}，与 duration×fps 推算值 "
+            f"≈{estimated_n} 偏差超过一个数量级"
+        )
+    else:
+        trusted = True
+
+    if trusted:
+        return {
+            "nb_frames": nb,
+            "source": "probe",
+            "basis": "ffprobe 实测帧数与 duration×fps 推算值一致（可信）",
+            "trusted": True,
+        }
+    # 不可信 → 估算。
+    if estimated_n is not None:
+        return {
+            "nb_frames": estimated_n,
+            "source": "estimated",
+            "basis": (
+                f"{reason}；改用 duration({duration_s}s)×fps({fps}) 估算帧数≈"
+                f"{estimated_n}（估算值，非实测）"
+            ),
+            "trusted": False,
+        }
+    # 既不可信又无法估算（缺 duration 或 fps）：保留原始值但明确不可信、无法估算。
+    return {
+        "nb_frames": nb,
+        "source": "probe",
+        "basis": f"{reason}；且缺少 duration/fps 无法估算，帧数仅供参考",
+        "trusted": False,
     }
 
 

@@ -201,13 +201,24 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
     for vmeta in context.meta.get("video_meta", []):
         src = vmeta.get("file", "unknown")
         if vmeta.get("ffprobe_available"):
+            nb_frames = vmeta.get("nb_frames")
+            nb_source = vmeta.get("nb_frames_source", "probe")
+            nb_basis = vmeta.get("nb_frames_basis", "")
+            duration_s = vmeta.get("duration")
+            # 估算值展示必须带"估算"字样，禁止伪装成实测。
+            if nb_source == "estimated":
+                nb_display = f"约{nb_frames}（估算）" if nb_frames is not None else "未知（无法估算）"
+            else:
+                nb_display = nb_frames
             video_streams.append({
                 "source": src,
                 "role": _sniffing.infer_role(src),
                 "nominal_fps": vmeta.get("fps"),
                 "actual_fps": vmeta.get("fps"),
-                "nb_frames": vmeta.get("nb_frames"),
-                "duration_s": vmeta.get("duration"),
+                "nb_frames": nb_display,
+                "nb_frames_source": nb_source,
+                "nb_frames_basis": nb_basis,
+                "duration_s": duration_s,
                 "resolution": (
                     f"{vmeta.get('width')}x{vmeta.get('height')}"
                     if vmeta.get("width") and vmeta.get("height")

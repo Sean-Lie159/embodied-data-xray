@@ -21,6 +21,7 @@ from app.tools._sniffing import (
     fingerprint_timestamp,
     infer_role,
     pair_streams,
+    _estimate_frame_count,
 )
 
 
@@ -186,3 +187,52 @@ def test_chinese_filename_image_not_misclassified() -> None:
     r = infer_role("信息.jpg")
     # 图片扩展名无语义角色，但不应误判为标定/相机传感器。
     assert r["role"] != "标定文件"
+
+
+# --- 视频帧数可信度甄别（probe_video 帧数不可信修复） ----------------------
+
+
+def test_estimate_frames_one_is_estimated() -> None:
+    """nb_frames=1 明显错误 → 不可信，改用 duration×fps 估算并标 estimated。"""
+    res = _estimate_frame_count(1, 30.0, 10.0)
+    assert res["trusted"] is False
+    assert res["source"] == "estimated"
+    assert res["nb_frames"] == 300  # 10s × 30fps
+    assert "估算" in res["basis"]
+
+
+def test_estimate_frames_missing_is_estimated() -> None:
+    """nb_frames 缺失但 duration/fps 可用 → 估算。"""
+    res = _estimate_frame_count(None, 30.0, 10.0)
+    assert res["trusted"] is False
+    assert res["source"] == "estimated"
+    assert res["nb_frames"] == 300
+
+
+def test_estimate_frames_off_by_order_of_magnitude() -> None:
+    """nb_frames 与 duration×fps 偏差超一个数量级 → 不可信、估算。"""
+    # 1000 帧 vs 10s×30fps=300 帧 → 1000/300 ≈ 3.3 倍，未超 10 倍 → 可信。
+    ok = _estimate_frame_count(1000, 30.0, 10.0)
+    assert ok["trusted"] is True
+    assert ok["source"] == "probe"
+    # 8000 帧 vs 300 帧 → 26 倍 > 10 倍 → 不可信、估算。
+    bad = _estimate_frame_count(8000, 30.0, 10.0)
+    assert bad["trusted"] is False
+    assert bad["source"] == "estimated"
+    assert bad["nb_frames"] == 300
+
+
+def test_estimate_frames_no_duration_cannot_estimate() -> None:
+    """不可信且缺 duration/fps → 无法估算，保留原始值但标不可信。"""
+    res = _estimate_frame_count(1, None, None)
+    assert res["trusted"] is False
+    assert res["source"] == "probe"  # 无法估算，非 estimated
+    assert "无法估算" in res["basis"]
+
+
+def test_estimate_frames_trusted_consistent() -> None:
+    """nb_frames 与 duration×fps 一致 → 可信、来源 probe。"""
+    res = _estimate_frame_count(300, 30.0, 10.0)
+    assert res["trusted"] is True
+    assert res["source"] == "probe"
+    assert res["nb_frames"] == 300

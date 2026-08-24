@@ -196,6 +196,68 @@ def test_video_ffprobe_degraded_reports_unknown() -> None:
     assert "ffprobe" in vs["reason"]
 
 
+def test_video_nb_frames_one_estimated_and_labeled() -> None:
+    """nb_frames=1 明显错误 → 改用 duration×fps 估算，并标注来源与'估算'字样。"""
+    ctx = RunContext(
+        dataset_id="demo",
+        df=pd.DataFrame({"a": [1]}),
+        meta={
+            "capabilities": {"has_video_streams": True},
+            "video_meta": [
+                {
+                    "file": "ctrl.mp4",
+                    "ffprobe_available": True,
+                    "fps": 30.0,
+                    "nb_frames": 1,            # 明显错误
+                    "duration": "10.0",        # 10s × 30fps ≈ 300 帧
+                    "width": 640, "height": 480,
+                    "codec": "h264",
+                    "nb_frames_source": "estimated",
+                    "nb_frames_basis": "ffprobe 返回 nb_frames=1（明显错误）；改用 duration(10.0s)×fps(30.0) 估算帧数≈300（估算值，非实测）",
+                    "nb_frames_trusted": False,
+                }
+            ],
+        },
+    )
+    result = inspect_streams_impl(ctx)
+    vs = result["video_streams"][0]
+    assert vs["nb_frames_source"] == "estimated"
+    # 估算值展示必须带"估算"字样，不得伪装成实测。
+    assert "估算" in str(vs["nb_frames"])
+    assert vs["nb_frames_basis"]  # 透出估算依据
+    assert "30.0" in vs["nb_frames_basis"]
+
+
+def test_video_nb_frames_trusted_uses_probe() -> None:
+    """nb_frames 可信（与 duration×fps 一致）→ 来源标 probe，无'估算'字样。"""
+    ctx = RunContext(
+        dataset_id="demo",
+        df=pd.DataFrame({"a": [1]}),
+        meta={
+            "capabilities": {"has_video_streams": True},
+            "video_meta": [
+                {
+                    "file": "rgb.mp4",
+                    "ffprobe_available": True,
+                    "fps": 30.0,
+                    "nb_frames": 300,
+                    "duration": "10.0",
+                    "width": 640, "height": 480,
+                    "codec": "h264",
+                    "nb_frames_source": "probe",
+                    "nb_frames_basis": "ffprobe 实测帧数与 duration×fps 推算值一致（可信）",
+                    "nb_frames_trusted": True,
+                }
+            ],
+        },
+    )
+    result = inspect_streams_impl(ctx)
+    vs = result["video_streams"][0]
+    assert vs["nb_frames_source"] == "probe"
+    assert vs["nb_frames"] == 300
+    assert "估算" not in str(vs["nb_frames"])
+
+
 # --- 角色组合推断（修复2） ---------------------------------------------
 
 def test_role_combined_left_wrist() -> None:
