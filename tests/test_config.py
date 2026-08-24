@@ -30,7 +30,8 @@ def test_settings_loads_valid_values() -> None:
     assert s.default_model == "kimi-k2-0711-preview"
     assert s.default_temperature == 0.2
     assert s.max_turns == 15
-    assert s.max_rows_in_context == 200
+    # 主表装载行数阈值（安全阀）：默认足够大，使常规采集数据（数万行）不被静默截断。
+    assert s.max_rows_in_context == 500_000
     assert s.output_dir == "outputs"
 
 

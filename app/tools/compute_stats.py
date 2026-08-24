@@ -248,6 +248,23 @@ def compute_stats_impl(
     }
     context.findings.append(finding)
 
+    # ---- 装载完整性继承声明 ----
+    # 若主表被截断（超行数阈值），统计基于截断后的数据，必须在返回中明确标注，
+    # 避免把样本当全量描述。
+    main_table_meta = context.meta.get("main_table", {})
+    data_scope: dict[str, Any] | None = None
+    if main_table_meta.get("truncated"):
+        data_scope = {
+            "truncated": True,
+            "rows_total": main_table_meta.get("rows_total"),
+            "rows_loaded": main_table_meta.get("rows_loaded"),
+            "note": (
+                f"统计基于截断数据：仅前 {main_table_meta.get('rows_loaded')} 行"
+                f"（共 {main_table_meta.get('rows_total')} 行）已装载，"
+                "超出部分未载入内存，结论仅代表已装载部分。"
+            ),
+        }
+
     return {
         "success": True,
         "dataset": dataset_id,
@@ -257,10 +274,12 @@ def compute_stats_impl(
         "qc_summary": qc_summary,
         "semantic_notes": semantic_notes,
         "findings": [finding],
+        "data_scope": data_scope,
         "user_message": (
             f"任务级统计完成（{dataset_id}）：{metrics.get('episode_distribution', {}).get('n_episodes', 0)} 个 episode。"
             + (f" 成功率 {metrics['success_rate']['overall']}。" if 'success_rate' in metrics else "")
             + (f" 离群 episode {len(outlier_episodes)} 个。" if outlier_episodes else "")
+            + (f" {data_scope['note']}" if data_scope else "")
         ),
     }
 

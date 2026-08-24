@@ -152,6 +152,39 @@ def _read_table_columns(path: Path) -> list[str] | None:
         return None
 
 
+def _read_table_nrows(path: Path) -> int | None:
+    """只读表格行数（不读全量数据），用于主表选择评分。
+
+    Args:
+        path: 表格文件路径。
+
+    Returns:
+        行数（不含表头）；读取失败返回 None。
+    """
+    try:
+        ext = path.suffix.lower()
+        if ext == ".csv":
+            # 仅计数行，跳过表头。用 python 引擎只读首列以降低成本。
+            df = pd.read_csv(
+                path,
+                encoding=_detect_encoding(path.read_bytes()),
+                usecols=[0],
+                engine="python",
+            )
+            return int(df.shape[0])
+        if ext == ".parquet":
+            return int(pd.read_parquet(path, columns=None).shape[0])
+        if ext == ".json":
+            with open(path, encoding=_detect_encoding(path.read_bytes())) as f:
+                obj = json.load(f)
+            if isinstance(obj, list):
+                return len(obj)
+            return 0
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _parse_calibration(path: Path) -> Any:
     """解析 json/yaml 标定候选文件。
 
@@ -188,9 +221,9 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
 
     # 表格列名嗅探：覆盖全部表格文件（读头部判类型，成本可忽略），不做抽样。
     table_sniffs: list[dict[str, Any]] = []
-    main_table: pd.DataFrame | None = None
-    main_table_path: str | None = None
     table_info: list[dict[str, Any]] = []
+    # 主表候选：（路径、列名、嗅探结果、行数、列数）。
+    candidates: list[dict[str, Any]] = []
     for p_str in probe["tables"]:
         p = Path(p_str)
         cols = _read_table_columns(p)
@@ -198,18 +231,39 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             continue
         sniff = _sniffing.sniff_table_columns(cols)
         table_sniffs.append(sniff)
+        nrows = _read_table_nrows(p)
+        ncols = len(cols)
+        candidates.append({
+            "file": str(p),
+            "name": p.name,
+            "sniff": sniff,
+            "nrows": nrows,
+            "ncols": ncols,
+        })
         table_info.append({
             "file": str(p),  # 完整路径，供流登记表按需定位
             "name": p.name,
             "columns": cols[:20],
             "sniff": sniff,
         })
-        # 选择第一个有内容的表格作为主表（记录但不整表读入，除非是主表）。
-        if main_table is None:
-            main_table_path = p_str
 
-    # 若存在主表格且数据量不大，装载其头部作为 df 的轻量代表。
-    if main_table_path is not None:
+    # 主表选择（显式策略）：含状态/动作列 > 行数×列数最大 > 字母序。
+    selected: dict[str, Any] | None = None
+    ranked: list[dict[str, Any]] = []
+    if candidates:
+        def _main_table_key(c: dict[str, Any]) -> tuple[int, int, str]:
+            has_actions = 1 if c["sniff"]["has_actions"]["present"] else 0
+            size = (c["nrows"] or 0) * c["ncols"]
+            return (has_actions, size, c["name"])
+        ranked = sorted(candidates, key=_main_table_key, reverse=True)
+        selected = ranked[0]
+
+    main_table: pd.DataFrame | None = None
+    main_table_path: str | None = None
+    main_table_info: dict[str, Any] = {}
+    if selected is not None:
+        main_table_path = selected["file"]
+        # 主表全量装载（默认全量；超阈值才截断并声明，见下方 rows_total/rows_loaded）。
         try:
             ext = Path(main_table_path).suffix.lower()
             if ext == ".csv":
@@ -218,12 +272,53 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
                 main_table = pd.read_parquet(main_table_path)
             elif ext == ".json":
                 main_table = pd.read_json(main_table_path)
-            # 仅保留前 max_rows_in_context 行，避免大表塞入内存。
-            cap_rows = getattr(context, "max_rows_in_context", 200)
-            if main_table is not None and len(main_table) > cap_rows:
-                main_table = main_table.head(cap_rows).copy()
         except Exception:  # noqa: BLE001
             main_table = None
+
+    # 装载完整性声明：记录真实总行数 rows_total；超阈值截断到 cap_rows 后 rows_loaded
+    # 小于 rows_total，返回必须同时包含两个数字并明确提示截断。
+    rows_total: int | None = None
+    rows_loaded: int | None = None
+    truncated: bool = False
+    truncation_note: str | None = None
+    if main_table is not None:
+        rows_total = int(main_table.shape[0])
+        cap_rows = getattr(context, "max_rows_in_context", 500_000)
+        if rows_total > cap_rows:
+            truncated = True
+            main_table = main_table.head(cap_rows).copy()
+            rows_loaded = int(main_table.shape[0])
+            truncation_note = (
+                f"仅装载前 {rows_loaded} 行（共 {rows_total} 行）——"
+                "该表超过行数阈值，超出部分未载入内存。"
+            )
+        else:
+            rows_loaded = rows_total
+
+    # 主表选择依据与落选候选（供返回透明化，避免"静默选主表"）。
+    main_table_selection: dict[str, Any] = {"selected": None, "reason": None, "candidates": []}
+    if selected is not None and ranked:
+        has_actions = selected["sniff"]["has_actions"]["present"]
+        if has_actions:
+            reason = "含状态/动作列，优先作为主表"
+        else:
+            reason = (
+                f"行数×列数最大（约 {selected['nrows'] or '?'} 行 × "
+                f"{selected['ncols']} 列，规模 { (selected['nrows'] or 0) * selected['ncols'] }）"
+            )
+        main_table_selection = {
+            "selected": selected["name"],
+            "reason": reason,
+            "candidates": [
+                {
+                    "name": c["name"],
+                    "has_actions": c["sniff"]["has_actions"]["present"],
+                    "nrows": c["nrows"],
+                    "ncols": c["ncols"],
+                }
+                for c in ranked
+            ],
+        }
 
     # 标定检测：覆盖全部标定候选文件（json/yaml）。
     calib_detected = False
@@ -272,6 +367,15 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         "streams": _sniffing.build_streams_registry(
             probe, table_info, video_meta, audio_meta, image_meta
         ),
+        # 主表信息：选择依据、装载完整性声明（供后续统计工具继承）。
+        "main_table": {
+            "file": main_table_path,
+            "name": main_table_selection["selected"],
+            "selection": main_table_selection,
+            "rows_total": rows_total,
+            "rows_loaded": rows_loaded,
+            "truncated": truncated,
+        },
     }
     context.meta = meta
     context.dataset_id = dataset_id
@@ -301,20 +405,35 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         "audio_files": [a["file"] for a in audio_meta],
         "image_files": [i["file"] for i in image_meta],
         "table_info": table_info,
+        "main_table_selection": main_table_selection,
     }
     if main_table is not None:
         result["main_table"] = {
             "file": main_table_path,
+            "name": main_table_selection["selected"],
             "n_rows": int(main_table.shape[0]),
             "n_cols": int(main_table.shape[1]),
+            # 装载完整性：真实总行数、实际装载行数、是否截断，三者同时可见。
+            "rows_total": rows_total,
+            "rows_loaded": rows_loaded,
+            "truncated": truncated,
         }
     if ffprobe_degraded:
         result["ffprobe_degraded"] = ffprobe_degraded
-    result["user_message"] = (
+    # user_message：含主表选择依据 + 截断声明（若有）。
+    msg_parts = [
         f"已探测数据集目录 {dataset_id}：{probe['total_files']} 个文件，"
         f"推测类型 {caps_result['guessed_type']}。"
-        + (f" {ffprobe_degraded}" if ffprobe_degraded else "")
-    )
+    ]
+    if selected is not None:
+        msg_parts.append(
+            f"主表选择 {selected['name']}（{main_table_selection['reason']}）。"
+        )
+    if truncated and truncation_note:
+        msg_parts.append(truncation_note)
+    if ffprobe_degraded:
+        msg_parts.append(ffprobe_degraded)
+    result["user_message"] = " ".join(msg_parts)
     return result
 
 
