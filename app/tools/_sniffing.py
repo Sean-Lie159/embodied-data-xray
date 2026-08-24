@@ -483,6 +483,11 @@ def classify_table_stream(
     Returns:
         dict，含 kind、semantic_label、label_evidence、label_confidence、
         status、channels、timestamp_column、quaternion_groups、imu_axes。
+
+    约定：当第 1 层词典与第 2 层内容指纹均无法判定时，返回 kind="unknown"、
+        semantic_label="未知（无法分类）"，并明确列出已排查的层级（label_evidence）。
+        **不得硬猜**——决策余地留给第 3 层 LLM 语义假设（未接模型，见
+        docs/技术债.md）或第 4 层用户确认。
     """
     # 1. 空流检测。
     if nrows <= EMPTY_STREAM_MAX_ROWS:
@@ -616,11 +621,24 @@ def classify_table_stream(
             "quaternion_groups": quat_groups,
             "imu_axes": None,
         }
+    # 8. 判不出：所有层级均未命中，明确返回 unknown，绝不硬猜。
+    # 证据需说明"第 1 层词典线索 + 第 2 层内容指纹均无法判定"，把决策空间留给
+    # 第 3 层 LLM 语义假设（目前未接模型，见 docs/技术债.md）或第 4 层用户确认。
+    checked = []
+    checked.append("词典线索（动作/IMU/位姿/力/手部跟踪均未命中）")
+    if sample is not None:
+        checked.append(
+            f"内容指纹（时间戳：{ts_fp.get('evidence','')}；"
+            f"四元数：{'命中' if quat_groups else '未命中'}；"
+            f"力：{force_fp.get('evidence','')}）"
+        )
+    else:
+        checked.append("内容指纹（无样本，跳过）")
     return {
         "kind": "unknown",
-        "semantic_label": "未知",
-        "label_evidence": "无词典线索且无内容指纹命中",
-        "label_confidence": "low",
+        "semantic_label": "未知（无法分类）",
+        "label_evidence": "判不出，未做硬猜；已排查：" + "；".join(checked),
+        "label_confidence": "low（无法判定）",
         "status": "active",
         "channels": [],
         "timestamp_column": ts_fp.get("column"),
