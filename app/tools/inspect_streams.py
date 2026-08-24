@@ -242,6 +242,7 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
             "semantic_label": s.get("semantic_label"),
             "label_evidence": s.get("label_evidence"),
             "label_confidence": s.get("label_confidence"),
+            "label_source": s.get("label_source"),  # user_confirmed / content_fingerprint / dictionary / None
             "status": s.get("status", "active"),
             "imu_axes": s.get("imu_axes"),
             "timestamp_column": s.get("timestamp_column"),
@@ -318,6 +319,14 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         calibration["parameters"] = "已检测到标定文件（参数详见源目录 calib 文件）"
 
     # --- 汇总 -----------------------------------------------------------
+    # 用户确认覆盖清单（第 4 层）：来自 meta.user_profile，标注哪些标签是
+    # user_confirmed（覆盖第 1-3 层自动识别）。
+    user_profile = context.meta.get("user_profile", {})
+    user_confirmed_overrides = [
+        {"filename": fname, **mapping}
+        for fname, mapping in user_profile.get("streams", {}).items()
+    ]
+
     summary = {
         "n_video_streams": len(video_streams),
         "n_imus": len(imus),
@@ -328,6 +337,7 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
             p.get("type") == "media_metainfo" for p in context.meta.get("stream_pairs", [])
         ),
         "n_empty_streams": len(empty_streams),
+        "n_user_confirmed": len(user_confirmed_overrides),
         "clock_source": clock_source,
         "n_table_streams": len([s for s in streams if s.get("kind") != "video"]),
     }
@@ -343,6 +353,7 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "table_streams": other_stream_list,
         "empty_streams": empty_streams,
         "stream_pairs": context.meta.get("stream_pairs", []),
+        "user_confirmed_overrides": user_confirmed_overrides,
         "summary": summary,
         "user_message": (
             f"已生成设备清单：{len(video_streams)} 路视频、{len(imus)} 个 IMU、"

@@ -5,7 +5,11 @@ from app.tools.check_temporal_sync import check_temporal_sync, check_temporal_sy
 from app.tools.compute_stats import compute_stats, compute_stats_impl
 from app.tools.generate_report import generate_report, generate_report_impl
 from app.tools.inspect_streams import inspect_streams, inspect_streams_impl
-from app.tools.load_dataset import load_dataset, load_dataset_impl
+from app.tools.load_dataset import (
+    confirm_stream_semantic_impl,
+    load_dataset,
+    load_dataset_impl,
+)
 from app.tools.plot_chart import plot_chart, plot_chart_impl
 from app.tools.profile_data import profile_data, profile_data_impl
 

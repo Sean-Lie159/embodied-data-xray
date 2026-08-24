@@ -23,6 +23,7 @@ from agents.decorators import tool
 
 from app.agent.context import RunContext
 from app.tools import _sniffing
+from app.tools import profile_store
 
 # 本工具支持的扩展名 → 说明。
 _SUPPORTED_FORMATS: dict[str, str] = {
@@ -445,6 +446,17 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             "truncated": truncated,
         },
     }
+
+    # 第 4 层：用户确认持久化覆盖。加载时优先读取 outputs/.dataset_profile.json
+    # 中该 dataset_id 的已确认映射（来源 user_confirmed），覆盖第 1-3 层自动识别。
+    # 文件不存在/损坏时安全降级为无覆盖，不中断加载。
+    user_profile = profile_store.load_dataset_profile(context.output_dir, dataset_id)
+    if user_profile.get("streams"):
+        meta["streams"] = profile_store.apply_profile_overrides(
+            meta["streams"], user_profile
+        )
+    meta["user_profile"] = user_profile
+
     context.meta = meta
     context.dataset_id = dataset_id
     context.df = main_table
@@ -612,6 +624,70 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
     else:
         result["user_message"] = f"已加载数据集 {dataset_id}，当前可对其进行分析。"
     return result
+
+
+def confirm_stream_semantic_impl(
+    context: RunContext,
+    filename: str,
+    *,
+    kind: str | None = None,
+    role: dict[str, Any] | None = None,
+    semantic_label: str | None = None,
+    label_evidence: str | None = None,
+    imu_axes: int | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """第 4 层用户确认入口（内部函数，非 agent 工具）。
+
+    用户对某条流的语义标签提出确认/纠正后，经此函数把映射写入
+    ``outputs/.dataset_profile.json``（来源标 user_confirmed）。下一次加载该数据集
+    时，load_dataset 会优先读取并覆盖第 1-3 层的自动识别。
+
+    按既定设计，本函数不注册为 @tool——用户质疑标签时由 agent 用自然语言对话处理，
+    确认结果经此函数落盘。
+
+    Args:
+        context: 运行时上下文（取 dataset_id 与 output_dir）。
+        filename: 被确认流的文件名（不含路径）。
+        kind/role/semantic_label/label_evidence/imu_axes/status: 用户确认后的字段。
+
+    Returns:
+        dict，success + 覆盖后的流映射 + user_message。
+    """
+    if not context.dataset_id:
+        return {
+            "success": False,
+            "error": "no_data_loaded",
+            "user_message": "尚未加载任何数据集，无法确认语义标签。请先 load_dataset。",
+        }
+    mapping: dict[str, Any] = {}
+    if kind is not None:
+        mapping["kind"] = kind
+    if role is not None:
+        mapping["role"] = role
+    if semantic_label is not None:
+        mapping["semantic_label"] = semantic_label
+    if label_evidence is not None:
+        mapping["label_evidence"] = label_evidence
+    if imu_axes is not None:
+        mapping["imu_axes"] = imu_axes
+    if status is not None:
+        mapping["status"] = status
+
+    profile = profile_store.save_dataset_profile(
+        context.output_dir, context.dataset_id,
+        stream_overrides={filename: mapping},
+    )
+    return {
+        "success": True,
+        "dataset_id": context.dataset_id,
+        "filename": filename,
+        "mapping": {**mapping, "source": "user_confirmed"},
+        "user_message": (
+            f"已记录你对 {filename} 的语义确认为 user_confirmed，"
+            f"下次加载 {context.dataset_id} 时将优先采用。"
+        ),
+    }
 
 
 @tool
