@@ -14,6 +14,7 @@ from app.ui.components import (
     render_charts,
     render_dataset_overview,
     render_findings_and_report,
+    render_token_stats,
     render_tool_activity,
 )
 
@@ -34,12 +35,31 @@ def _get_messages() -> list[dict]:
     return st.session_state.messages
 
 
+def _get_cumulative_usage() -> dict:
+    """返回会话累计 token 用量（st.session_state 维护，刷新页面重置属正常）。"""
+    if "cumulative_usage" not in st.session_state:
+        st.session_state.cumulative_usage = {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "rounds": 0,
+        }
+    return st.session_state.cumulative_usage
+
+
 def _main() -> None:
     service = _get_service()
     messages = _get_messages()
+    cumulative = _get_cumulative_usage()
 
     st.title("具身智能数据分析 Agent")
     st.caption("全链路：加载 → 质检 → 统计 → 绘图 → 报告")
+
+    # 侧栏：Token 统计（本轮 + 会话累计；刷新页面重置属正常，不持久化）。
+    with st.sidebar:
+        last_usage = (
+            messages[-1].get("turn").usage
+            if messages and messages[-1].get("turn") is not None
+            else None
+        )
+        render_token_stats(last_usage, cumulative)
 
     left, right = st.columns([1, 1.2], gap="large")
 
@@ -68,6 +88,12 @@ def _main() -> None:
                     turn = service.reply(prompt)
                 st.markdown(turn.reply)
                 render_tool_activity(turn)
+            # 累计本轮 token 用量（usage 为 None 时不加，避免 0 冒充）。
+            if turn.usage:
+                cumulative["input_tokens"] += turn.usage.get("input_tokens", 0)
+                cumulative["output_tokens"] += turn.usage.get("output_tokens", 0)
+                cumulative["total_tokens"] += turn.usage.get("total_tokens", 0)
+            cumulative["rounds"] += 1
             messages.append({"role": "assistant", "content": turn.reply, "turn": turn})
 
     # ---- 右侧：展示区 ----

@@ -10,6 +10,7 @@ from typing import Any
 
 import streamlit as st
 
+from app.config import get_settings
 from app.services.chat_service import ChatTurn
 
 
@@ -24,6 +25,49 @@ def render_tool_activity(turn: ChatTurn) -> None:
         st.caption(turn.tool_activity)
         if turn.tool_calls:
             st.caption("本轮调用工具：" + "、".join(turn.tool_calls))
+
+
+def render_token_stats(usage: dict | None, cumulative: dict) -> None:
+    """在侧栏渲染 Token 统计区块。
+
+    Args:
+        usage: 本轮 token 用量 {input/output/total} 或 None。
+        cumulative: 会话累计 {input/output/total/rounds}。
+    """
+    st.markdown("**Token 统计**")
+    if usage is None:
+        st.caption("本轮：本次未获取到用量")
+    else:
+        st.caption(
+            f"本轮：输入 {usage.get('input_tokens', 0):,} | "
+            f"输出 {usage.get('output_tokens', 0):,} | "
+            f"合计 {usage.get('total_tokens', 0):,}"
+        )
+    st.caption(
+        f"累计：输入 {cumulative.get('input_tokens', 0):,} | "
+        f"输出 {cumulative.get('output_tokens', 0):,} | "
+        f"合计 {cumulative.get('total_tokens', 0):,} | "
+        f"{cumulative.get('rounds', 0)} 轮"
+    )
+    cost = _estimate_cost_text(usage, cumulative)
+    if cost:
+        st.caption(f"成本估算：{cost}")
+
+
+def _estimate_cost_text(usage: dict | None, cumulative: dict) -> str:
+    """估算本轮与累计成本（美元）；未配置价格或用量缺失时返回空串。"""
+    settings = get_settings()
+    p_in, p_out = settings.price_input_per_mtok, settings.price_output_per_mtok
+    if not (p_in > 0 and p_out > 0):
+        return ""
+    if usage is None:
+        return "本次未获取到用量"
+    cost = usage.get("input_tokens", 0) / 1e6 * p_in + usage.get("output_tokens", 0) / 1e6 * p_out
+    cost_acc = (
+        cumulative.get("input_tokens", 0) / 1e6 * p_in
+        + cumulative.get("output_tokens", 0) / 1e6 * p_out
+    )
+    return f"本轮 ≈${cost:.4f} / 累计 ≈${cost_acc:.4f}"
 
 
 def render_charts(findings: list[dict]) -> None:

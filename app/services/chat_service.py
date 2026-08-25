@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agents import RunResult
+from agents.usage import Usage
 
 from app.agent.agent import build_agent, format_tool_activity, run_turn
 from app.agent.context import RunContext
@@ -54,6 +55,38 @@ class ChatTurn:
     tool_activity: str  # 工具调用轨迹（可折叠展示）
     tool_calls: list[str] = field(default_factory=list)  # 本轮调用的工具名列表
     findings: list[dict] = field(default_factory=list)  # 截止本轮的最新 findings
+    usage: dict[str, int] | None = None  # 本轮 token 用量（input/output/total），获取不到为 None
+
+
+def extract_usage(result: RunResult | None) -> dict[str, int] | None:
+    """从 RunResult 提取本轮 token 用量（input/output/total）。
+
+    真实 SDK 结构：``RunResult`` 不暴露公开的 ``context_wrapper`` 属性，usage 位于
+    ``RunContextWrapper.usage``（``result.to_state()._context.usage``），``Usage`` 含
+    ``input_tokens / output_tokens / total_tokens``，且为整轮（含全部内部模型调用）的
+    累计值。result 为 None（MaxTurnsExceeded 等）或结构不符时返回 None，不抛异常。
+
+    Args:
+        result: 单轮运行的完整结果；可能为 None。
+
+    Returns:
+        dict{input_tokens, output_tokens, total_tokens}；获取不到返回 None。
+    """
+    if result is None:
+        return None
+    try:
+        state = result.to_state()
+        wrapper = getattr(state, "_context", None)
+        usage: Usage | None = getattr(wrapper, "usage", None) if wrapper is not None else None
+        if usage is None:
+            return None
+        return {
+            "input_tokens": int(usage.input_tokens or 0),
+            "output_tokens": int(usage.output_tokens or 0),
+            "total_tokens": int(usage.total_tokens or 0),
+        }
+    except Exception:  # noqa: BLE001 - 结构不符时安全降级，不中断对话
+        return None
 
 
 class ChatService:
@@ -98,6 +131,7 @@ class ChatService:
             tool_activity=tool_activity,
             tool_calls=tool_calls,
             findings=list(self.context.findings),
+            usage=extract_usage(result),
         )
 
     def dataset_summary(self) -> dict[str, Any]:

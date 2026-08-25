@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # 离群 episode 检测（IQR 法）的 k 值：Q1 - k*IQR / Q3 + k*IQR 之外视为离群。
     stats_outlier_k: float = Field(default=1.5, ge=0.0)
 
+    # --- 可选：Token 成本估算（美元/百万 token）------------------------------
+    # 两项都 >0 时才启用成本估算；默认 0 = 未配置，不显示成本。价格是易变信息，
+    # 不硬编码，由用户在 .env 按当前服务商定价填写。
+    price_input_per_mtok: float = Field(default=0.0, ge=0.0)
+    price_output_per_mtok: float = Field(default=0.0, ge=0.0)
+
     @model_validator(mode="after")
     def _validate_required(self) -> Settings:
         """校验必须的模型配置是否齐全，缺失时给出中文报错。"""

@@ -19,6 +19,7 @@ from app.agent.agent import build_agent, format_tool_activity, run_turn
 from app.agent.context import RunContext
 from app.config import get_settings
 from app.llm import build_model
+from app.services.chat_service import extract_usage
 from app.tools import (
     check_sensor_sanity,
     check_temporal_sync,
@@ -31,6 +32,58 @@ from app.tools import (
 )
 
 _EXIT_COMMANDS = {"exit", "quit", "q", "退出", "再见"}
+
+
+def _format_tokens(usage: dict[str, int] | None, cumulative: dict[str, int]) -> str:
+    """格式化单轮 + 会话累计的 token 用量与可选成本。
+
+    Args:
+        usage: 本轮用量 {input/output/total} 或 None。
+        cumulative: 会话累计 {input/output/total/rounds}。
+
+    Returns:
+        "[tokens] 输入 X | 输出 Y | 合计 Z | 会话累计 ..." 一行文本；usage 为
+        None 时显示"本次未获取到用量"，不显示 0 冒充。
+    """
+    cost_text = _format_cost(usage, cumulative)
+    if usage is None:
+        base = "本次未获取到用量"
+    else:
+        base = (
+            f"输入 {usage.get('input_tokens', 0):,} | "
+            f"输出 {usage.get('output_tokens', 0):,} | "
+            f"合计 {usage.get('total_tokens', 0):,}"
+        )
+    return (
+        f"[tokens] {base} | "
+        + f"会话累计 {cumulative.get('input_tokens', 0):,}/{cumulative.get('output_tokens', 0):,}"
+        + f"/{cumulative.get('total_tokens', 0):,}（{cumulative.get('rounds', 0)} 轮）"
+        + (f" | {cost_text}" if cost_text else "")
+    )
+
+
+def _format_cost(usage: dict[str, int] | None, cumulative: dict[str, int]) -> str:
+    """估算本轮与累计成本（美元）；未配置价格或用量缺失时返回空串。
+
+    Args:
+        usage: 本轮用量。
+        cumulative: 会话累计用量。
+
+    Returns:
+        成本文本（如 "≈$0.0021 / 累计 $0.034"）；未启用返回空串。
+    """
+    settings = get_settings()
+    p_in, p_out = settings.price_input_per_mtok, settings.price_output_per_mtok
+    if not (p_in > 0 and p_out > 0):
+        return ""
+    if usage is None:
+        return ""
+    cost = usage.get("input_tokens", 0) / 1e6 * p_in + usage.get("output_tokens", 0) / 1e6 * p_out
+    cost_acc = (
+        cumulative.get("input_tokens", 0) / 1e6 * p_in
+        + cumulative.get("output_tokens", 0) / 1e6 * p_out
+    )
+    return f"≈${cost:.4f} / 累计 ${cost_acc:.4f}"
 
 
 def _build_main_agent():
@@ -53,6 +106,8 @@ async def chat_loop() -> None:
     agent = _build_main_agent()
     context = RunContext()
     history_input: list[Any] | None = None
+    # 会话累计 token（CLI 进程内维护，不持久化）。
+    cumulative: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "rounds": 0}
 
     print("=" * 56)
     print("具身智能数据分析 Agent")
@@ -81,6 +136,15 @@ async def chat_loop() -> None:
         activity = format_tool_activity(result)
         if activity:
             print(f"\n[工具] {activity}")
+
+        # Token 统计：本轮用量 + 会话累计（usage 为 None 时显示"未获取到用量"）。
+        usage = extract_usage(result)
+        if usage:
+            cumulative["input_tokens"] += usage.get("input_tokens", 0)
+            cumulative["output_tokens"] += usage.get("output_tokens", 0)
+            cumulative["total_tokens"] += usage.get("total_tokens", 0)
+        cumulative["rounds"] += 1
+        print(f"\n{_format_tokens(usage, cumulative)}")
 
         print(f"\n助手: {final}")
 
