@@ -56,17 +56,32 @@ def _read_columns(path: str, fmt: str, columns: list[str]) -> dict[str, np.ndarr
         return None
 
 
-def _split_imu_channels(channels: list[str]) -> tuple[list[str], list[str]]:
+def _split_imu_channels(
+    channels: list[str], filename: str = ""
+) -> tuple[list[str], list[str]]:
     """把 IMU 通道拆分为加速度计列与陀螺仪列。
+
+    优先按列名命中（accel_* / gyro_*）；当列为通用 x/y/z（真实 accel.csv/gyro.csv
+    用 x/y/z 而非 accel_x）时，用**文件名**区分——文件名含 accel 则该文件 x/y/z 全
+    归加速度计，含 gyro/gyr 则全归陀螺仪。
 
     Args:
         channels: IMU 通道列名清单。
+        filename: 文件路径或文件名（用于 x/y/z 通用列时的归属判断）。
 
     Returns:
         (accel_cols, gyro_cols)。
     """
+    lower_name = filename.lower()
     accel = [c for c in channels if "accel" in c]
     gyro = [c for c in channels if ("gyro" in c or "gyr" in c)]
+    # 通用列（x/y/z）按文件名归属。
+    generic = [c for c in channels if str(c).lower().strip() in ("x", "y", "z")]
+    if not accel and not gyro and generic:
+        if "accel" in lower_name:
+            accel = generic
+        elif "gyro" in lower_name or "gyr" in lower_name:
+            gyro = generic
     return accel, gyro
 
 
@@ -207,12 +222,123 @@ def _infer_gyro_unit(static_gyro_magnitudes: np.ndarray) -> tuple[str, dict[str,
     return "无法确定", {"median": round(med, 3), "reason": "静止偏置量级异常"}
 
 
-def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, Any]:
+def _imu_check_units(
+    context: RunContext,
+    imu_streams: list[dict[str, Any]],
+    table: str | None,
+) -> list[dict[str, Any]]:
+    """构建 IMU 检查单元（单流或 accel+gyro 配对组），按流登记表惰性读数据。
+
+    优先用第 3 步已建立的 accel+gyro 六轴配对（stream_pairs），把 accel 表与 gyro
+    表合成一个检查单元（accel 列来自 accel 文件的 x/y/z，gyro 列来自 gyro 文件的
+    x/y/z），不依赖主表身份。指定 table 时仅检查该表。
+
+    Args:
+        context: 运行时上下文。
+        imu_streams: 流登记表中 kind=imu 的流。
+        table: 可选，指定检查对象表名。
+
+    Returns:
+        list[dict]，每项含 key、table_name、data、accel_cols、gyro_cols、rate、
+        source（"pair" / "stream" / "explicit"）。
+    """
+    from app.tools import _data_access
+
+    streams = context.meta.get("streams", [])
+    pairs = context.meta.get("stream_pairs", [])
+    units: list[dict[str, Any]] = []
+
+    # 显式指定表：按名解析，不要求 kind=imu（如直接检查 accel.csv）。
+    if table is not None:
+        resolved = _data_access.resolve_table_name(context, table)
+        if resolved["success"]:
+            s = next((x for x in streams if Path(x.get("path", "")).name.lower() == table.lower()), None)
+            channels = (s or {}).get("channels", []) or list(resolved["df"].columns)
+            accel_cols, gyro_cols = _split_imu_channels(list(resolved["df"].columns), resolved["table_name"])
+            units.append({
+                "key": resolved["table_name"],
+                "table_name": resolved["table_name"],
+                "data": {c: resolved["df"][c].to_numpy(dtype=float) for c in accel_cols + gyro_cols if c in resolved["df"].columns},
+                "accel_cols": accel_cols,
+                "gyro_cols": gyro_cols,
+                "rate": (s or {}).get("measured_rate", {}).get("sample_rate_hz") if isinstance((s or {}).get("measured_rate"), dict) else None,
+                "source": "explicit",
+            })
+        return units
+
+    # 六轴配对：accel 表 + gyro 表合成一个单元。
+    used = set()
+    for p in pairs:
+        if p.get("type") != "imu_6axis":
+            continue
+        accel_paths = [t for t in p.get("streams", []) if "accel" in Path(t).name.lower()]
+        gyro_paths = [t for t in p.get("streams", []) if "gyro" in Path(t).name.lower() or "gyr" in Path(t).name.lower()]
+        if not accel_paths or not gyro_paths:
+            continue
+        accel_s = next((x for x in imu_streams if x.get("path") == accel_paths[0]), None)
+        gyro_s = next((x for x in imu_streams if x.get("path") == gyro_paths[0]), None)
+        accel_df = _data_access.read_stream_full(accel_paths[0], (accel_s or {}).get("format", "csv"))
+        gyro_df = _data_access.read_stream_full(gyro_paths[0], (gyro_s or {}).get("format", "csv"))
+        accel_cols, _ = _split_imu_channels(list(accel_df.columns) if accel_df is not None else [], Path(accel_paths[0]).name)
+        _, gyro_cols = _split_imu_channels(list(gyro_df.columns) if gyro_df is not None else [], Path(gyro_paths[0]).name)
+        # accel 与 gyro 文件可能都用 x/y/z 通用列 → 用前缀命名避免 key 冲突。
+        data: dict[str, np.ndarray] = {}
+        if accel_df is not None:
+            for c in accel_cols:
+                if c in accel_df.columns:
+                    data[f"accel_{c}"] = accel_df[c].to_numpy(dtype=float)
+        if gyro_df is not None:
+            for c in gyro_cols:
+                if c in gyro_df.columns:
+                    data[f"gyro_{c}"] = gyro_df[c].to_numpy(dtype=float)
+        accel_cols = [f"accel_{c}" for c in accel_cols]
+        gyro_cols = [f"gyro_{c}" for c in gyro_cols]
+        rate = None
+        for x in (accel_s, gyro_s):
+            if x and isinstance(x.get("measured_rate"), dict):
+                rate = x.get("measured_rate", {}).get("sample_rate_hz")
+                break
+        units.append({
+            "key": "accel + gyro（六轴配对）",
+            "table_name": Path(accel_paths[0]).name + " + " + Path(gyro_paths[0]).name,
+            "data": data,
+            "accel_cols": accel_cols,
+            "gyro_cols": gyro_cols,
+            "rate": rate,
+            "source": "pair",
+        })
+        used.update(accel_paths)
+        used.update(gyro_paths)
+
+    # 其余单个 IMU 流（未被配对覆盖）。
+    for imu in imu_streams:
+        if imu.get("path") in used:
+            continue
+        key = imu.get("path") or "imu"
+        accel_cols, gyro_cols = _split_imu_channels(imu.get("channels", []), key)
+        path = imu.get("path", "")
+        fmt = imu.get("format", "")
+        data = _read_columns(path, fmt, accel_cols + gyro_cols) if path else {}
+        rate = (imu.get("measured_rate") or {}).get("sample_rate_hz") if isinstance(imu.get("measured_rate"), dict) else None
+        units.append({
+            "key": key,
+            "table_name": Path(path).name if path else None,
+            "data": data or {},
+            "accel_cols": accel_cols,
+            "gyro_cols": gyro_cols,
+            "rate": rate,
+            "source": "stream",
+        })
+    return units
+
+
+def check_sensor_sanity_impl(context: RunContext, settings=None, table: str | None = None) -> dict[str, Any]:
     """执行传感器数据合理性检查。
 
     Args:
         context: 运行时上下文（复用 meta.streams / capabilities）。
         settings: 应用配置（阈值）；缺省读取 get_settings()。
+        table: 可选，指定检查对象表名（与 profile_data 对齐）；缺省自动定位。
 
     Returns:
         统一质检返回：result（pass/warn/fail）、units、静止段、各检查项、
@@ -231,7 +357,7 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
     episode_note = "未检测到 episode 划分，将整个录制视为单个 episode。"
 
     # 无可检查流（既无 IMU 也无力）→ 不适用。
-    if not imu_streams and not force_streams:
+    if not imu_streams and not force_streams and table is None:
         return {
             "success": False,
             "error": "not_applicable",
@@ -245,15 +371,16 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
     failures: list[str] = []
     warns: list[str] = []
 
-    # ---- 逐个 IMU 流检查 ----
-    for imu in imu_streams:
-        key = imu.get("path") or "imu"
-        accel_cols, gyro_cols = _split_imu_channels(imu.get("channels", []))
-        path = imu.get("path", "")
-        fmt = imu.get("format", "")
-        data = _read_columns(path, fmt, accel_cols + gyro_cols) if path else None
+    # ---- IMU 检查单元（含配对与单流；指定 table 时仅该表）----
+    imu_units = _imu_check_units(context, imu_streams, table)
+    for imu in imu_units:
+        key = imu["key"]
+        accel_cols = imu["accel_cols"]
+        gyro_cols = imu["gyro_cols"]
+        data = imu["data"]
+        check_table = imu["table_name"]
 
-        if data is None or not accel_cols:
+        if not data or not accel_cols:
             skipped_checks[key] = {"status": "skipped", "reason": "无法读取 IMU 数值列"}
             continue
 
@@ -274,7 +401,7 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
             nan_ratio = 0.0
 
         # 静止段窗口自适应采样率（measured_rate 优先，回退 config 默认）。
-        rate = (imu.get("measured_rate") or {}).get("sample_rate_hz") if isinstance(imu.get("measured_rate"), dict) else None
+        rate = imu.get("rate")
         if rate is None:
             rate = settings.sanity_static_window_rate
         window = max(2, int(round(float(rate) * 1.0)))
@@ -349,11 +476,26 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
             if gdata.size > 0:
                 gmags = np.linalg.norm(gdata, axis=1)
                 gnan = _nan_inf_ratio(gmags)
-                gstatic = gmags[static_mask & ~np.isnan(gmags)]
+                # accel 与 gyro 行数可能不同（真实 accel 52354 / gyro 52347），
+                # 当长度不一致时对 gyro 单独判静止段，避免广播越界。
+                if len(gmags) == len(static_mask):
+                    gstatic = gmags[static_mask & ~np.isnan(gmags)]
+                else:
+                    gmask, _ = _stationary_mask(
+                        gmags, window, settings.sanity_static_var_threshold
+                    )
+                    gstatic = gmags[gmask & ~np.isnan(gmags)]
                 gunit, gunit_evidence = _infer_gyro_unit(gstatic)
                 for c in gyro_cols:
                     if c in data:
-                        arr = data[c][static_mask & ~np.isnan(data[c])]
+                        arr = data[c][~np.isnan(data[c])]
+                        if len(arr) == len(static_mask):
+                            arr = arr[static_mask]
+                        else:
+                            gmask2, _ = _stationary_mask(
+                                arr, window, settings.sanity_static_var_threshold
+                            )
+                            arr = arr[gmask2]
                         per_axis_gyro[c] = round(float(np.degrees(np.median(arr))), 4) if len(arr) else None
                 gyro_check = {
                     "status": "done",
@@ -389,6 +531,8 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
 
         checks[key] = {
             "type": "imu",
+            "table_name": check_table,
+            "data_source": imu.get("source"),
             "accel_unit": unit,
             "accel_unit_evidence": unit_evidence,
             "static_ratio": static_ratio,
@@ -426,6 +570,7 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
 
         force_check = {
             "type": "force",
+            "table_name": Path(path).name if path else None,
             "nan_ratio": nan_ratio,
             "saturation_ratio": sat_ratio,
             "threshold": settings.sanity_saturation_ratio,
@@ -528,17 +673,21 @@ def check_sensor_sanity_impl(context: RunContext, settings=None) -> dict[str, An
 def check_sensor_sanity(
     wrapper: RunContextWrapper[RunContext],
     sensor: str | None = None,
+    table: str | None = None,
 ) -> dict:
     """检查传感器数据合理性（单位、重力、零漂、饱和、NaN、恒定通道）。
 
     基于流登记表按需读取数值列，执行单位推断、IMU/力/力矩检查与通用检查。
-    静止段用方差阈值启发式确定；判定三档 pass/warn/fail。
+    IMU 检查优先用 accel+gyro 六轴配对（按配对从流注册表惰性读取对应表，不依赖
+    主表身份）；也可显式指定 table 检查某张表。静止段用方差阈值启发式确定；
+    判定三档 pass/warn/fail。每个检查项注明作用表名。
 
     Args:
         sensor: 可选，指定要检查的传感器；省略时检查所有可用传感器。
+        table: 可选，指定检查对象表名（如 "accel.csv"）；缺省自动定位/全查。
 
     Returns:
         统一质检返回格式：result、checks、skipped_checks、dataset、user_message；
         无可检查流时返回 not_applicable。
     """
-    return check_sensor_sanity_impl(wrapper.context)
+    return check_sensor_sanity_impl(wrapper.context, table=table)
