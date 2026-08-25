@@ -89,6 +89,7 @@ def compute_stats_impl(
     metric: str | None = None,
     column: str | None = None,
     group_by: str | None = None,
+    table: str | None = None,
     settings=None,
 ) -> dict[str, Any]:
     """执行任务级统计。
@@ -98,17 +99,34 @@ def compute_stats_impl(
         metric: 可选，指定指标；省略时返回全部可用指标。
         column: 可选，通用统计的列。
         group_by: 可选，分组列。
+        table: 可选，目标表名（文件名）；缺省自动定位状态/动作表（主表或独立表）。
         settings: 应用配置；缺省读取 get_settings()。
 
     Returns:
-        dict，含 success、dataset、stats、metrics、qc_summary、semantic_notes、
-        findings、user_message。
+        dict，含 success、dataset、table_name、stats、metrics、qc_summary、
+        semantic_notes、findings、user_message。
     """
     settings = settings or get_settings()
     capabilities = context.meta.get("capabilities", {})
     dataset_id = context.dataset_id
 
-    df, _source = _data_access.locate_action_table(context)
+    if table is not None:
+        # 显式指定表：经统一多表入口按名惰性读取（不替换主表）。
+        resolved = _data_access.resolve_table_name(context, table)
+        if not resolved["success"]:
+            return {
+                "success": False,
+                "error": resolved.get("error", "table_unavailable"),
+                "reason": resolved.get("reason"),
+                "table": table,
+                "dataset": dataset_id,
+                "user_message": resolved.get("user_message", f"指定的表 {table} 不可用。"),
+            }
+        df = resolved["df"]
+        _source = resolved["source"]
+    else:
+        resolved = None
+        df, _source = _data_access.locate_action_table(context)
 
     # 前置条件：无状态/动作表 → 不适用。
     if df is None:
@@ -265,9 +283,25 @@ def compute_stats_impl(
             ),
         }
 
+    # 结果标注表名与数据集归属。
+    table_name = (
+        resolved["table_name"] if resolved is not None
+        else (context.meta.get("main_table", {}).get("name") if _source in ("main", "main_fallback") else None)
+    )
+    source_note = (
+        "（显式指定表，按名惰性读取，未替换主表）"
+        if table is not None else
+        ("（主表）" if _source == "main" else
+         ("（独立状态/动作表）" if _source == "actions_stream" else
+          ("（主表兜底）" if _source == "main_fallback" else "")))
+    )
+
     return {
         "success": True,
         "dataset": dataset_id,
+        "table": table_name,
+        "table_name": table_name,
+        "data_source": _source,
         "metric": metric,
         "stats": stats,
         "metrics": metrics,
@@ -276,7 +310,8 @@ def compute_stats_impl(
         "findings": [finding],
         "data_scope": data_scope,
         "user_message": (
-            f"任务级统计完成（{dataset_id}）：{metrics.get('episode_distribution', {}).get('n_episodes', 0)} 个 episode。"
+            f"任务级统计完成（数据集 {dataset_id}，表 {table_name}{source_note}）："
+            f"{metrics.get('episode_distribution', {}).get('n_episodes', 0)} 个 episode。"
             + (f" 成功率 {metrics['success_rate']['overall']}。" if 'success_rate' in metrics else "")
             + (f" 离群 episode {len(outlier_episodes)} 个。" if outlier_episodes else "")
             + (f" {data_scope['note']}" if data_scope else "")
@@ -302,19 +337,23 @@ def compute_stats(
     metric: str | None = None,
     column: str | None = None,
     group_by: str | None = None,
+    table: str | None = None,
 ) -> dict:
     """计算任务级统计指标（episode 分布、成功率、关节活动范围、离群 episode 等）。
 
-    数据来源默认 context.df；若状态/动作在独立表中则按流登记表按需读取。语义不明
-    时标注所用规则与依据列名（如 success 取末帧、episode 缺失时整段视为一个 episode）。
+    数据来源默认自动定位状态/动作表（主表或独立表）；也可显式指定 table（文件名）
+    对目录内某张表统计，该表按名惰性读取、不替换主表。语义不明时标注所用规则与
+    依据列名（如 success 取末帧、episode 缺失时整段视为一个 episode）。
 
     Args:
         metric: 可选，指定指标；省略时返回全部可用指标。
         column: 可选，通用统计的列。
         group_by: 可选，分组列。
+        table: 可选，目标表名（如 "accel.csv"）；缺省自动定位状态/动作表。
 
     Returns:
-        dict，含 success、dataset、stats、metrics、qc_summary、semantic_notes、
-        findings、user_message；无可用的状态/动作表时返回 not_applicable。
+        dict，含 success、dataset、table_name、stats、metrics、qc_summary、
+        semantic_notes、findings、user_message；无可用的状态/动作表时返回
+        not_applicable；指定表不存在时返回 table_not_found。
     """
-    return compute_stats_impl(wrapper.context, metric, column, group_by)
+    return compute_stats_impl(wrapper.context, metric, column, group_by, table)

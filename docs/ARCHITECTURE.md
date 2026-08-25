@@ -109,6 +109,19 @@
 
 **共享数据访问约定（2026-08-20 新增）**：凡需访问状态/动作数据的工具（如 compute_stats、plot_chart 的 trajectory），一律经共享数据访问函数 `app/tools/_data_access.py` 的 `locate_action_table` 定位数据表（主表含目标列则用主表，否则按流登记表按需读取独立表），**不得各自直接读 `context.df`**——避免"状态/动作在独立表时误用主表"的问题。
 
+**多表支持（2026-08-25 新增，边界：目录内多表并存，非多数据集对比）**：
+
+- **`RunContext.df` 保持主表语义**：`df` 只装单主表，新加载仍覆盖。目录内其它表经流登记表
+  `meta["streams"]` **按名惰性读取**，**不替换 `context.df`**（主表状态不被修改）。
+- **统一数据访问入口 `_data_access.resolve_table_name(context, table=None)`**：缺省
+  `table=None` → 主表（`context.df`）；显式给表名 → 按流登记表按文件名查找并读全表。
+  返回统一含 `success / df / table_name / dataset / source`（main / stream_lazy / error），
+  表不存在或读取失败返回结构化错误（`table_not_found` / `table_read_failed`），不抛异常。
+- **工具接入**：`profile_data`、`compute_stats`、`plot_chart` 均新增可选参数 `table`
+  （缺省=主表/自动定位），经 `resolve_table_name` 取数；**每表统计结果都注明表名
+  （`table_name`）与数据集归属（`dataset`）**，来源经 `data_source` 标注
+  （`main` / `stream_lazy` / `actions_stream` 等），避免把次表结果误当主表。
+
 ### 3.4 `app/agent/` — Agent 定义与运行入口
 
 - 组装：读取 `get_settings()` → 通过 `app/llm/factory.build_model` 构建 Model → 构建 `Agent`（含 `name`、`instructions`、`model`、`tools`）。

@@ -72,6 +72,7 @@ def plot_chart_impl(
     y: str | None = None,
     color: str | None = None,
     title: str | None = None,
+    table: str | None = None,
 ) -> dict[str, Any]:
     """绘制图表并保存到 outputs/。
 
@@ -82,30 +83,50 @@ def plot_chart_impl(
         y: 可选，Y 轴列名。
         color: 可选，分组列名。
         title: 可选，标题（建议英文，含中文会回退英文默认以规避乱码）。
+        table: 可选，目标表名（文件名）；缺省用主表/自动定位。
 
     Returns:
-        dict，含 success、file_path、chart_type、title、description、dataset、findings。
+        dict，含 success、file_path、chart_type、title、description、dataset、
+        table_name、findings。
     """
     chart_type = chart_type.lower().strip()
     dataset_id = context.dataset_id
 
-    # 通用图需要 context.df。
+    # 通用图：缺省主表，或经统一入口按名惰性读取指定表（不替换主表）。
     if chart_type in ("line", "scatter", "histogram"):
-        if context.df is None:
+        resolved = _data_access.resolve_table_name(context, table)
+        if not resolved["success"]:
             return {
-                "success": False, "error": "no_data_loaded",
-                "user_message": f"绘制 {chart_type} 需要已加载的数据表。请先调用 load_dataset。",
+                "success": False, "error": resolved.get("error", "no_data_loaded"),
+                "reason": resolved.get("reason"),
+                "table": table,
+                "user_message": resolved.get("user_message", f"绘制 {chart_type} 需要可用数据表。"),
                 "dataset": dataset_id,
             }
         title_safe = _safe_title(title, f"{chart_type} chart")
         path = _output_path(context, chart_type)
         fig, ax = plt.subplots()
-        desc, plot_spec = _plot_generic_to_ax(context.df, chart_type, x, y, color, title_safe, fig, ax)
+        desc, plot_spec = _plot_generic_to_ax(resolved["df"], chart_type, x, y, color, title_safe, fig, ax)
         _save_fig(fig, path)
+        chart_table_name = resolved["table_name"]
 
     elif chart_type == "trajectory":
-        # 定位状态/动作表（主表含关节/位姿列则用主表，否则按流登记表读独立表）。
-        traj_df, _source = _data_access.locate_action_table(context)
+        # 显式指定表 → 统一入口按名读取；否则自动定位状态/动作表。
+        if table is not None:
+            resolved = _data_access.resolve_table_name(context, table)
+            if not resolved["success"]:
+                return {
+                    "success": False, "error": resolved.get("error", "table_not_found"),
+                    "reason": resolved.get("reason"),
+                    "table": table,
+                    "user_message": resolved.get("user_message", "指定的表不可用。"),
+                    "dataset": dataset_id,
+                }
+            traj_df = resolved["df"]
+            chart_table_name = resolved["table_name"]
+        else:
+            traj_df, _source = _data_access.locate_action_table(context)
+            chart_table_name = context.meta.get("main_table", {}).get("name")
         if traj_df is None:
             return {
                 "success": False, "error": "no_data_loaded",
@@ -156,16 +177,19 @@ def plot_chart_impl(
     }
     context.findings.append(finding)
 
+    table_name = chart_table_name if chart_type in ("line", "scatter", "histogram", "trajectory") else None
     return {
         "success": True,
         "dataset": dataset_id,
+        "table": table_name,
+        "table_name": table_name,
         "file_path": str(path),
         "chart_type": chart_type,
         "title": _safe_title(title, chart_type),
         "description": desc,
         "plot_spec": plot_spec,
         "findings": [finding],
-        "user_message": f"已生成 {chart_type} 图表，保存至 {path}。{desc}。",
+        "user_message": f"已生成 {chart_type} 图表（数据集 {dataset_id}" + (f"，表 {table_name}" if table_name else "") + f"），保存至 {path}。{desc}。",
     }
 
 
@@ -322,6 +346,7 @@ def plot_chart(
     y: str | None = None,
     color: str | None = None,
     title: str | None = None,
+    table: str | None = None,
 ) -> dict:
     """绘制图表并保存到 outputs/。
 
@@ -335,9 +360,11 @@ def plot_chart(
         y: 可选，Y 轴列名。
         color: 可选，分组列名。
         title: 可选，标题（建议英文）。
+        table: 可选，目标表名（如 "accel.csv"）；缺省用主表/自动定位，指定表
+            按名惰性读取、不替换主表。
 
     Returns:
         dict，含 success、file_path、chart_type、title、description、dataset、
-        findings；无轨迹列/无数据流时返回 not_applicable。
+        table_name、findings；无轨迹列/无数据流时返回 not_applicable。
     """
-    return plot_chart_impl(wrapper.context, chart_type, x, y, color, title)
+    return plot_chart_impl(wrapper.context, chart_type, x, y, color, title, table)
