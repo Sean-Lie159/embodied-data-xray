@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from agents import RunContextWrapper
@@ -75,19 +76,26 @@ def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
 
 
 def _measure_rate_from_file(
-    path: str, fmt: str, channels: list[str]
+    path: str, fmt: str, channels: list[str], timestamp_unit: str | None = None
 ) -> dict[str, Any]:
-    """从文件实测采样率（均值 + 抖动）。
+    """从文件实测采样率（均值 + 抖动），先把时间戳归一化到纳秒基准。
 
     Args:
         path: 文件路径。
         fmt: 文件格式（csv/parquet/json）。
         channels: 该流的通道列（用于判断数据是否存在）。
+        timestamp_unit: 时间戳单位（s/ms/us/ns，来自嗅探推断）。传入可用的时间单位
+            时，先把差分换算到纳秒再算采样率，避免"微秒被当成秒"之类导致采样率
+            误算成 10^-9；无法确定单位（None/unknown/frame_index）时按原值计算，
+            并注明单位未知。
 
     Returns:
-        dict，含 present、sample_rate_hz、jitter_ms、n_samples；文件缺失、格式
-        损坏、无时间戳列或通道缺失时 present=False 并注明原因。
+        dict，含 present、sample_rate_hz、jitter_ms、n_samples、timestamp_unit、
+        timestamp_unit_basis；文件缺失、格式损坏、无时间戳列或通道缺失时
+        present=False 并注明原因。
     """
+    from app.tools.timestamp_units import to_ns
+
     if not Path(path).exists():
         return {"present": False, "reason": f"文件不存在：{path}"}
     ts = _read_timestamp_only(path, fmt)
@@ -97,20 +105,33 @@ def _measure_rate_from_file(
         ts = pd.to_numeric(ts, errors="coerce").dropna().sort_values()
         if len(ts) < 2:
             return {"present": False, "reason": "时间戳样本不足"}
-        diffs = ts.diff().dropna()
-        med = diffs.median()
+        # 归一化到纳秒基准（仅当单位可换算）；否则保留原值（未知单位按秒兜底，
+        # 兼容历史未标注单位的秒级时间戳）。
+        unit = timestamp_unit if timestamp_unit in ("s", "ms", "us", "ns") else None
+        normalized = unit is not None
+        ts_arr = to_ns(ts.to_numpy(), unit) if normalized else ts.to_numpy()
+        diffs = np.diff(ts_arr)
+        med = float(np.median(diffs)) if len(diffs) > 0 else 0.0
         if med and med > 0:
             diffs = diffs[diffs <= med * 10]
-        mean_interval = float(diffs.mean())
+        mean_interval = float(diffs.mean()) if len(diffs) > 0 else 0.0
         if mean_interval <= 0:
             return {"present": False, "reason": "时间戳间隔非正"}
-        jitter_ms = float(diffs.std()) * 1000.0
+        # 归一化到纳秒时按 1e9/间隔(ns) 算 Hz；未归一化时按 1/间隔(秒) 算 Hz。
+        sample_rate = (1e9 / mean_interval if normalized else 1.0 / mean_interval)
+        jitter_ms = float(diffs.std()) / 1e6 if normalized else float(diffs.std()) * 1000.0
+        unit_note = (
+            f"（原始单位 {timestamp_unit}，已归一化到纳秒）"
+            if normalized else f"（原始单位 {timestamp_unit or 'unknown'}，未归一化，按秒兜底计算）"
+        )
         return {
             "present": True,
-            "sample_rate_hz": round(1.0 / mean_interval, 3) if mean_interval else None,
+            "sample_rate_hz": round(sample_rate, 3),
             "jitter_ms": round(jitter_ms, 3),
             "n_samples": int(len(ts)),
             "timestamp_column": str(ts.name) if ts.name else None,
+            "timestamp_unit": timestamp_unit or "unknown",
+            "timestamp_unit_basis": unit_note,
         }
     except Exception:  # noqa: BLE001
         return {"present": False, "reason": "时间戳解析失败"}
@@ -147,6 +168,7 @@ def _measure_stream_rate(
             stream.get("path", ""),
             stream.get("format", ""),
             stream.get("channels", []),
+            stream.get("timestamp_unit"),
         )
 
     stream["measured_rate"] = result  # 回写缓存
@@ -257,6 +279,8 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
             "status": s.get("status", "active"),
             "imu_axes": s.get("imu_axes"),
             "timestamp_column": s.get("timestamp_column"),
+            "timestamp_unit": s.get("timestamp_unit"),
+            "timestamp_unit_basis": s.get("timestamp_unit_basis"),
         }
         if kind == "video":
             continue  # 视频已在上方 video_streams 处理

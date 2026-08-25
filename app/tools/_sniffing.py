@@ -303,6 +303,8 @@ def fingerprint_timestamp(sample: pd.DataFrame, columns: list[str]) -> dict[str,
         c for c in columns
         if str(c).lower().strip() in _TIMESTAMP_COLS and c in sample.columns
     ]
+    from app.tools.timestamp_units import infer_unit, unit_to_ns_factor
+
     for col in candidate_cols:
         s = pd.to_numeric(sample[col], errors="coerce").dropna()
         if len(s) < 3:
@@ -316,6 +318,15 @@ def fingerprint_timestamp(sample: pd.DataFrame, columns: list[str]) -> dict[str,
         # 差分大致均匀：偏离中位数 1.5 倍以内的占比。
         uniform_ratio = float((diffs <= med * 1.5).mean())
         if uniform_ratio >= 0.9:
+            # 单位推断：优先列名后缀，其次按中位差分量级；无法推断时标 unknown。
+            unit_info = infer_unit(s.to_numpy(), col)
+            unit = unit_info["unit"]
+            unit_basis = unit_info["unit_basis"]
+            # 依据里附上到纳秒的换算因子（时间单位才有）。
+            unit_extra = (
+                f"，到纳秒换算 ×{unit_to_ns_factor(unit)}"
+                if unit in ("s", "ms", "us", "ns") else ""
+            )
             return {
                 "present": True,
                 "column": col,
@@ -323,11 +334,16 @@ def fingerprint_timestamp(sample: pd.DataFrame, columns: list[str]) -> dict[str,
                     f"列 {col} 单调递增，间隔中位数 {med:.3g}，"
                     f"差分均匀占比 {uniform_ratio:.0%}"
                 ),
+                # 单位推断结果透出（供采样率 / 对齐归一化使用）。
+                "timestamp_unit": unit,
+                "timestamp_unit_basis": f"{unit_basis}{unit_extra}",
                 "layer": "content_fingerprint",
             }
     return {
         "present": False, "column": None,
         "evidence": "无可识别的时间戳列（需列名命中且数值单调递增、差分均匀）",
+        "timestamp_unit": "unknown",
+        "timestamp_unit_basis": "无时间戳列，无法推断单位",
         "layer": "content_fingerprint",
     }
 
@@ -517,6 +533,10 @@ def classify_table_stream(
         quat_groups = detect_quaternion_groups(sample, columns)
         force_fp = fingerprint_force(sample, columns)
 
+    # 时间戳单位（第 2 层推断）：透出到流登记表，供采样率/对齐归一化使用。
+    ts_unit = ts_fp.get("timestamp_unit", "unknown")
+    ts_unit_basis = ts_fp.get("timestamp_unit_basis", "未推断")
+
     # 2. 手部跟踪修正：命名含 hand_tracking 或词典线索强（多 joint/orientation）。
     if "hand_tracking" in lower or dict_sniff["has_hand_tracking"]["present"]:
         label = "手部跟踪（关节+四元数）"
@@ -531,6 +551,8 @@ def classify_table_stream(
             "status": "active",
             "channels": columns,
             "timestamp_column": ts_fp.get("column"),
+            "timestamp_unit": ts_unit,
+            "timestamp_unit_basis": ts_unit_basis,
             "quaternion_groups": quat_groups,
             "imu_axes": None,
         }
@@ -560,6 +582,8 @@ def classify_table_stream(
             "status": "active",
             "channels": columns,
             "timestamp_column": ts_fp.get("column"),
+            "timestamp_unit": ts_unit,
+            "timestamp_unit_basis": ts_unit_basis,
             "quaternion_groups": quat_groups,
             "imu_axes": axes,
         }
@@ -577,6 +601,8 @@ def classify_table_stream(
             "status": "active",
             "channels": columns,
             "timestamp_column": ts_fp.get("column"),
+            "timestamp_unit": ts_unit,
+            "timestamp_unit_basis": ts_unit_basis,
             "quaternion_groups": quat_groups,
             "imu_axes": None,
         }
@@ -591,6 +617,8 @@ def classify_table_stream(
             "status": "active",
             "channels": force_fp["columns"],
             "timestamp_column": ts_fp.get("column"),
+            "timestamp_unit": ts_unit,
+            "timestamp_unit_basis": ts_unit_basis,
             "quaternion_groups": quat_groups,
             "imu_axes": None,
         }
@@ -604,6 +632,8 @@ def classify_table_stream(
             "status": "active",
             "channels": [],
             "timestamp_column": ts_fp.get("column"),
+            "timestamp_unit": ts_unit,
+            "timestamp_unit_basis": ts_unit_basis,
             "quaternion_groups": quat_groups,
             "imu_axes": None,
         }
@@ -618,6 +648,8 @@ def classify_table_stream(
             "status": "active",
             "channels": dict_sniff["has_actions"]["columns"],
             "timestamp_column": ts_fp.get("column"),
+            "timestamp_unit": ts_unit,
+            "timestamp_unit_basis": ts_unit_basis,
             "quaternion_groups": quat_groups,
             "imu_axes": None,
         }
@@ -642,6 +674,8 @@ def classify_table_stream(
         "status": "active",
         "channels": [],
         "timestamp_column": ts_fp.get("column"),
+        "timestamp_unit": ts_unit,
+        "timestamp_unit_basis": ts_unit_basis,
         "quaternion_groups": quat_groups,
         "imu_axes": None,
     }
@@ -1103,6 +1137,8 @@ def build_streams_registry(
             "label_confidence": klass.get("label_confidence"),
             "status": klass.get("status", "active"),
             "timestamp_column": klass.get("timestamp_column"),
+            "timestamp_unit": klass.get("timestamp_unit", "unknown"),
+            "timestamp_unit_basis": klass.get("timestamp_unit_basis", "未推断"),
             "quaternion_groups": klass.get("quaternion_groups", []),
             "imu_axes": klass.get("imu_axes"),
         })

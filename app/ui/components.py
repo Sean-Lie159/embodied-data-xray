@@ -104,9 +104,12 @@ def render_dataset_overview(summary: dict[str, Any]) -> None:
 
     caps = summary.get("capabilities", {})
     st.markdown("**能力标签**")
+    # IMU 轴数：None 或 "unknown" 时显示"未知"，避免侧栏出现 "None 轴"。
+    imu_axes = caps.get("imu_axes")
+    imu_axes_txt = "未知" if imu_axes is None or imu_axes == "unknown" else f"{imu_axes} 轴"
     cap_lines = [
         f"- 视频流: {'✓' if caps.get('has_video_streams') else '✗'}",
-        f"- IMU: {'✓' if caps.get('has_imu') else '✗'}（{caps.get('imu_axes', '?')} 轴）",
+        f"- IMU: {'✓' if caps.get('has_imu') else '✗'}（{imu_axes_txt}）",
         f"- 力/力矩: {'✓' if caps.get('has_force') else '✗'}",
         f"- 标定: {'✓' if caps.get('has_calibration') else '✗'}",
         f"- 状态/动作: {'✓' if caps.get('has_actions') else '✗'}",

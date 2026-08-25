@@ -406,12 +406,18 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
 
     # 流配对规则（mp4↔metainfo、accel+gyro=六轴IMU）。
     stream_pairs = _sniffing.pair_streams(probe["videos"], probe["tables"], probe["audios"])
-    caps_result["capabilities"]["has_imu_6axis_pair"] = any(
-        p["type"] == "imu_6axis" for p in stream_pairs
-    )
+    has_imu_6axis_pair = any(p["type"] == "imu_6axis" for p in stream_pairs)
+    caps_result["capabilities"]["has_imu_6axis_pair"] = has_imu_6axis_pair
     caps_result["capabilities"]["has_media_metainfo_pair"] = any(
         p["type"] == "media_metainfo" for p in stream_pairs
     )
+    # 修复侧栏 IMU 轴数显示 None：has_imu 但聚合轴数为 None 时，若存在 accel+gyro
+    # 六轴配对则标 6；否则标 "unknown"（避免 UI 显示 None）。
+    if (
+        caps_result["capabilities"].get("has_imu")
+        and caps_result["capabilities"].get("imu_axes") is None
+    ):
+        caps_result["capabilities"]["imu_axes"] = 6 if has_imu_6axis_pair else "unknown"
 
     # 记录路径清单与元数据（不读入内存）。
     dataset_id = dir_path.name

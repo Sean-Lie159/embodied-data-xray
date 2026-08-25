@@ -21,6 +21,7 @@ from agents.decorators import tool
 from app.agent.context import RunContext
 from app.config import get_settings
 from app.tools.inspect_streams import _read_timestamp_only
+from app.tools.timestamp_units import FRAME_UNIT, TIME_UNITS, to_ns, unit_to_ns_factor
 
 
 def _read_stream_timestamps(stream: dict[str, Any]) -> np.ndarray | None:
@@ -56,6 +57,83 @@ def pd_to_numeric(series) -> np.ndarray:
     return pd.to_numeric(series, errors="coerce").to_numpy()
 
 
+def _to_seconds(ts: np.ndarray, unit_info: dict[str, Any] | None) -> np.ndarray:
+    """把时间戳换算为秒（供单流检查用）。
+
+    已归一化到纳秒的（normalized=True）除以 1e9；未归一化的（unknown/frame_index）
+    按原值当作秒（仅用于乱序/重复/丢帧等相对检查，不涉绝对时间）。
+
+    Args:
+        ts: 时间戳数组（可能为纳秒或原值）。
+        unit_info: _normalize_to_ns 返回的单位说明。
+
+    Returns:
+        秒级时间戳数组。
+    """
+    if unit_info and unit_info.get("normalized"):
+        return np.asarray(ts, dtype=float) / 1e9
+    return np.asarray(ts, dtype=float)
+
+
+def infer_metainfo_unit(arr: np.ndarray, col_name: str) -> str:
+    """推断 metainfo 时间戳列的单位。
+
+    规则：列名含真实时钟标记（utc / epoch / real / host）→ 用 infer_unit 按量级推断
+    （如 exposure_start_utc_ns → ns）；列名是帧序号类（pts / frame / packet / index）→
+    直接判为 frame_index（无物理时间，不参与跨流对齐）；否则退回 infer_unit。
+
+    Args:
+        arr: 时间戳数值数组。
+        col_name: 时间戳列名。
+
+    Returns:
+        单位名（s/ms/us/ns/frame_index/unknown）。
+    """
+    from app.tools.timestamp_units import infer_unit
+
+    lower = col_name.lower()
+    if any(k in lower for k in ("utc", "epoch", "real", "host")):
+        return infer_unit(arr)["unit"]
+    if any(k in lower for k in ("pts", "frame", "packet", "index", "idx")):
+        return FRAME_UNIT
+    return infer_unit(arr)["unit"]
+
+
+def _normalize_to_ns(ts: np.ndarray, unit: str) -> tuple[np.ndarray, dict[str, Any]]:
+    """把原始时间戳归一化到纳秒基准，返回 (归一化数组, 单位说明)。
+
+    时间单位（s/ms/us/ns）直接换算；frame_index（帧序号）无物理时间，不换算、
+    不参与跨流对齐残差判定，仅用于单流检查（乱序/重复/丢帧）。单位未知时保持
+    原值并注明"未归一化"。
+
+    Args:
+        ts: 原始时间戳数组。
+        unit: 流的时间戳单位（来自嗅探推断）。
+
+    Returns:
+        (归一化数组, 说明 dict)，说明含 original_unit、normalized、basis。
+    """
+    if unit in TIME_UNITS:
+        return to_ns(ts, unit), {
+            "original_unit": unit,
+            "normalized": True,
+            "basis": f"原始单位 {unit}，已归一化到纳秒（×{unit_to_ns_factor(unit)}）",
+        }
+    if unit == FRAME_UNIT:
+        return ts, {
+            "original_unit": FRAME_UNIT,
+            "normalized": False,
+            "basis": "帧序号时间戳（无物理时间），不参与跨流对齐残差判定",
+        }
+    # 单位未知：不硬猜，但为兼容历史数据（未标注单位的秒级时间戳），按秒换算到纳秒。
+    # 说明标注"默认按秒"，使下游可见这是兜底假设而非实测单位。
+    return ts * 1e9, {
+        "original_unit": unit or "unknown",
+        "normalized": True,
+        "basis": "单位未知，按秒换算到纳秒（兜底假设，非实测单位；真实采集应带 timestamp_unit）",
+    }
+
+
 def _nominal_rate(stream: dict[str, Any]) -> float | None:
     """从流登记表/meta 读取标称采样率；缺省返回 None。"""
     rate = stream.get("nominal_rate_hz")
@@ -70,7 +148,7 @@ def _single_stream_checks(
     """单流时间戳检查：单调性、重复、丢帧率、实际采样率、时长。
 
     Args:
-        ts: 原始顺序时间戳数组。
+        ts: 原始顺序时间戳数组（**秒**，调用方已统一换算为秒）。
         nominal: 标称采样率（Hz），None 时跳过实际 vs 标称对比。
 
     Returns:
@@ -154,7 +232,7 @@ def _align_residuals(base_ts: np.ndarray, other_ts: np.ndarray) -> dict[str, Any
             if 0 <= j < len(base_sorted):
                 best = min(best, abs(base_sorted[j] - t))
         residuals.append(best)
-    res = np.asarray(residuals) * 1000.0  # 秒 → 毫秒
+    res = np.asarray(residuals) / 1e6  # 纳秒 → 毫秒
     return {
         "n_match": int(len(res)),
         "residual_mean_ms": round(float(np.mean(res)), 3),
@@ -200,8 +278,8 @@ def _detect_drift(
                 if best is None or abs(d) < best[0]:
                     best = (abs(d), d)
         if best is not None:
-            base_times.append(float(b))
-            offsets.append(best[1] * 1000.0)  # ms
+            base_times.append(float(b) / 1e9)      # 纳秒 → 秒
+            offsets.append(best[1] / 1e6)          # 纳秒 → 毫秒
 
     if len(offsets) < 3:
         return {"drift_detected": False, "drift_slope_ms_per_s": None,
@@ -216,7 +294,7 @@ def _detect_drift(
     # 避免恒定小偏移/抖动被误判。
     bd = np.diff(base_sorted)
     med_b = float(np.median(bd)) if len(bd) > 0 else 0.0
-    base_interval_ms = med_b * 1000.0 if med_b > 0 else 0.0
+    base_interval_ms = (med_b / 1e6) if med_b > 0 else 0.0  # 纳秒 → 毫秒
     offset_range = float(np.max(y) - np.min(y))
     drift_detected = bool(
         abs(slope) > slope_threshold
@@ -268,16 +346,31 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                 if meta_ts is not None:
                     arr = pd_to_numeric(meta_ts)  # 已为 ndarray（见 pd_to_numeric）
                     arr = arr[~np.isnan(arr)]
+                    # 推断 metainfo 时间戳列的单位并归一化到纳秒；若为帧序号
+                    # （如 pts 无配对真实时间戳列）则标 frame_index、不参与对齐残差。
+                    col_name = str(meta_ts.name) if meta_ts.name is not None else ""
+                    meta_unit = infer_metainfo_unit(arr, col_name)
+                    arr_ns, unit_info = _normalize_to_ns(arr, meta_unit)
+                    frame_indexed = meta_unit == FRAME_UNIT
                     per_stream[key] = {
                         "kind": "video",
-                        "ts": arr if len(arr) > 0 else None,
+                        "ts": arr_ns if len(arr) > 0 else None,
                         "source": meta_path,
                         "timestamp_origin": "exposure_metadata",
+                        "unit_info": unit_info,
+                        "timestamp_unit": meta_unit,
+                        "frame_indexed": frame_indexed,
                     }
-                    streams_status[key] = (
-                        "参与对齐：经配对 metainfo 表读取曝光时间戳"
-                        "（时间戳来自曝光元数据而非容器）"
-                    )
+                    if frame_indexed:
+                        streams_status[key] = (
+                            "仅单流检查：metainfo 时间戳为帧序号（无配对真实时间戳列，"
+                            "不参与跨流对齐残差判定）"
+                        )
+                    else:
+                        streams_status[key] = (
+                            "参与对齐：经配对 metainfo 表读取曝光时间戳"
+                            "（时间戳来自曝光元数据而非容器）"
+                        )
                 else:
                     per_stream[key] = {"kind": "video", "ts": None,
                                        "source": s.get("path")}
@@ -288,19 +381,36 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                 streams_status[key] = "未参与：v1 不做视频帧级对齐（容器时间戳不可靠，内容级对齐属 v2）"
         else:
             ts = _read_stream_timestamps(s)
+            unit = s.get("timestamp_unit", "unknown")
+            ts_ns, unit_info = (
+                _normalize_to_ns(ts, unit) if ts is not None else (None, None)
+            )
+            # 帧序号类时间戳（如 metainfo 的 pts）无物理时间：不参与跨流对齐残差，
+            # 但保留用于单流检查（乱序/重复/丢帧）。
+            frame_indexed = unit == FRAME_UNIT
             per_stream[key] = {
                 "kind": s.get("kind"),
-                "ts": ts,
+                "ts": ts_ns,
+                "ts_raw": ts,
                 "source": s.get("path"),
                 "nominal": _nominal_rate(s),
+                "unit_info": unit_info,
+                "timestamp_unit": unit,
+                "frame_indexed": frame_indexed,
             }
             if ts is None:
                 streams_status[key] = "未参与：无法读取时间戳列"
+            elif frame_indexed:
+                streams_status[key] = "仅单流检查：帧序号时间戳（不参与跨流对齐残差判定）"
             else:
                 streams_status[key] = "参与对齐"
 
-    # 可对齐流数：统计能实际读到时间戳列的流（含经 metainfo 配对的视频流）。
-    alignable = [k for k, p in per_stream.items() if p["ts"] is not None]
+    # 可对齐流数：统计能实际读到时间戳列、且为真实时间（非帧序号）的流。
+    # 帧序号流（frame_indexed）仅做单流检查，不参与跨流对齐残差判定。
+    alignable = [
+        k for k, p in per_stream.items()
+        if p["ts"] is not None and not p.get("frame_indexed", False)
+    ]
     n_alignable = len(alignable)
     if n_alignable < 2:
         return {
@@ -322,10 +432,18 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                                   "status": "skipped",
                                   "reason": streams_status.get(key, "无法读取时间戳")}
             continue
-        checks = _single_stream_checks(p["ts"], p.get("nominal"))
+        # 单流检查用秒；p["ts"] 已统一为纳秒（normalized）或原值（unknown/frame）。
+        ts_sec = _to_seconds(p["ts"], p.get("unit_info"))
+        checks = _single_stream_checks(ts_sec, p.get("nominal"))
         checks["present"] = True
+        # 透出该流时间戳的原始单位与换算说明（供核对归一化是否正确）。
+        if p.get("unit_info"):
+            checks["timestamp_unit"] = p.get("timestamp_unit")
+            checks["timestamp_unit_basis"] = p["unit_info"].get("basis")
         stream_checks[key] = checks
-        valid_ts.append((key, p["ts"]))
+        # 仅真实时间流进入跨流对齐残差 / 漂移判定（帧序号流已在上方排除）。
+        if not p.get("frame_indexed", False):
+            valid_ts.append((key, p["ts"]))
 
     # episode 口径：无 episode 划分时整段视为一个 episode。
     has_episodes = bool(capabilities.get("has_episodes")) or bool(
@@ -341,8 +459,8 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     for key, ts in valid_ts:
         if len(ts) > 1:
             med = float(np.median(np.diff(np.sort(ts))))
-            if med > 0 and 1.0 / med > max_interval_hz:
-                max_interval_hz = 1.0 / med
+            if med > 0 and 1e9 / med > max_interval_hz:
+                max_interval_hz = 1e9 / med  # 纳秒间隔 → Hz
 
     # 基准 = 帧率最低的流（采样间隔最大）。
     if valid_ts:
@@ -350,7 +468,7 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
         for key, ts in valid_ts:
             if len(ts) > 1:
                 med = float(np.median(np.diff(np.sort(ts))))
-                rate = 1.0 / med if med > 0 else np.inf
+                rate = 1e9 / med if med > 0 else np.inf  # 纳秒间隔 → Hz
                 if rate < min_rate:
                     min_rate = rate
                     baseline_key = key
