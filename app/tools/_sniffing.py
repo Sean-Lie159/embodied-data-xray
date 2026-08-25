@@ -714,6 +714,23 @@ def pair_streams(
 
 # --- 视频 / 角色推断（保留，修正误判） -------------------------------------
 
+def _ffprobe_runs() -> bool:
+    """真正尝试调用一次 ffprobe，确认其可执行（比 shutil.which 更可靠）。
+
+    Returns:
+        ffprobe -version 能在超时内成功执行返回 True，否则 False。
+    """
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-version"],
+            capture_output=True, text=True, timeout=10, encoding="utf-8",
+            errors="replace",
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def probe_video(path: str) -> dict[str, Any]:
     """用 ffprobe 读取视频元数据。
 
@@ -728,11 +745,18 @@ def probe_video(path: str) -> dict[str, Any]:
     """
     import shutil
 
-    if shutil.which("ffprobe") is None:
+    # 仅用 shutil.which 并不可靠：用户可能已安装 ffmpeg，但 PATH 中的实际目录
+    # 与约定路径（如 C:\ffmpeg\bin）不符，which 会返回 None 而误判"未安装"。
+    # 改为真正尝试调用一次 ffprobe -version：能跑通即认为可用，彻底消除误报。
+    if shutil.which("ffprobe") is None and not _ffprobe_runs():
         return {
             "ffprobe_available": False,
-            "user_message": "未检测到 ffprobe（ffmpeg），已跳过视频元数据嗅探。"
-            "可安装 ffmpeg 后重试以获得视频信息。",
+            "user_message": (
+                "未检测到可用的 ffprobe（ffmpeg）。视频元数据嗅探已跳过，"
+                "其余功能不受影响。请确认已安装 ffmpeg，并将其 bin 目录加入当前"
+                "会话的 PATH（用 `where ffprobe` 或 `ffprobe -version` 验证路径），"
+                "再重新加载含视频的数据集。"
+            ),
         }
 
     try:

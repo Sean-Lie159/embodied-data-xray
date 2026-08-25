@@ -67,13 +67,34 @@ streamlit run streamlit_app.py
 winget install Gyan.FFmpeg
 ```
 
-安装后重新打开终端，或在当前会话中把 `C:\ffmpeg\bin` 加入 `PATH`。
+winget 默认不会把 ffmpeg 装到 `C:\ffmpeg\bin`，而是装在类似
+`C:\Users\<你>\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_...\ffmpeg-<版本>-full_build\bin`
+的目录。**请务必用下面命令确认实际路径，再把它加入 PATH**：
+
+```powershell
+# 确认 ffprobe 是否在 PATH 中、以及实际安装路径
+where ffprobe
+ffprobe -version
+```
+
+- 若 `where ffprobe` 有输出：说明已在 PATH 中，直接重新打开终端加载数据集即可。
+- 若 `where ffprobe` 无输出：找到上面 winget 安装目录里的 `bin` 文件夹，
+  把该完整路径加入系统 `PATH`（系统属性 → 环境变量 → Path），或在本会话临时：
+
+  ```powershell
+  $env:PATH += ";C:\Users\<你>\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_...\ffmpeg-<版本>-full_build\bin"
+  ```
+
+  然后重开终端，用 `ffprobe -version` 验证有输出。
+
+> 注意：本项目检测 ffprobe 时会**真正尝试调用一次** `ffprobe -version`，
+> 只要 PATH 里能找到可执行文件即视为可用，不依赖某个固定路径约定。
 
 **方式二：手动安装**
 
 1. 到 [ffmpeg 官网下载页](https://ffmpeg.org/download.html) 选择 Windows 版本（如 gyan.dev 或 BtbN 构建）。
 2. 解压到一个固定目录（如 `C:\ffmpeg`）。
-3. 把 `C:\ffmpeg\bin` 加入系统 `PATH`（系统属性 → 环境变量 → Path）。
+3. 把解压后目录里的 `bin` 子目录（如 `C:\ffmpeg\bin`）加入系统 `PATH`。
 4. 重启终端，验证 `ffprobe -version` 有输出。
 
 ### macOS / Linux
@@ -86,7 +107,7 @@ brew install ffmpeg
 sudo apt install ffmpeg
 ```
 
-验证安装：`ffprobe -version`。
+验证安装：`ffprobe -version`（有版本信息输出即表示可用）。
 
 ## 目录数据集嗅探
 

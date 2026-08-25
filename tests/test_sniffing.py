@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from app.tools._sniffing import sniff_table_columns
+from app.tools._sniffing import _ffprobe_runs, sniff_table_columns
 
 
 def _pose_present(columns: list[str]) -> bool:
@@ -72,3 +72,45 @@ def test_imu_with_mag_is_9_axes() -> None:
     )
     assert result["has_imu"]["present"] is True
     assert result["imu_axes"] == 9
+
+
+# --- ffprobe 可用性判断（不能只看 shutil.which，否则误报"未安装"） ----------
+
+
+def test_ffprobe_runs_returns_bool(monkeypatch) -> None:
+    """_ffprobe_runs 必须返回 bool（即便调用抛异常也应返回 False 而非崩溃）。"""
+    # 模拟 subprocess 抛 OSError（如文件找不到），应安全返回 False。
+    def _boom(*_a, **_k):
+        raise OSError("no ffprobe")
+    monkeypatch.setattr("app.tools._sniffing.subprocess.run", _boom)
+    assert _ffprobe_runs() is False
+
+
+def test_probe_video_uses_real_ffprobe_check(monkeypatch) -> None:
+    """shutil.which 返回 None 但 ffprobe 真能跑通时，不应误判为不可用。
+
+    复现用户场景：winget 把 ffmpeg 装到非 C:\\ffmpeg\\bin 的目录，
+    which 找不到，但真实调用 ffprobe -version 成功——此时必须视为可用。
+    """
+    import app.tools._sniffing as sn
+
+    monkeypatch.setattr("shutil.which", lambda name: None)  # 模拟 which 找不到
+    # 让真实调用返回成功（模拟本机已装 ffmpeg 且 PATH 含其目录）。
+    monkeypatch.setattr(
+        sn, "subprocess",
+        _FakeSubprocessOk(),
+    )
+    # 直接用 _ffprobe_runs 验证：which 为 None 但能跑通 → True。
+    assert sn._ffprobe_runs() is True
+
+
+class _FakeSubprocessOk:
+    """模拟 subprocess.run 对 ffprobe -version 成功、其余调用按真实逻辑抛错。"""
+
+    class _Ok:
+        returncode = 0
+
+    def run(self, cmd, **_kw):
+        if cmd and cmd[0] == "ffprobe" and cmd[1:2] == ["-version"]:
+            return self._Ok()
+        raise FileNotFoundError("ffprobe not directly resolvable")
