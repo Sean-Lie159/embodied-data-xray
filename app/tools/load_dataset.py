@@ -257,38 +257,55 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
 
     # 表格语义识别（四层架构）：覆盖全部表格文件。第 1 层词典线索（raw_sniff）
     # 与第 2 层内容指纹裁判（klass）分别保留——原始线索供主表选择，klass 供流登记。
+    # 兜底：单个文件的任何探测操作失败，记录 probe_error 并继续，绝不让单文件打崩
+    # 整个加载流程；失败清单汇总到 probe_errors 供调用方查看。
     table_sniffs: list[dict[str, Any]] = []  # 第 2 层 classify 结果
     table_info: list[dict[str, Any]] = []
+    probe_errors: list[dict[str, Any]] = []  # 探测失败的文件清单
     # 主表候选：（路径、列名、原始嗅探、分类结果、行数、列数）。
     candidates: list[dict[str, Any]] = []
     for p_str in probe["tables"]:
         p = Path(p_str)
-        cols = _read_table_columns(p)
-        if cols is None:
+        try:
+            cols = _read_table_columns(p)
+            if cols is None:
+                # 读列名失败不视为崩溃：记录并继续（该文件不参与主表/流登记）。
+                probe_errors.append({
+                    "file": str(p),
+                    "phase": "enumeration",
+                    "probe_error": "读取表列名失败",
+                })
+                continue
+            nrows = _read_table_nrows(p)
+            ncols = len(cols)
+            raw_sniff = _sniffing.sniff_table_columns(cols)  # 第 1 层词典线索
+            sample = _read_table_sample(p)  # 第 2 层内容指纹样本
+            klass = _sniffing.classify_table_stream(
+                p.name, cols, sample, nrows or 0
+            )
+            table_sniffs.append(klass)
+            candidates.append({
+                "file": str(p),
+                "name": p.name,
+                "sniff": raw_sniff,
+                "klass": klass,
+                "nrows": nrows,
+                "ncols": ncols,
+            })
+            table_info.append({
+                "file": str(p),  # 完整路径，供流登记表按需定位
+                "name": p.name,
+                "columns": cols[:20],
+                "sniff": klass,
+                "nrows": nrows,
+            })
+        except Exception as exc:  # noqa: BLE001 - 单文件探测异常兜底，绝不中断加载
+            probe_errors.append({
+                "file": str(p),
+                "phase": "fingerprint",
+                "probe_error": f"{type(exc).__name__}: {exc}",
+            })
             continue
-        nrows = _read_table_nrows(p)
-        ncols = len(cols)
-        raw_sniff = _sniffing.sniff_table_columns(cols)  # 第 1 层词典线索
-        sample = _read_table_sample(p)  # 第 2 层内容指纹样本
-        klass = _sniffing.classify_table_stream(
-            p.name, cols, sample, nrows or 0
-        )
-        table_sniffs.append(klass)
-        candidates.append({
-            "file": str(p),
-            "name": p.name,
-            "sniff": raw_sniff,
-            "klass": klass,
-            "nrows": nrows,
-            "ncols": ncols,
-        })
-        table_info.append({
-            "file": str(p),  # 完整路径，供流登记表按需定位
-            "name": p.name,
-            "columns": cols[:20],
-            "sniff": klass,
-            "nrows": nrows,
-        })
 
     # 主表选择（显式策略）：含状态/动作列 > 行数×列数最大 > 字母序。
     selected: dict[str, Any] | None = None
@@ -368,18 +385,25 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     calib_detected = False
     calib_detail: list[dict[str, Any]] = []
     for p_str in probe["cals"]:
-        obj = _parse_calibration(Path(p_str))
-        is_cal = _sniffing.is_calibration_file(obj) or bool(
-            _sniffing.fingerprint_calibration(obj).get("present")
-        )
-        if is_cal:
-            calib_detected = True
-            fp = _sniffing.fingerprint_calibration(obj)
-            calib_detail.append({
-                "path": p_str,
-                "name": Path(p_str).name,
-                "keys_found": fp.get("keys_found", []),
-                "evidence": fp.get("evidence", ""),
+        try:
+            obj = _parse_calibration(Path(p_str))
+            is_cal = _sniffing.is_calibration_file(obj) or bool(
+                _sniffing.fingerprint_calibration(obj).get("present")
+            )
+            if is_cal:
+                calib_detected = True
+                fp = _sniffing.fingerprint_calibration(obj)
+                calib_detail.append({
+                    "path": p_str,
+                    "name": Path(p_str).name,
+                    "keys_found": fp.get("keys_found", []),
+                    "evidence": fp.get("evidence", ""),
+                })
+        except Exception as exc:  # noqa: BLE001 - 单标定文件探测异常兜底，不中断
+            probe_errors.append({
+                "file": p_str,
+                "phase": "fingerprint",
+                "probe_error": f"{type(exc).__name__}: {exc}",
             })
 
     # 视频嗅探（ffprobe，可降级），覆盖全部视频文件。
@@ -388,7 +412,15 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     ffprobe_degraded: str | None = None
     for p_str in probe["videos"]:
         video_files.append(p_str)
-        meta = _sniffing.probe_video(p_str)
+        try:
+            meta = _sniffing.probe_video(p_str)
+        except Exception as exc:  # noqa: BLE001 - 单视频探测异常兜底，不中断加载
+            probe_errors.append({
+                "file": p_str,
+                "phase": "fingerprint",
+                "probe_error": f"{type(exc).__name__}: {exc}",
+            })
+            continue
         if not meta.get("ffprobe_available", True):
             ffprobe_degraded = meta.get("user_message")
         video_meta.append({"file": p_str, **meta})
@@ -440,6 +472,8 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         ),
         # 流配对规则结果（mp4↔metainfo、accel+gyro=六轴IMU）。
         "stream_pairs": stream_pairs,
+        # 探测失败的文件清单（兜底：单文件失败不中断，记录原因供定位）。
+        "probe_errors": probe_errors,
         # 标定文件细节（第 2 层指纹确认的键与依据）。
         "calibration_detail": calib_detail,
         # 主表信息：选择依据、装载完整性声明（供后续统计工具继承）。
@@ -495,6 +529,8 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         # 流配对与标定细节透出，供 agent 了解配对关系与标定依据。
         "stream_pairs": stream_pairs,
         "calibration_detail": calib_detail,
+        # 探测失败的文件清单（结构化：file + phase + probe_error）。
+        "probe_errors": probe_errors,
     }
     if main_table is not None:
         result["main_table"] = {
@@ -522,6 +558,10 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         msg_parts.append(truncation_note)
     if ffprobe_degraded:
         msg_parts.append(ffprobe_degraded)
+    if probe_errors:
+        msg_parts.append(
+            f"{len(probe_errors)} 个文件探测失败（详见 probe_errors），已跳过并继续其余文件。"
+        )
     result["user_message"] = " ".join(msg_parts)
     return result
 
@@ -555,7 +595,16 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
     # 目录输入：走文件普查与能力嗅探。
     if source.is_dir():
         replaced = context.dataset_id
-        result = _load_directory_impl(context, source)
+        try:
+            result = _load_directory_impl(context, source)
+        except Exception as exc:  # noqa: BLE001 - 目录加载整体兜底，异常转结构化错误
+            # 绝不把裸 Python 异常（如 "list index out of range"）原样抛给用户；
+            # reason 携带目录与失败阶段，便于定位。
+            return _error(
+                "directory_probe_failed",
+                f"目录探测失败（{type(exc).__name__}: {exc}），目录 {source}",
+                f"加载目录 {source} 时探测失败，已停止本次加载。请检查目录内文件是否含异常数据。",
+            )
         if result.get("success"):
             if replaced is not None:
                 result["replaced_previous"] = replaced
