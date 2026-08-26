@@ -264,7 +264,19 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     probe_errors: list[dict[str, Any]] = []  # 探测失败的文件清单
     # 主表候选：（路径、列名、原始嗅探、分类结果、行数、列数）。
     candidates: list[dict[str, Any]] = []
-    for p_str in probe["tables"]:
+    # 表格候选 = probe["tables"]（csv/parquet） + cals 中**非标定**的 .json
+    # （nuScenes 等数据表 JSON；标定 JSON 仍归 cals，不作为数据表流登记）。
+    table_candidates = list(probe["tables"])
+    for p_str in probe["cals"]:
+        if Path(p_str).suffix.lower() != ".json":
+            continue
+        obj = _parse_calibration(Path(p_str))
+        is_cal = _sniffing.is_calibration_file(obj) or bool(
+            _sniffing.fingerprint_calibration(obj).get("present")
+        )
+        if not is_cal:
+            table_candidates.append(p_str)
+    for p_str in table_candidates:
         p = Path(p_str)
         try:
             cols = _read_table_columns(p)

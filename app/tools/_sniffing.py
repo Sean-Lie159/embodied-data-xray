@@ -40,6 +40,11 @@ _TABLE_EXTS = {".csv", ".json", ".parquet"}
 # 标定相关扩展名（json/yaml 可能含标定键，需进一步解析判定）。
 _CALIB_EXTS = {".yaml", ".yml", ".json"}
 
+# 桌面/系统文件：不参与任何探测，直接跳过（不崩、不进清单）。
+_SYSTEM_FILES = {"desktop.ini", "thumbs.db", ".ds_store", ".ds_store_"}
+# 系统文件扩展名兜底（.DS_Store 等以点开头的隐藏文件）。
+_SYSTEM_FILE_PREFIXES = (".ds_store",)
+
 # 空流阈值：行数 ≤ 此值视为未使用/空流，不计入可对齐流。
 EMPTY_STREAM_MAX_ROWS = 2
 
@@ -73,6 +78,25 @@ _QUAT_SUFFIXES = ("_x", "_y", "_z", "_w")
 _QUAT_TOKENS = ("quat", "orientation", "rot")
 
 
+def _is_system_file(path: Path) -> bool:
+    """判断是否为桌面/系统文件（desktop.ini、Thumbs.db、.DS_Store 等）。
+
+    Args:
+        path: 文件路径。
+
+    Returns:
+        是系统文件返回 True，应跳过不参与探测。
+    """
+    name = path.name
+    lower = name.lower()
+    if lower in _SYSTEM_FILES:
+        return True
+    # 隐藏的系统文件：以 .ds_store 开头（含 .DS_Store / .DS_Store_）。
+    if lower.startswith(_SYSTEM_FILE_PREFIXES):
+        return True
+    return False
+
+
 def probe_directory(root: Path) -> dict[str, Any]:
     """递归普查目录，返回完整文件清单（按类型分组）与扩展名分布。
 
@@ -94,13 +118,20 @@ def probe_directory(root: Path) -> dict[str, Any]:
         "tables": [], "videos": [], "audios": [], "images": [],
         "cals": [], "others": [],
     }
+    total_files = 0
     for item in root.rglob("*"):
         if item.is_dir():
             subdirs.append(str(item.relative_to(root)))
         elif item.is_file():
+            # 桌面/系统文件直接跳过，不参与任何探测（不崩、不进清单）。
+            if _is_system_file(item):
+                continue
             ext = item.suffix.lower()
+            total_files += 1
             ext_counter[ext] += 1
-            # 标定候选（json/yaml）优先归入 cals，避免被当作数据表。
+            # 标定候选（json/yaml）优先归入 cals，避免被当作数据表。.json 既可能是
+            # 标定也可能是数据表（nuScenes 等）——由 load_dataset 在标定判定后把
+            # 非标定 JSON 补入 tables 探测（见 _load_directory_impl）。
             if ext in _CALIB_EXTS:
                 grouped["cals"].append(item)
             elif ext in _TABLE_EXTS:
@@ -122,7 +153,7 @@ def probe_directory(root: Path) -> dict[str, Any]:
         grouped[key] = [str(p) for p in grouped[key]]
 
     return {
-        "total_files": sum(len(v) for v in grouped.values()),
+        "total_files": total_files,
         "ext_dist": dict(sorted(ext_counter.items())),
         "subdirs": subdirs,
         "tables": grouped["tables"],
