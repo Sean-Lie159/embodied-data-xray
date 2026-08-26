@@ -94,14 +94,16 @@ def _error(
     user_message: str,
     *,
     supported_formats: list[str] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造统一的错误返回结构。
 
     Args:
         error: 机器可读的错误类型标识。
-        reason: 具体原因（面向开发者/日志）。
+        reason: 具体原因（面向开发者/日志，需可定位：含异常类型+肇事文件/阶段）。
         user_message: 可直接转达给用户的中文说明。
         supported_formats: 支持的格式列表（可选）。
+        extra: 额外内部字段（如 traceback 关键帧），供定位调试，不进 user_message。
 
     Returns:
         统一结构的错误 dict：success=False + error/reason/user_message。
@@ -115,7 +117,34 @@ def _error(
     }
     if supported_formats is not None:
         result["supported_formats"] = supported_formats
+    if extra is not None:
+        result.update(extra)
     return result
+
+
+def _tb_key_frames(exc: Exception) -> list[str]:
+    """摘取 traceback 的关键帧（文件名:行号:函数），供错误定位。
+
+    只保留 app/ 内部的帧，过滤外部库噪音；最多返回最近 6 帧。
+
+    Args:
+        exc: 已抛出的异常。
+
+    Returns:
+        关键帧列表，如 ["app/tools/_sniffing.py:1104:infer_role", ...]。
+    """
+    import traceback
+
+    frames: list[str] = []
+    tb = exc.__traceback__
+    while tb is not None:
+        fname = tb.tb_frame.f_code.co_filename
+        fname = str(fname).replace("\\", "/")
+        # 只摘项目内部帧，便于定位到肇事函数。
+        if "/app/" in fname:
+            frames.append(f"{fname.split('/app/', 1)[-1]}:{tb.tb_lineno}")
+        tb = tb.tb_next
+    return frames[:6] or traceback.format_exc().splitlines()[:3]
 
 
 def _read_table_columns(path: Path) -> list[str] | None:
@@ -320,14 +349,21 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             continue
 
     # 主表选择（显式策略）：含状态/动作列 > 行数×列数最大 > 字母序。
+    # 空文件（0 行，如空 JSON []/{} 或 2 字节 ego_pose.json）不作为主表候选——
+    # 纯媒体/空 JSON 数据集"无有效主表"是合法的，此时 main_table 应为 null。
+    # 注意：小但非空（>0 行）的表仍是合法候选（如 2 行 small.csv）。
     selected: dict[str, Any] | None = None
     ranked: list[dict[str, Any]] = []
-    if candidates:
+    data_candidates = [
+        c for c in candidates
+        if (c.get("nrows") or 0) > 0
+    ]
+    if data_candidates:
         def _main_table_key(c: dict[str, Any]) -> tuple[int, int, str]:
             has_actions = 1 if c["sniff"]["has_actions"]["present"] else 0
             size = (c["nrows"] or 0) * c["ncols"]
             return (has_actions, size, c["name"])
-        ranked = sorted(candidates, key=_main_table_key, reverse=True)
+        ranked = sorted(data_candidates, key=_main_table_key, reverse=True)
         selected = ranked[0]
 
     main_table: pd.DataFrame | None = None
@@ -611,11 +647,14 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
             result = _load_directory_impl(context, source)
         except Exception as exc:  # noqa: BLE001 - 目录加载整体兜底，异常转结构化错误
             # 绝不把裸 Python 异常（如 "list index out of range"）原样抛给用户；
-            # reason 携带目录与失败阶段，便于定位。
+            # reason 需可定位：异常类型 + 关键 traceback 帧（文件名:行号）+ 目录。
+            frames = _tb_key_frames(exc)
             return _error(
                 "directory_probe_failed",
-                f"目录探测失败（{type(exc).__name__}: {exc}），目录 {source}",
+                f"目录探测失败（{type(exc).__name__}: {exc}），目录 {source}；"
+                f"关键帧：{frames or '无'}",
                 f"加载目录 {source} 时探测失败，已停止本次加载。请检查目录内文件是否含异常数据。",
+                extra={"traceback_frames": frames, "probe_error": f"{type(exc).__name__}: {exc}"},
             )
         if result.get("success"):
             if replaced is not None:

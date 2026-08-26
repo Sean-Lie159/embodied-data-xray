@@ -1097,8 +1097,15 @@ def infer_role(source: str) -> dict[str, Any]:
             if k in name and role not in [h[0] for h in hits]:
                 hits.append((role, conf, k))
 
-    if not hits and not positions:
-        return {"role": "unknown", "confidence": "low", "evidence": "文件名无可识别模式"}
+    if not hits:
+        # 无角色命中时不得对空 hits 做下标访问（hits[0] 会 IndexError）。
+        # 即使有方位词（如 left/right），也先判 unknown，方位词仅作说明附加。
+        pos_suffix = f"（{'、'.join(positions)}）" if positions else ""
+        return {
+            "role": f"unknown{pos_suffix}" if positions else "unknown",
+            "confidence": "low",
+            "evidence": "文件名无可识别模式" + (f"；方位词 {'、'.join(positions)}" if positions else ""),
+        }
 
     hits.sort(key=lambda h: -h[1])
     main_role, main_conf, main_word = hits[0]
