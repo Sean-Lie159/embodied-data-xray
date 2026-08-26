@@ -774,7 +774,94 @@ def pair_streams(
             "evidence": "accel 与 gyro 同目录配对为一组六轴 IMU",
         })
 
+    # 规则 3：多分辨率/预览版本组（登记级）。xxx.mp4 / xxx_480.mp4 / xxx_960.mp4 /
+    # xxx_pre.mp4 / xxx_pre.webp 归为同一视频源的不同版本。主版本 = 无分辨率/预览
+    # 后缀的文件；变体标 variant_of 指向主版本。只做登记，不做版本内容合并。
+    _video_base_groups = _group_video_versions(video_files)
+    for base, members in _video_base_groups.items():
+        if len(members) < 2:
+            continue
+        main = next((m for m in members if _video_is_main_version(m)), None)
+        variants = [
+            {"path": m, "variant_of": main} for m in members
+            if m != main and main is not None
+        ]
+        pairs.append({
+            "type": "video_version_group",
+            "base": base,
+            "main": main,
+            "members": members,
+            "variants": variants,
+            "source": "content_fingerprint",
+            "evidence": f"视频 {base} 存在多分辨率/预览版本：{', '.join(Path(m).name for m in members)}，"
+                        "归为同一视频源版本组（登记级，不做版本合并）",
+        })
+
+    # 规则 4：同名不同扩展配对（metainfo 规则推广）。<name>.mp4 ↔ <name>.json
+    # （如相机同名 json 840KB 与 mp4 配对）；仅登记，供后续关联。
+    for media in video_files + audio_files:
+        mp = Path(media)
+        media_stem = mp.stem
+        same_name_json = next(
+            (t for t in table_files if Path(t).stem == media_stem and Path(t).suffix.lower() == ".json"),
+            None
+        )
+        if same_name_json is not None:
+            pairs.append({
+                "type": "media_samename",
+                "media": media,
+                "json": same_name_json,
+                "source": "dictionary",
+                "evidence": f"{mp.name} 与 {Path(same_name_json).name} 同名配对（推广 metainfo 规则），"
+                            "JSON 与该媒体流同源登记",
+            })
+
     return pairs
+
+
+# 视频多分辨率/预览版本后缀（登记级识别，用于版本组配对）。
+_VIDEO_VARIANT_SUFFIXES = ("_480", "_720", "_960", "_1080", "_2k", "_4k", "_pre", "_preview", "_thumb", "_hd")
+
+
+def _video_is_main_version(path: str) -> bool:
+    """判断视频文件是否为主版本（文件名不含分辨率/预览后缀）。
+
+    Args:
+        path: 视频文件路径。
+
+    Returns:
+        主版本返回 True。
+    """
+    name = Path(path).stem.lower()
+    return not any(name.endswith(suf) for suf in _VIDEO_VARIANT_SUFFIXES)
+
+
+def _group_video_versions(video_files: list[str]) -> dict[str, list[str]]:
+    """把视频按"基础名"（去掉版本后缀）分组，识别同一视频源的不同版本。
+
+    Args:
+        video_files: 视频文件路径列表。
+
+    Returns:
+        {基础名: [成员路径...]}；基础名 = 文件名去掉版本后缀后的部分（含视频扩展名
+        区分，如 xxx 与 xxx_480 归一组）。
+    """
+    groups: dict[str, list[str]] = {}
+    for vf in video_files:
+        p = Path(vf)
+        base = _video_base_name(p)
+        groups.setdefault(base, []).append(vf)
+    return groups
+
+
+def _video_base_name(path: Path) -> str:
+    """返回视频的基础名（去掉 _480/_960/_pre 等版本后缀，保留视频扩展名）。"""
+    stem = path.stem.lower()
+    for suf in _VIDEO_VARIANT_SUFFIXES:
+        if stem.endswith(suf):
+            stem = stem[: -len(suf)]
+            break
+    return f"{stem}{path.suffix.lower()}"
 
 
 # --- 视频 / 角色推断（保留，修正误判） -------------------------------------

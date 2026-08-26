@@ -220,6 +220,14 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
     # --- 视频流 -------------------------------------------------------------
     video_streams: list[dict[str, Any]] = []
     video_rate_cache: dict[str, Any] = {}
+    # 多分辨率版本组映射：variant_path -> 主版本路径（登记级，标 variant_of）。
+    video_variant_of: dict[str, str] = {}
+    for pair in context.meta.get("stream_pairs", []):
+        if pair.get("type") != "video_version_group":
+            continue
+        for v in pair.get("variants", []):
+            if v.get("variant_of"):
+                video_variant_of[v.get("path")] = v.get("variant_of")
     for vmeta in context.meta.get("video_meta", []):
         src = vmeta.get("file", "unknown")
         if vmeta.get("ffprobe_available"):
@@ -247,6 +255,10 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
                     else None
                 ),
                 "codec": vmeta.get("codec"),
+                # 多分辨率版本组：非主版本标 variant_of（主版本基础名）。
+                "variant_of": (
+                    Path(video_variant_of[src]).stem if src in video_variant_of else None
+                ),
             })
         else:
             video_streams.append({
@@ -254,6 +266,9 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
                 "role": _sniffing.infer_role(src),
                 "status": "unknown",
                 "reason": vmeta.get("user_message", "ffprobe 不可用"),
+                "variant_of": (
+                    Path(video_variant_of[src]).stem if src in video_variant_of else None
+                ),
             })
 
     # --- IMU / 力 / 其他表格流：从流登记表按需实测采样率 -----------------------
