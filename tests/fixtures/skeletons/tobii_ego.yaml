@@ -1,0 +1,73 @@
+# 数据格式骨架：tobii_ego（Tobii 风格 Ego 采集）
+#
+# 用途：把真实采集目录的"文件名模式 + 类型构成"固化为合成夹具，永久进入回归套件。
+# 所有文件名均为代表性样本（匿名化，不含真实项目名/序列号/日期）。
+# 生成规则只描述"写什么内容"，具体由 tests/fixtures/make_skeleton.py 落地。
+#
+# 结构指纹：CSV 表格流（IMU/位姿/动作/metainfo）、相机参数 JSON 标定、
+# mp4/m4a/jpg 媒体、controller_poses 空流（仅表头）。
+
+name: tobii_ego
+description: "Tobii 风格 Ego 采集：CSV 传感器流 + JSON 相机标定 + 媒体文件"
+
+files:
+  - name: accel.csv
+    type: csv
+    generate: "3 行 CSV，列 timestamp_ns,accel_x,accel_y,accel_z（时间戳单调递增）"
+  - name: gyro.csv
+    type: csv
+    generate: "3 行 CSV，列 timestamp_ns,gyro_x,gyro_y,gyro_z（时间戳单调递增）"
+  - name: head_pose.csv
+    type: csv
+    generate: "3 行 CSV，列 timestamp_ns,ee_pos_x,ee_pos_y,ee_pos_z（时间戳单调递增）"
+  - name: hand_tracking.csv
+    type: csv
+    generate: "3 行 CSV，列 frame_number,left_joint0_id,left_joint0_name,left_active"
+  - name: controller_poses.csv
+    type: csv
+    generate: "仅表头 pose_x,pose_y,pose_z（无数据行 → 空流）"
+  - name: ctrl_metainfo.csv
+    type: csv
+    generate: "3 行 CSV，列 frame_index,pts_us（帧序号）"
+  - name: rgb_metainfo.csv
+    type: csv
+    generate: "3 行 CSV，列 frame_index,pts_us（帧序号）"
+  - name: tracking_metainfo.csv
+    type: csv
+    generate: "3 行 CSV，列 frame_index,pts_us（帧序号）"
+  - name: audio_metainfo.csv
+    type: csv
+    generate: "3 行 CSV，列 packet_index,pts_us,capture_utc_ns"
+  - name: camera_params_ctrl.json
+    type: json
+    generate: "标定 JSON：{intrinsics:{fx,fy}}"
+  - name: camera_params_rgb.json
+    type: json
+    generate: "标定 JSON：{intrinsics:{fx,fy}}"
+  - name: camera_params_tracking.json
+    type: json
+    generate: "标定 JSON：{extrinsics:{matrix}}"
+  - name: imu_calibration.json
+    type: json
+    generate: "标定 JSON：{matrix:[[...]]}（含 bias/noise 类键）"
+  - name: ctrl.mp4
+    type: video
+    generate: "0 字节 mp4 占位"
+  - name: rgb.mp4
+    type: video
+    generate: "0 字节 mp4 占位"
+  - name: tracking.mp4
+    type: video
+    generate: "0 字节 mp4 占位"
+  - name: audio.m4a
+    type: audio
+    generate: "0 字节 m4a 占位"
+  - name: 信息.jpg
+    type: image
+    generate: "0 字节 jpg 占位"
+
+expectations:
+  total_files: 18
+  main_table: head_pose.csv
+  empty_streams: ["controller_poses.csv", "imu_calibration.json"]
+  system_files_skipped: 0

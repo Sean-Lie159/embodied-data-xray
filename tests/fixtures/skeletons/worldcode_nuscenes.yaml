@@ -1,0 +1,92 @@
+# 数据格式骨架：worldcode_nuscenes（带 nuScenes schema 的具身采集格式）
+#
+# 用途：把真实采集目录的"文件名模式 + 类型构成"固化为合成夹具，永久进入回归套件。
+# 文件名匿名化（camera-a / mipi-fpv-right-camera 等代表性样本，不带真实设备/项目名）。
+#
+# 刻意保留的"刁难特征"（结构指纹，正是打崩过我们的东西）：
+#   - 2 字节空 JSON（ego_pose.json）
+#   - desktop.ini 系统文件
+#   - .index.parquet 双扩展名
+#   - 多分辨率/预览版本组（_480/_960/_pre.mp4 + _pre.webp）
+#   - nuScenes schema 表族（sample.json / sample_data.json 等 dict 结构 JSON）
+
+name: worldcode_nuscenes
+description: "worldcode 采集：nuScenes schema JSON 表族 + 多分辨率相机视频版本组 + .index.parquet"
+
+files:
+  # ---- nuScenes schema 表族（dict 结构 JSON，非数组 → 空流/登记）----
+  - name: sample.json
+    type: json
+    generate: "最小合法 dict：{\"data\": []}"
+  - name: sample_data.json
+    type: json
+    generate: "最小合法 dict：{\"data\": []}"
+  - name: sensor.json
+    type: json
+    generate: "最小合法 dict：{\"data\": []}"
+  - name: scene.json
+    type: json
+    generate: "最小合法 dict：{\"data\": []}"
+  # ---- 2 字节空 JSON（刁难特征：空流）----
+  - name: ego_pose.json
+    type: json
+    generate: "2 字节空 JSON：{}"
+  # ---- 相机多分辨率版本组（匿名化相机名 camera-a）----
+  - name: camera-a.mp4
+    type: video
+    generate: "0 字节 mp4 占位（主版本）"
+  # 刁难特征：文件名含方位词（right）但无角色关键词命中——曾打崩 infer_role。
+  - name: mipi-fpv-right-camera.mp4
+    type: video
+    generate: "0 字节 mp4 占位（含方位词 right、无角色命中）"
+  - name: camera-a_480.mp4
+    type: video
+    generate: "0 字节 mp4 占位（480 变体）"
+  - name: camera-a_960.mp4
+    type: video
+    generate: "0 字节 mp4 占位（960 变体）"
+  - name: camera-a_pre.mp4
+    type: video
+    generate: "0 字节 mp4 占位（preview 变体）"
+  - name: camera-a_pre.webp
+    type: image
+    generate: "0 字节 webp 占位（按图片扩展名登记）"
+  - name: camera-a.index.parquet
+    type: parquet
+    generate: "最小 parquet（2 行，含 timestamp_ns 列），双扩展名 .index.parquet"
+  - name: camera-a.json
+    type: json
+    generate: "最小合法 dict（相机同名 json，与 mp4 同名配对）"
+  - name: camera-a_480.index.parquet
+    type: parquet
+    generate: "最小 parquet（2 行），变体双扩展名"
+  - name: camera-a_480.json
+    type: json
+    generate: "最小合法 dict"
+  - name: camera-a_960.index.parquet
+    type: parquet
+    generate: "最小 parquet（2 行），变体双扩展名"
+  - name: camera-a_960.json
+    type: json
+    generate: "最小合法 dict"
+  # ---- 系统文件（刁难特征：应被跳过）----
+  - name: desktop.ini
+    type: system
+    generate: "文本占位（系统文件，跳过不参与探测）"
+  - name: Thumbs.db
+    type: system
+    generate: "文本占位（系统文件，跳过）"
+  - name: .DS_Store
+    type: system
+    generate: "文本占位（系统文件，跳过）"
+
+expectations:
+  # 20 个清单条目 - 3 个系统文件（跳过）= 17 个登记文件。
+  total_files: 17
+  # 含 .index.parquet 数据表，主表为规模最大的 parquet（非 null）。
+  main_table: camera-a_960.index.parquet
+  empty_streams: ["sample.json", "sample_data.json", "sensor.json", "scene.json", "ego_pose.json",
+                  "camera-a.json", "camera-a_480.json", "camera-a_960.json",
+                  "camera-a.index.parquet", "camera-a_480.index.parquet", "camera-a_960.index.parquet"]
+  system_files_skipped: 3
+  version_groups: 1
