@@ -66,12 +66,99 @@ _ACTION_STATE_COLS = ("qpos", "qvel", "qacc", "action", "obs", "state", "cmd")
 _FORCE_COLS = ("force", "torque", "ft_", "force_torque", "_ft", "fx", "fy",
                "fz", "tx", "ty", "tz", "wrench")
 
-# 常见时间戳列名（用于第 2 层时间戳指纹）。
+# 常见时间戳列名（用于第 2 层时间戳指纹）。扩展词表覆盖 worldcode 的
+# index.parquet（pts / frame_timestamps_ns）与曝光时间戳（exposure_*）。
 _TIMESTAMP_COLS = ("timestamp", "timestamp_ns", "time", "ts", "ts_ns", "t", "stamp",
-                   "frame_time", "pts_us", "capture_utc_ns",
+                   "frame_time", "pts", "pts_us", "frame_timestamps_ns",
+                   "frame_timestamp_ns", "pts_ns", "capture_utc_ns",
                    "exposure_start_utc_ns", "mid_exposure_utc_ns",
                    "exposure_duration_ns", "packet_index", "frame_index",
                    "frame_id")
+# 帧序号类时间戳列（无物理时间，不参与跨流对齐残差，仅单流检查）。
+_FRAME_TIMESTAMP_COLS = ("pts", "pts_us", "frame_index", "frame_id", "packet_index", "frame_number")
+
+
+def classify_timestamp_column(name: str) -> str:
+    """把列名分类为时间戳类型：physical / frame / ""（非时间戳）。
+
+    Args:
+        name: 列名。
+
+    Returns:
+        "physical"（物理时间，参与对齐）、"frame"（帧序号，不参与跨流对齐）、
+        ""（列名不是时间戳）。
+    """
+    lower = str(name).lower().strip()
+    if lower in _FRAME_TIMESTAMP_COLS or lower in ("frame", "packet"):
+        return "frame"
+    if lower in _TIMESTAMP_COLS:
+        return "physical"
+    return ""
+
+
+def find_timestamp_columns(
+    columns: list[str], sample: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """从表格列中识别主时间戳列与备选，返回结构化结果。
+
+    识别顺序：
+    1. 词表命中（_TIMESTAMP_COLS）：物理时间列优先（带 ns/us/utc 后缀或非帧序号），
+       帧序号列（pts/frame_index 等）作为备选；
+    2. 词表未命中但提供 sample：内容指纹回退——数值列单调递增且量级符合已知时间单位
+       的视为候选，来源标 fingerprint；
+    3. 都不行则无时间戳列。
+
+    Args:
+        columns: 表格列名列表。
+        sample: 可选样本 DataFrame（用于内容指纹回退；不提供则只做词表匹配）。
+
+    Returns:
+        dict，含 main（主时间戳列或 None）、alternatives（备选列名列表）、
+        source（"dictionary" / "fingerprint" / "none"）、frame_main（主时间戳是否为
+        帧序号）、all_candidates（全部候选，含类型）。
+    """
+    candidates: list[dict[str, Any]] = []
+    for c in columns:
+        typ = classify_timestamp_column(c)
+        if typ:
+            candidates.append({"name": str(c), "type": typ, "source": "dictionary"})
+
+    # 词表未命中 → 内容指纹回退（需样本）。
+    if not candidates and sample is not None:
+        from app.tools.timestamp_units import infer_unit
+
+        for c in columns:
+            if not pd.api.types.is_numeric_dtype(sample[c]):
+                continue
+            s = sample[c].dropna()
+            if len(s) < 3:
+                continue
+            if not bool((s.diff().dropna() >= 0).all()):
+                continue  # 非单调递增
+            unit_info = infer_unit(s.to_numpy(), str(c))
+            if unit_info["unit"] in ("s", "ms", "us", "ns"):
+                candidates.append({
+                    "name": str(c), "type": "physical",
+                    "source": "fingerprint",
+                    "unit": unit_info["unit"],
+                })
+
+    if not candidates:
+        return {"main": None, "alternatives": [], "source": "none",
+                "frame_main": None, "all_candidates": []}
+
+    # 主列选择：物理时间优先（否则帧序号）；同类时按列序。
+    physical = [c for c in candidates if c["type"] == "physical"]
+    frame = [c for c in candidates if c["type"] == "frame"]
+    ordered = physical + frame
+    main = ordered[0]
+    return {
+        "main": main["name"],
+        "alternatives": [c["name"] for c in ordered[1:]],
+        "source": main["source"],
+        "frame_main": main["type"] == "frame",
+        "all_candidates": ordered,
+    }
 
 # 四元数列名模式：列名以四元数分量后缀成组（x/y/z/w），或含 orientation/quat。
 _QUAT_SUFFIXES = ("_x", "_y", "_z", "_w")
@@ -714,6 +801,42 @@ def classify_table_stream(
 
 # --- 流配对规则 ------------------------------------------------------------
 
+def _read_table_columns_cheap(path: str, fmt: str) -> list[str] | None:
+    """只读表格列名（不读全量数据），用于配对时判断是否含时间戳列。
+
+    与 load_dataset._read_table_columns 等价，但作为 _sniffing 内部轻量实现，
+    避免配对阶段加载全量（worldcode 的 .json 元信息达 840KB，只读列名是廉价的）。
+
+    Args:
+        path: 文件路径。
+        fmt: 格式（csv/parquet/json）。
+
+    Returns:
+        列名列表；读取失败返回 None。
+    """
+    import json as _json
+
+    try:
+        p = Path(path)
+        if fmt == "csv":
+            import pandas as pd
+            return [str(c) for c in pd.read_csv(p, nrows=0, engine="python").columns]
+        if fmt == "parquet":
+            import pyarrow.parquet as pq
+            return list(pq.ParquetFile(p).schema.names)
+        if fmt == "json":
+            encoding = "utf-8"
+            obj = _json.loads(p.read_text(encoding=encoding))
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                return list(obj[0].keys())
+            if isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], list) and obj["data"]:
+                return list(obj["data"][0].keys()) if isinstance(obj["data"][0], dict) else []
+            return []
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def pair_streams(
     video_files: list[str],
     table_files: list[str],
@@ -721,8 +844,11 @@ def pair_streams(
 ) -> list[dict[str, Any]]:
     """流配对规则。
 
-    规则 1：<name>.mp4 ↔ <name>_metainfo.csv（同名 + 前缀 _metainfo）→ 视频时间戳
-        来源配对（含音频 <name>.m4a ↔ <name>_metainfo.csv）。
+    规则 1：媒体 ↔ metainfo（语义角色匹配）。视频/音频文件与其**同 stem** 的表格文件
+        （任意已支持格式 csv/parquet/json，含 *_metainfo.csv 命名与同名前缀）配对——
+        若该表格列名含可识别时间戳列则建立 metainfo 配对；_metainfo.csv 命名降级为
+        线索之一而非唯一路径。同 stem 多候选（.json 与 .index.parquet 并存）全部登记，
+        其中含物理时间戳（非帧序号）的优先参与对齐，选择依据透出。
     规则 2：目录内 accel*.csv 与 gyro*.csv 且均识别为 IMU → 配对为一组六轴 IMU
         （imu_axes=6）。
 
@@ -737,29 +863,74 @@ def pair_streams(
     """
     pairs: list[dict[str, Any]] = []
 
-    # 规则 1：媒体 ↔ metainfo。
+    # 规则 1：媒体 ↔ metainfo（语义角色匹配）。媒体与同 stem 表格配对，若表格列名含
+    # 可识别时间戳列则建 metainfo 配对；_metainfo.csv 命名降级为线索之一。
     media_files = [f for f in (video_files + audio_files)]
     for media in media_files:
         mp = Path(media)
-        stem = mp.stem  # 去扩展名
+        stem = mp.stem  # 去扩展名（含主版本名）
         suffix = mp.suffix.lower()
-        if suffix in (".mp4", ".m4a", ".avi", ".mov", ".mkv", ".webm"):
-            # 匹配 <stem>_metainfo.csv
-            meta_name = f"{stem}_metainfo.csv"
-            meta_path = next(
-                (t for t in table_files if Path(t).name == meta_name), None
-            )
-            if meta_path is not None:
-                media_kind = "video" if suffix == ".mp4" else "audio"
-                pairs.append({
-                    "type": "media_metainfo",
-                    "media": media,
-                    "media_kind": media_kind,
-                    "metainfo": meta_path,
-                    "source": "content_fingerprint",
-                    "evidence": f"{media_kind} {stem} 与 {meta_name} 同名配对，"
-                                "metainfo 表登记为该媒体流的时间戳来源",
+        if suffix not in (".mp4", ".m4a", ".avi", ".mov", ".mkv", ".webm"):
+            continue
+        media_kind = "video" if suffix == ".mp4" else "audio"
+        # 同 stem 表格候选：<stem> 前缀的表格文件（含 _metainfo.csv 与同名不同扩展）。
+        same_stem = [
+            t for t in table_files
+            if Path(t).stem.startswith(stem) or stem.startswith(Path(t).stem)
+        ]
+        # 判定每个候选是否含可识别时间戳列。_metainfo.csv 是命名线索（快速路径，无需
+        # 读文件即视为 metainfo）；其余同 stem 表格需读列名确认含时间戳列。
+        metainfo_candidates: list[dict[str, Any]] = []
+        for t in same_stem:
+            tname = Path(t).name
+            fmt = Path(t).suffix.lstrip(".").lower()
+            if tname.endswith("_metainfo.csv"):
+                # _metainfo.csv 命名即线索：默认为 metainfo（帧序号/曝光时间戳类）。
+                ts_info = {"main": None, "frame_main": True, "source": "dictionary"}
+                metainfo_candidates.append({
+                    "path": t, "format": fmt, "ts_info": ts_info,
+                    "by_naming": True,
                 })
+                continue
+            cols = _read_table_columns_cheap(t, fmt)
+            if cols is None:
+                continue
+            ts_info = find_timestamp_columns(cols)
+            if ts_info["main"] is None:
+                continue  # 列名无时间戳（未做内容指纹，配对阶段保持廉价）
+            metainfo_candidates.append({
+                "path": t,
+                "format": fmt,
+                "ts_info": ts_info,
+            })
+        if not metainfo_candidates:
+            continue
+        # 多候选全部登记；含物理时间戳（非帧序号）的优先参与对齐。
+        metainfo_candidates.sort(key=lambda c: (c["ts_info"]["frame_main"], c["path"]))
+        primary = next((c for c in metainfo_candidates if not c["ts_info"]["frame_main"]), metainfo_candidates[0])
+        pairs.append({
+            "type": "media_metainfo",
+            "media": media,
+            "media_kind": media_kind,
+            "metainfo": primary["path"],
+            "metainfo_format": primary["format"],
+            "timestamp_column": primary["ts_info"]["main"],
+            "timestamp_source": primary["ts_info"]["source"],
+            "all_candidates": [
+                {"path": c["path"], "timestamp_column": c["ts_info"]["main"],
+                 "frame_only": c["ts_info"]["frame_main"]}
+                for c in metainfo_candidates
+            ],
+            "source": "content_fingerprint",
+            "evidence": (
+                f"{media_kind} {stem} 与同 stem 表格 "
+                f"{', '.join(Path(c['path']).name for c in metainfo_candidates)} 配对；"
+                f"主时间戳列 {primary['ts_info']['main']}"
+                f"（来源 {primary['ts_info']['source']}"
+                + ("，帧序号，不参与跨流对齐" if primary["ts_info"]["frame_main"] else "，物理时间，参与对齐")
+                + "）。_metainfo.csv 命名仅为线索之一，现按语义角色匹配。"
+            ),
+        })
 
     # 规则 2：accel + gyro → 六轴 IMU。
     accel_files = [t for t in table_files if "accel" in Path(t).name.lower()]

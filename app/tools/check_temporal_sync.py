@@ -79,8 +79,10 @@ def infer_metainfo_unit(arr: np.ndarray, col_name: str) -> str:
     """推断 metainfo 时间戳列的单位。
 
     规则：列名含真实时钟标记（utc / epoch / real / host）→ 用 infer_unit 按量级推断
-    （如 exposure_start_utc_ns → ns）；列名是帧序号类（pts / frame / packet / index）→
-    直接判为 frame_index（无物理时间，不参与跨流对齐）；否则退回 infer_unit。
+    （如 exposure_start_utc_ns → ns）；列名以时间单位后缀（_ns/_us/_ms/_s）结尾 →
+    物理时间（用 infer_unit 量级确认，如 frame_timestamps_ns → ns）；列名是**裸**帧
+    序号词（pts / frame_index / frame_id / packet_index 等，无时间单位后缀）→
+    frame_index（无物理时间，不参与跨流对齐）；否则退回 infer_unit。
 
     Args:
         arr: 时间戳数值数组。
@@ -94,7 +96,11 @@ def infer_metainfo_unit(arr: np.ndarray, col_name: str) -> str:
     lower = col_name.lower()
     if any(k in lower for k in ("utc", "epoch", "real", "host")):
         return infer_unit(arr)["unit"]
-    if any(k in lower for k in ("pts", "frame", "packet", "index", "idx")):
+    # 时间单位后缀优先：frame_timestamps_ns 是物理时间，不是帧序号。
+    if lower.endswith(("_ns", "_us", "_ms", "_s")):
+        return infer_unit(arr)["unit"]
+    # 裸帧序号词（无时间单位后缀）→ frame_index。
+    if any(k in lower for k in ("pts", "packet", "frame_index", "frame_id", "_idx")):
         return FRAME_UNIT
     return infer_unit(arr)["unit"]
 
@@ -327,10 +333,23 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     capabilities = context.meta.get("capabilities", {})
 
     # 视频 ↔ metainfo 配对映射（type=media_metainfo），用于视频流时间戳级对齐。
-    video_metainfo: dict[str, str] = {}
+    # 值为 (metainfo 路径, 格式)，格式来自配对登记（不再硬编码 csv）。
+    video_metainfo: dict[str, tuple[str, str]] = {}
     for pair in context.meta.get("stream_pairs", []):
         if pair.get("type") == "media_metainfo":
-            video_metainfo[pair.get("media", "")] = pair.get("metainfo", "")
+            video_metainfo[pair.get("media", "")] = (
+                pair.get("metainfo", ""),
+                pair.get("metainfo_format", ""),
+            )
+    # 版本组去重：变体视频（variant_of 指向主版本）不参与跨流对齐，避免重复计入
+    # 可对齐流数。仅主版本（无分辨率/_pre 后缀）参与对齐。
+    video_variant_of: set[str] = set()
+    for pair in context.meta.get("stream_pairs", []):
+        if pair.get("type") != "video_version_group":
+            continue
+        for v in pair.get("variants", []):
+            if v.get("path"):
+                video_variant_of.add(v.get("path"))
 
     # 逐流读取时间戳（表格流读文件；视频流若存在配对 metainfo 表，经该表参与
     # 时间戳级对齐，注明时间戳来自曝光元数据而非容器）。
@@ -339,10 +358,19 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     for s in streams:
         key = s.get("path") or s.get("kind")
         if s.get("kind") == "video":
-            meta_path = video_metainfo.get(s.get("path", ""))
-            if meta_path:
-                # 经配对 metainfo 表读取时间戳（exposure_start_utc_ns / pts_us 等）。
-                meta_ts = _read_timestamp_only(meta_path, "csv")
+            # 版本组去重：变体视频不参与对齐（仅主版本参与跨流对齐）。
+            if s.get("path") in video_variant_of:
+                per_stream[key] = {"kind": "video", "ts": None,
+                                   "source": s.get("path")}
+                streams_status[key] = (
+                    "未参与：视频版本组的变体（非主版本），不重复计入可对齐流数"
+                )
+                continue
+            metainfo = video_metainfo.get(s.get("path", ""))
+            if metainfo:
+                meta_path, meta_fmt = metainfo
+                # 经配对 metainfo 表读取时间戳（csv/parquet/json，格式来自配对登记）。
+                meta_ts = _read_timestamp_only(meta_path, meta_fmt or "csv")
                 if meta_ts is not None:
                     arr = pd_to_numeric(meta_ts)  # 已为 ndarray（见 pd_to_numeric）
                     arr = arr[~np.isnan(arr)]

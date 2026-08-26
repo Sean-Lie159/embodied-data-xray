@@ -31,45 +31,44 @@ _TIMESTAMP_COLS = _sniffing._TIMESTAMP_COLS
 def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
     """按需读取文件的时间戳列（不读全量，立即释放）。
 
+    列识别经 find_timestamp_columns：词表命中优先，未命中则内容指纹回退
+    （单调递增 + 量级符合时间单位）；主列选择物理时间 > 帧序号。
+
     Args:
         path: 文件路径。
         fmt: 格式（csv / parquet / json）。
 
     Returns:
-        时间戳列 Series；无时间戳列或读取失败返回 None。
+        时间戳列 Series（其 name 为列名）；无时间戳列或读取失败返回 None。
     """
     from app.tools.load_dataset import _detect_encoding
+    from app.tools._sniffing import find_timestamp_columns
 
     try:
+        sample_rows = 20  # 仅读前若干行用于内容指纹回退
         if fmt == "csv":
             encoding = _detect_encoding(Path(path).read_bytes())
-            # 先读全部列名，再只读时间戳列。
             df_head = pd.read_csv(path, encoding=encoding, nrows=0, engine="python")
-            cols = [c for c in df_head.columns if str(c).lower().strip() in _TIMESTAMP_COLS]
-            if not cols:
+            sample = pd.read_csv(path, encoding=encoding, nrows=sample_rows, engine="python")
+            ts_info = find_timestamp_columns(list(df_head.columns), sample)
+            if ts_info["main"] is None:
                 return None
-            ts = pd.read_csv(
-                path, encoding=encoding, usecols=[cols[0]], engine="python"
-            )[cols[0]]
-            return ts
+            return pd.read_csv(path, encoding=encoding, usecols=[ts_info["main"]], engine="python")[ts_info["main"]]
         if fmt == "parquet":
             import pyarrow.parquet as pq
 
             pf = pq.ParquetFile(path)
-            schema_cols = [c.lower().strip() for c in pf.schema.names]
-            ts_col = next(
-                (c for c in pf.schema.names if str(c).lower().strip() in _TIMESTAMP_COLS),
-                None,
-            )
-            if ts_col is None:
+            sample = pf.read().slice(0, sample_rows).to_pandas()
+            ts_info = find_timestamp_columns(list(pf.schema.names), sample)
+            if ts_info["main"] is None:
                 return None
-            table = pf.read(columns=[ts_col])
-            return pd.Series(table.column(ts_col).to_pylist())
+            table = pf.read(columns=[ts_info["main"]])
+            return pd.Series(table.column(ts_info["main"]).to_pylist(), name=ts_info["main"])
         if fmt == "json":
             encoding = _detect_encoding(Path(path).read_bytes())
             df = pd.read_json(path, encoding=encoding)
-            ts_col = _find_timestamp_column(df)
-            return df[ts_col] if ts_col else None
+            ts_info = find_timestamp_columns(list(df.columns), df.head(sample_rows))
+            return df[ts_info["main"]] if ts_info["main"] else None
         return None
     except Exception:  # noqa: BLE001
         return None

@@ -88,10 +88,11 @@ def test_multi_file_streams_all_measured(tmp_path: Path) -> None:
 
 
 def test_single_stream_failure_does_not_affect_others(tmp_path: Path) -> None:
-    """单条流失败（无时间戳列）标 unknown，不影响其他流测量。"""
+    """单条流失败（无时间戳列，非单调/量级不符）标 unknown，不影响其他流测量。"""
+    # 列非单调递增、量级不符时间单位 → 词表与内容指纹都无法识别为时间戳。
     bad_path = _write_csv(
         tmp_path / "no_ts.csv",
-        pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}),
+        pd.DataFrame({"a": [3, 1, 2], "b": [6, 4, 5]}),
     )
     ts = np.arange(0, 1.0, 0.01)
     good_path = _write_csv(
