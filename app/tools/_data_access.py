@@ -55,9 +55,8 @@ def has_action_columns(df: pd.DataFrame) -> bool:
     return any(str(c).lower().startswith(_JOINT_PREFIXES) for c in df.columns)
 
 
-# JSON 行列表键：顶层 dict 中这些键的值为"行记录列表"（LeRobot 用 frames，nuScenes
-# 用 data），应展开为表格；其余标量键（如 fps/episode_index）不是数据行。
-_JSON_ROW_LIST_KEYS = ("frames", "data")
+# JSON 行列表键：单一事实来源在 _sniffing（语义角色识别的常量层）。
+from app.tools._sniffing import _JSON_ROW_LIST_KEYS  # noqa: E402
 
 
 def parse_lerobot_vector(value: Any) -> np.ndarray | None:

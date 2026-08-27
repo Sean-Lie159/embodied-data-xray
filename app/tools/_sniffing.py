@@ -1410,10 +1410,104 @@ def _is_lerobot_layout(probe: dict[str, Any]) -> bool:
     return has_info and (has_data_chunk or has_video_chunk)
 
 
+# 元数据配置型键（小写）：命中即视为数据集元数据（与标定键区分）。
+_METADATA_CONFIG_KEYS = {
+    "fps", "robot_type", "features", "code_keys", "video", "tasks",
+    "total_episodes", "total_frames", "total_videos", "chunks_size",
+    "data_files_size_in_mb", "videos_size_in_mb",
+}
+# 元数据文件的尺寸上限：超过此值视为数据表而非配置。
+_METADATA_MAX_BYTES = 100_000
+# 标定键（小写副本）：含任一即归标定角色，不参与元数据判定。
+_CALIB_KEYS_LOWER = {k.lower() for k in _CALIB_KEYS}
+# JSON 行列表键：顶层 dict 中这些键的值为"行记录列表"（LeRobot 用 frames，
+# nuScenes 用 data），应展开为表格；其余标量键（如 fps）不是数据行。
+_JSON_ROW_LIST_KEYS = ("frames", "data")
+
+
+def _is_dataset_metadata_content(path: str) -> bool:
+    """按内容特征判定 JSON 是否为数据集元数据（语义角色，不依赖目录布局）。
+
+    判据（全部满足）：可解析为 dict、尺寸 < 100KB、含至少一个配置型键
+    （fps/robot_type/features 等）、不含标定型键（intrinsics/extrinsics/matrix/
+    bias 等——含标定键的归标定角色，如 imu_calibration.json）。
+
+    Args:
+        path: 文件路径。
+
+    Returns:
+        是数据集元数据返回 True。
+    """
+    import json as _json
+
+    p = Path(path)
+    if p.suffix.lower() != ".json":
+        return False
+    try:
+        if p.stat().st_size > _METADATA_MAX_BYTES:
+            return False
+        obj = _json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(obj, dict):
+        return False
+    keys = {str(k).lower() for k in obj.keys()}
+    # 含标定键 → 标定角色，不是元数据。
+    if keys & _CALIB_KEYS_LOWER:
+        return False
+    # 含实质性行列表（frames/data 非空）→ 数据表角色（如 LeRobot episode json，
+    # 与同名 parquet 内容一致），不是元数据。
+    for key in _JSON_ROW_LIST_KEYS:
+        v = obj.get(key)
+        if isinstance(v, list) and v:
+            return False
+    # 命中配置型键 → 元数据角色。
+    if keys & _METADATA_CONFIG_KEYS:
+        return True
+    return False
+
+
 def _is_dataset_metadata_file(path: str) -> bool:
-    """判定文件是否为数据集元数据（LeRobot 的 meta/*.json），不进流清单/不对齐。"""
+    """判定文件是否为数据集元数据角色（不进流清单/不参与对齐）。
+
+    语义角色判据：内容特征（小尺寸 + 配置型键 + 无标定键）。``meta/`` 目录布局
+    仅是线索之一：LeRobot 的 info.json 通常在 meta/ 下，但目录名不作排他判据，
+    以内容为准。
+
+    Args:
+        path: 文件路径。
+
+    Returns:
+        是数据集元数据返回 True。
+    """
     p = Path(path).as_posix()
-    return "/meta/" in p and p.endswith(".json")
+    if not p.endswith(".json"):
+        return False
+    if _is_dataset_metadata_content(path):
+        return True
+    # 目录线索兜底：meta/ 下的小 JSON 且为"配置型结构"（含配置键、无实质行列表、
+    # 无标定键）时按元数据角色处理；纯数据表（含 frames 等非空行列表）不在此列。
+    if "/meta/" in p:
+        import json as _json
+
+        try:
+            pp = Path(path)
+            if pp.stat().st_size > _METADATA_MAX_BYTES:
+                return False
+            obj = _json.loads(pp.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return False
+        if not isinstance(obj, dict):
+            return False
+        keys = {str(k).lower() for k in obj.keys()}
+        if keys & _CALIB_KEYS_LOWER:
+            return False
+        for key in _JSON_ROW_LIST_KEYS:
+            v = obj.get(key)
+            if isinstance(v, list) and v:
+                return False
+        return bool(keys & _METADATA_CONFIG_KEYS) or len(keys) <= 3
+    return False
 
 
 def parse_lerobot_info(info_path: str) -> dict[str, Any]:

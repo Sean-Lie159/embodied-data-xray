@@ -109,15 +109,34 @@ sudo apt install ffmpeg
 
 验证安装：`ffprobe -version`（有版本信息输出即表示可用）。
 
+## 支持的数据布局清单
+
+当前**已验证**的数据布局（每种布局的结构骨架已固化为回归测试，见 `tests/fixtures/skeletons/`）：
+
+| 布局 | 特征 | 状态 |
+|---|---|---|
+| 单文件 | CSV / JSON / Parquet / HDF5 单表 | ✅ 支持 |
+| Tobii 式 Ego 目录 | CSV 传感器流 + `*_metainfo.csv` + JSON 相机标定 + MP4/M4A/JPG | ✅ 支持 |
+| worldcode / nuScenes 重组目录 | nuScenes schema JSON 表族 + `.index.parquet` + 多分辨率视频版本组 + 同名 json↔mp4 | ✅ 支持 |
+| LeRobot v2 | `meta/info.json` + `data/chunk-*` + `videos/chunk-*` | ✅ 支持 |
+
+**清单外格式**：agent 会尝试加载（普查/嗅探尽力而为），但识别可能受限——未知语义角色
+会被如实标注为 unknown，而不是硬猜。请优先使用上方已验证布局；新布局建议先提取结构
+骨架进测试套件（见行为测试.md 的元规则），再进入分析流程。
+
 ## 目录数据集嗅探
 
 `load_dataset` 支持传入**目录**，会执行：
 
 - 递归文件普查（扩展名分布、目录结构）；
 - 表格类（csv/json/parquet）读列名，推断 IMU（6/9 轴）、位姿、状态/动作；
-- json/yaml 标定文件检测（intrinsic/extrinsic/K/D 等键）；
+- 数据识别按**语义角色**匹配（时间戳伴随表、元数据文件、索引列），不绑定具体后缀或
+  固定列名；词表未命中时回退内容指纹（数值列单调递增 + 差分均匀 + 量级符合时间单位）；
+- json/yaml 标定文件检测（intrinsic/extrinsic/K/D 等键）；小尺寸配置型 JSON
+  （fps/features 等）归数据集元数据角色，不进流清单、不参与对齐；
 - 视频类 ffprobe 元数据（可用时）；
-- 生成能力标签（`has_imu` / `has_video_streams` / `has_calibration` / `has_actions` 等）与推测类型（含置信度），写入 `RunContext.meta`。
+- 生成能力标签（`has_imu` / `has_video_streams` / `has_calibration` / `has_actions` 等）
+  与推测类型（含置信度），写入 `RunContext.meta`。
 
 ## 测试
 
