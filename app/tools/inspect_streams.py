@@ -65,8 +65,13 @@ def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
             table = pf.read(columns=[ts_info["main"]])
             return pd.Series(table.column(ts_info["main"]).to_pylist(), name=ts_info["main"])
         if fmt == "json":
-            encoding = _detect_encoding(Path(path).read_bytes())
-            df = pd.read_json(path, encoding=encoding)
+            # 经统一 reader 读取（JSON 顶层 dict 按行列表键 frames/data 展开，
+            # 避免把标量键如 fps 当数据列）。
+            from app.tools import _data_access
+
+            df = _data_access.read_stream_full(path, fmt)
+            if df is None:
+                return None
             ts_info = find_timestamp_columns(list(df.columns), df.head(sample_rows))
             return df[ts_info["main"]] if ts_info["main"] else None
         return None

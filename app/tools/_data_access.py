@@ -54,8 +54,39 @@ def has_action_columns(df: pd.DataFrame) -> bool:
     return any(str(c).lower().startswith(_JOINT_PREFIXES) for c in df.columns)
 
 
+# JSON 行列表键：顶层 dict 中这些键的值为"行记录列表"（LeRobot 用 frames，nuScenes
+# 用 data），应展开为表格；其余标量键（如 fps/episode_index）不是数据行。
+_JSON_ROW_LIST_KEYS = ("frames", "data")
+
+
+def _json_row_list(obj: Any) -> list | None:
+    """从已解析的 JSON 对象提取行记录列表。
+
+    顶层为 list → 直接作为行列表；顶层为 dict → 取第一个行列表键（frames/data）的
+    值（须为 list）。否则返回 None。
+
+    Args:
+        obj: json.loads 的返回。
+
+    Returns:
+        行记录列表；无则返回 None。
+    """
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for key in _JSON_ROW_LIST_KEYS:
+            v = obj.get(key)
+            if isinstance(v, list):
+                return v
+        return None
+    return None
+
+
 def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
     """按需读取流文件的全表。
+
+    JSON 顶层 dict 时按行列表键（frames/data）展开为 DataFrame，避免把标量键
+    （如 fps）当数据列。
 
     Args:
         path: 文件路径。
@@ -64,6 +95,8 @@ def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
     Returns:
         DataFrame；读取失败返回 None。
     """
+    import json as _json
+
     from app.tools.load_dataset import _detect_encoding
 
     try:
@@ -73,7 +106,12 @@ def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
         if fmt == "parquet":
             return pd.read_parquet(path)
         if fmt == "json":
-            return pd.read_json(path)
+            encoding = _detect_encoding(Path(path).read_bytes())
+            obj = _json.loads(Path(path).read_text(encoding=encoding))
+            rows = _json_row_list(obj)
+            if rows is None:
+                return None
+            return pd.DataFrame(rows)
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -106,11 +144,8 @@ def read_table_nrows(path: str, fmt: str) -> int | None:
         if fmt == "json":
             encoding = _detect_encoding(Path(path).read_bytes())
             obj = _json.loads(Path(path).read_text(encoding=encoding))
-            if isinstance(obj, list):
-                return len(obj)
-            if isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], list):
-                return len(obj["data"])
-            return 0
+            rows = _json_row_list(obj)
+            return len(rows) if rows is not None else 0
         return None
     except Exception:  # noqa: BLE001
         return None

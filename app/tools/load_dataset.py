@@ -22,7 +22,7 @@ from agents import RunContextWrapper
 from agents.decorators import tool
 
 from app.agent.context import RunContext
-from app.tools import _sniffing
+from app.tools import _data_access, _sniffing
 from app.tools import profile_store
 
 # 本工具支持的扩展名 → 说明。
@@ -170,12 +170,11 @@ def _read_table_columns(path: Path) -> list[str] | None:
             df = pd.read_parquet(path, columns=None)
             return [str(c) for c in df.columns[:50]]
         if ext == ".json":
-            with open(path, encoding=_detect_encoding(path.read_bytes())) as f:
-                obj = json.load(f)
-            if isinstance(obj, dict) and "columns" in obj:
-                return [str(c) for c in obj["columns"]]
-            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-                return [str(c) for c in obj[0].keys()]
+            from app.tools import _data_access
+
+            rows = _data_access._json_row_list(json.loads(path.read_text(encoding=_detect_encoding(path.read_bytes()))))
+            if rows and isinstance(rows[0], dict):
+                return [str(c) for c in rows[0].keys()]
             return []
         return None
     except Exception:  # noqa: BLE001
@@ -222,12 +221,11 @@ def _read_table_sample(path: Path) -> pd.DataFrame | None:
         if ext == ".parquet":
             return pd.read_parquet(path, columns=None).head(_FINGERPRINT_SAMPLE_ROWS)
         if ext == ".json":
-            with open(path, encoding=_detect_encoding(path.read_bytes())) as f:
-                obj = json.load(f)
-            if isinstance(obj, list):
-                return pd.DataFrame(obj[:_FINGERPRINT_SAMPLE_ROWS])
-            if isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], list):
-                return pd.DataFrame(obj["data"][:_FINGERPRINT_SAMPLE_ROWS])
+            from app.tools import _data_access
+
+            rows = _data_access._json_row_list(json.loads(path.read_text(encoding=_detect_encoding(path.read_bytes()))))
+            if rows is not None:
+                return pd.DataFrame(rows[:_FINGERPRINT_SAMPLE_ROWS])
             return None
         return None
     except Exception:  # noqa: BLE001
@@ -368,7 +366,8 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             elif ext == ".parquet":
                 main_table = pd.read_parquet(main_table_path)
             elif ext == ".json":
-                main_table = pd.read_json(main_table_path)
+                # 经统一 reader（JSON 顶层 dict 按行列表键 frames/data 展开）。
+                main_table = _data_access.read_stream_full(main_table_path, "json")
         except Exception:  # noqa: BLE001
             main_table = None
 
