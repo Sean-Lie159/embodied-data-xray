@@ -93,7 +93,7 @@ def _measure_rate_from_file(
         timestamp_unit_basis；文件缺失、格式损坏、无时间戳列或通道缺失时
         present=False 并注明原因。
     """
-    from app.tools.timestamp_units import to_ns
+    from app.tools.timestamp_units import self_correct_unit, to_ns
 
     if not Path(path).exists():
         return {"present": False, "reason": f"文件不存在：{path}"}
@@ -104,9 +104,12 @@ def _measure_rate_from_file(
         ts = pd.to_numeric(ts, errors="coerce").dropna().sort_values()
         if len(ts) < 2:
             return {"present": False, "reason": "时间戳样本不足"}
-        # 归一化到纳秒基准（仅当单位可换算）；否则保留原值（未知单位按秒兜底，
-        # 兼容历史未标注单位的秒级时间戳）。
-        unit = timestamp_unit if timestamp_unit in ("s", "ms", "us", "ns") else None
+        # 单位自我纠正：初始单位算出的采样率超物理区间时自动换候选单位重算。
+        init_unit = timestamp_unit if timestamp_unit in ("s", "ms", "us", "ns") else "unknown"
+        correction = self_correct_unit(ts.to_numpy(), init_unit)
+        unit = correction["unit"] if correction["unit"] in ("s", "ms", "us", "ns") else None
+        corrected = correction.get("corrected", False)
+        # 归一化到纳秒基准（仅当单位可换算）；否则保留原值（未知单位按秒兜底）。
         normalized = unit is not None
         ts_arr = to_ns(ts.to_numpy(), unit) if normalized else ts.to_numpy()
         diffs = np.diff(ts_arr)
@@ -120,17 +123,20 @@ def _measure_rate_from_file(
         sample_rate = (1e9 / mean_interval if normalized else 1.0 / mean_interval)
         jitter_ms = float(diffs.std()) / 1e6 if normalized else float(diffs.std()) * 1000.0
         unit_note = (
-            f"（原始单位 {timestamp_unit}，已归一化到纳秒）"
-            if normalized else f"（原始单位 {timestamp_unit or 'unknown'}，未归一化，按秒兜底计算）"
+            f"（原始单位 {unit}，已归一化到纳秒）"
+            if normalized else f"（原始单位 {init_unit}，未归一化，按秒兜底计算）"
         )
+        if corrected:
+            unit_note += f"；{correction.get('basis', '')}"
         return {
             "present": True,
             "sample_rate_hz": round(sample_rate, 3),
             "jitter_ms": round(jitter_ms, 3),
             "n_samples": int(len(ts)),
             "timestamp_column": str(ts.name) if ts.name else None,
-            "timestamp_unit": timestamp_unit or "unknown",
+            "timestamp_unit": unit or init_unit,
             "timestamp_unit_basis": unit_note,
+            "unit_corrected": corrected,
         }
     except Exception:  # noqa: BLE001
         return {"present": False, "reason": "时间戳解析失败"}

@@ -79,6 +79,43 @@ def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
     return None
 
 
+def read_table_nrows(path: str, fmt: str) -> int | None:
+    """只读表格行数（不读全量数据）。
+
+    统一行数读数入口：inspect_streams / check_temporal_sync / load_dataset 主表评分
+    都经此函数获取行数，避免各自实现导致同一文件行数读数不一致。
+
+    Args:
+        path: 文件路径。
+        fmt: 格式（csv/parquet/json）。
+
+    Returns:
+        行数（不含表头）；读取失败返回 None。
+    """
+    import json as _json
+
+    from app.tools.load_dataset import _detect_encoding
+
+    try:
+        if fmt == "csv":
+            encoding = _detect_encoding(Path(path).read_bytes())
+            # 用 python 引擎只读首列以降低成本；与全量读同一引擎，行数一致。
+            return int(pd.read_csv(path, encoding=encoding, usecols=[0], engine="python").shape[0])
+        if fmt == "parquet":
+            return int(pd.read_parquet(path, columns=None).shape[0])
+        if fmt == "json":
+            encoding = _detect_encoding(Path(path).read_bytes())
+            obj = _json.loads(Path(path).read_text(encoding=encoding))
+            if isinstance(obj, list):
+                return len(obj)
+            if isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], list):
+                return len(obj["data"])
+            return 0
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def resolve_table_name(context: RunContext, table: str | None) -> dict[str, Any]:
     """解析表名对应的 DataFrame 与来源，统一多表入口（惰性读取，不替换主表）。
 

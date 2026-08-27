@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from app.tools._sniffing import classify_table_stream
 from app.tools.timestamp_units import (
     FRAME_UNIT,
     infer_unit,
+    self_correct_unit,
     to_ns,
     unit_to_ns_factor,
 )
@@ -118,3 +120,40 @@ def test_inspect_rate_normalized_to_ns(tmp_path) -> None:
     assert good["timestamp_unit"] == "us"
     assert "归一化" in good["timestamp_unit_basis"] or "纳秒" in good["timestamp_unit_basis"]
     assert bad["sample_rate_hz"] != 1000.0  # 未归一化必然算错
+
+
+# --- 单位自我纠正（C1） ----------------------------------------------------
+
+
+def _ns_epoch(n: int = 10, step: float = 1_000_000.0) -> np.ndarray:
+    """构造纳秒 epoch 时间戳（值 ~1.7e18，间隔 step ns）。"""
+    return np.arange(n, dtype=float) * step + 1_700_000_000_000_000_000
+
+
+def test_self_correct_unit_implausible_rate() -> None:
+    """初始单位算出的采样率超物理区间 → 按量级重新推断并纠正。"""
+    # 真实场景：纳秒 epoch 列（间隔 1ms=1e6ns → 1000Hz），但列名后缀误判为 "s"。
+    ts = _ns_epoch()
+    res = self_correct_unit(ts, "s")  # 当秒：间隔 1e6s → rate ~1e-6 Hz，超物理区间
+    assert res["corrected"] is True
+    assert res["corrected_from"] == "s"
+    assert res["unit"] == "ns"  # 按量级重推（abs~1.7e18 epoch → ns）
+    assert "自我纠正" in res["basis"]
+    assert res["sample_rate_hz"] == pytest.approx(1000.0, abs=1.0)
+
+
+def test_self_correct_unit_no_change_when_plausible() -> None:
+    """初始单位采样率本就合理 → 不纠正。"""
+    ts = _ns_epoch()  # 间隔 1ms → ~1000Hz（float64 精度导致微小偏差）
+    res = self_correct_unit(ts, "ns")
+    assert res["corrected"] is False
+    assert res["unit"] == "ns"
+    assert res["sample_rate_hz"] == pytest.approx(1000.0, abs=1.0)
+
+
+def test_self_correct_unit_keeps_initial_when_all_implausible() -> None:
+    """所有候选单位采样率都超物理区间 → 保留初始单位（不硬猜）。"""
+    # 差分 0（全重复）→ 无法纠正。
+    res = self_correct_unit(np.array([1.0, 1.0, 1.0]), "ns")
+    assert res["corrected"] is False
+    assert res["sample_rate_hz"] is None

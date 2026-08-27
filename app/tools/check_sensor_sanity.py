@@ -40,20 +40,28 @@ def _read_columns(path: str, fmt: str, columns: list[str]) -> dict[str, np.ndarr
         if fmt == "csv":
             encoding = _detect_encoding(Path(path).read_bytes())
             df = pd.read_csv(path, encoding=encoding, usecols=columns, engine="python")
-            return {c: df[c].to_numpy(dtype=float) for c in columns if c in df.columns}
+            return {c: _column_array(df[c]) for c in columns if c in df.columns}
         if fmt == "parquet":
             import pyarrow.parquet as pq
 
             pf = pq.ParquetFile(path)
             table = pf.read(columns=columns)
-            return {c: np.asarray(table.column(c).to_pylist(), dtype=float) for c in columns}
+            return {c: np.asarray(table.column(c).to_pylist()) for c in columns}
         if fmt == "json":
             encoding = _detect_encoding(Path(path).read_bytes())
             df = pd.read_json(path, encoding=encoding)
-            return {c: df[c].to_numpy(dtype=float) for c in columns if c in df.columns}
+            return {c: _column_array(df[c]) for c in columns if c in df.columns}
         return None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _column_array(series) -> np.ndarray:
+    """把 Series 转为数组：数值列转 float（供方差/全零检测），object 列保留原值。"""
+    try:
+        return series.to_numpy(dtype=float)
+    except (ValueError, TypeError):
+        return series.to_numpy(dtype=object)
 
 
 def _split_imu_channels(
@@ -93,10 +101,34 @@ def _nan_inf_ratio(arr: np.ndarray) -> float:
     return round(float(np.mean(bad)), 4)
 
 
+def _is_index_metadata_column(name: str) -> bool:
+    """判断列名是否为索引/元数据列（恒定检测应排除）。
+
+    排除模式：*_index / frame_* / *id / timestamp 等非传感器数值通道。
+
+    Args:
+        name: 列名。
+
+    Returns:
+        是索引/元数据列返回 True。
+    """
+    lower = str(name).lower().strip()
+    if lower in ("timestamp", "timestamp_ns", "time", "ts", "frame", "packet", "index", "id"):
+        return True
+    if lower.endswith(("_index", "_id", "_idx", "_timestamp", "_time")):
+        return True
+    if lower.startswith("frame_"):
+        return True
+    return False
+
+
 def _constant_columns(
     data: dict[str, np.ndarray], threshold: float
 ) -> list[str]:
     """检测恒定通道（归一化方差低于阈值，疑似掉线）。
+
+    排除索引/元数据列（*_index / frame_* / *id 等），避免把恒定索引误报为掉线；
+    object/数组列纳入全零检测（无法做数值方差，改判是否全为 0/None）。
 
     Args:
         data: {列名: 数值数组}。
@@ -107,14 +139,55 @@ def _constant_columns(
     """
     constant: list[str] = []
     for c, arr in data.items():
-        vc = arr[~np.isnan(arr)]
-        if vc.size <= 10:
-            continue
-        span = float(np.max(vc)) - float(np.min(vc))
-        norm_var = float(np.var(vc)) / (span * span) if span > 0 else 0.0
-        if norm_var < threshold:
-            constant.append(c)
+        if _is_index_metadata_column(c):
+            continue  # 索引/元数据列不参与恒定掉线检测，排除逻辑透出到调用方。
+        if np.issubdtype(np.asarray(arr).dtype, np.number):
+            vc = np.asarray(arr, dtype=float)[~np.isnan(np.asarray(arr, dtype=float))]
+            if vc.size <= 10:
+                continue
+            span = float(np.max(vc)) - float(np.min(vc))
+            norm_var = float(np.var(vc)) / (span * span) if span > 0 else 0.0
+            if norm_var < threshold:
+                constant.append(c)
+        else:
+            # object/数组列：全零检测（全为 0 / 空 / None → 疑似掉线）。
+            arr_obj = np.asarray(arr)
+            if arr_obj.size <= 10:
+                continue
+            try:
+                if not any(_is_nonzero(x) for x in arr_obj):
+                    constant.append(c)
+            except Exception:  # noqa: BLE001
+                continue
     return constant
+
+
+def _is_nonzero(value: Any) -> bool:
+    """递归判断值是否非零（0 / None / 空 / 全零容器视为零）。
+
+    Args:
+        value: 任意值。
+
+    Returns:
+        非零返回 True。
+    """
+    if value is None:
+        return False
+    if isinstance(value, (bool, int, float)):
+        return bool(value)
+    if isinstance(value, (str, bytes)):
+        return len(value) > 0
+    if isinstance(value, (list, tuple, dict, set, np.ndarray)):
+        # 空容器视为零；非空则递归检查元素是否全零。
+        items = value.values() if isinstance(value, dict) else value
+        try:
+            items = list(items)
+        except TypeError:
+            return True
+        if not items:
+            return False
+        return any(_is_nonzero(item) for item in items)
+    return True
 
 
 def _saturation_ratio(data: dict[str, np.ndarray]) -> float:

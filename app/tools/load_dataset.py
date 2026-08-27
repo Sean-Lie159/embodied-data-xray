@@ -185,34 +185,18 @@ def _read_table_columns(path: Path) -> list[str] | None:
 def _read_table_nrows(path: Path) -> int | None:
     """只读表格行数（不读全量数据），用于主表选择评分。
 
+    收敛到 _data_access.read_table_nrows 统一读数入口，保证与 inspect_streams /
+    check_temporal_sync 行数读数一致。
+
     Args:
         path: 表格文件路径。
 
     Returns:
         行数（不含表头）；读取失败返回 None。
     """
-    try:
-        ext = path.suffix.lower()
-        if ext == ".csv":
-            # 仅计数行，跳过表头。用 python 引擎只读首列以降低成本。
-            df = pd.read_csv(
-                path,
-                encoding=_detect_encoding(path.read_bytes()),
-                usecols=[0],
-                engine="python",
-            )
-            return int(df.shape[0])
-        if ext == ".parquet":
-            return int(pd.read_parquet(path, columns=None).shape[0])
-        if ext == ".json":
-            with open(path, encoding=_detect_encoding(path.read_bytes())) as f:
-                obj = json.load(f)
-            if isinstance(obj, list):
-                return len(obj)
-            return 0
-        return None
-    except Exception:  # noqa: BLE001
-        return None
+    from app.tools import _data_access
+
+    return _data_access.read_table_nrows(str(path), path.suffix.lstrip(".").lower())
 
 
 def _read_table_sample(path: Path) -> pd.DataFrame | None:

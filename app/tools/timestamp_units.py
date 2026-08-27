@@ -194,6 +194,85 @@ def to_ns(ts: np.ndarray, unit: str) -> np.ndarray:
     return np.asarray(ts, dtype=float) * factor
 
 
+# 采样率的物理合理区间（Hz）：超出此区间视为单位推断错误，需自我纠正。
+MIN_PLAUSIBLE_RATE = 0.001  # Hz
+MAX_PLAUSIBLE_RATE = 10_000_000  # Hz（10MHz）
+
+
+def self_correct_unit(
+    ts: np.ndarray | list[float], initial_unit: str
+) -> dict[str, Any]:
+    """单位推断自我纠正：若推断单位算出的采样率超出物理合理区间，换候选单位重算。
+
+    规则：以中位正差分为采样间隔，按初始单位算采样率；若不在
+    [MIN_PLAUSIBLE_RATE, MAX_PLAUSIBLE_RATE] 区间内，则依次尝试其余时间单位
+    （s/ms/us/ns），取首个使采样率落回合理区间的单位。返回里记录纠正前后单位与
+    依据。无法找到合理单位则保留初始单位。
+
+    Args:
+        ts: 时间戳数组（数值型）。
+        initial_unit: 初步推断的单位（s/ms/us/ns；frame_index/unknown 不参与纠正）。
+
+    Returns:
+        dict，含 unit（纠正后单位）、corrected（是否发生纠正）、
+        corrected_from（纠正前单位）、sample_rate_hz（按纠正后单位算的采样率）、
+        basis（依据说明）。
+    """
+    arr = np.asarray(ts, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    med = _median_positive_diff(arr)
+    if med is None or med <= 0:
+        return {"unit": initial_unit, "corrected": False, "sample_rate_hz": None,
+                "basis": "时间戳差分无效，无法纠正"}
+    if initial_unit not in _UNIT_TO_NS:
+        return {"unit": initial_unit, "corrected": False, "sample_rate_hz": None,
+                "basis": "非时间单位，不参与纠正"}
+
+    def _rate_for(unit: str) -> float:
+        # 中位差分（该单位值）× 到纳秒倍数 = 纳秒间隔；采样率 = 1e9 / 间隔。
+        interval_ns = med * _UNIT_TO_NS[unit]
+        return 1e9 / interval_ns if interval_ns > 0 else float("inf")
+
+    def _plausible(rate: float) -> bool:
+        return MIN_PLAUSIBLE_RATE <= rate <= MAX_PLAUSIBLE_RATE
+
+    rate = _rate_for(initial_unit)
+    if _plausible(rate):
+        return {"unit": initial_unit, "corrected": False, "sample_rate_hz": round(rate, 3),
+                "basis": f"单位 {initial_unit} 采样率 {rate:.3g}Hz 在合理区间，无需纠正"}
+
+    # 初始单位采样率超物理区间 → 换候选单位重算。优先用"按量级重新推断"的单位
+    # （infer_unit 不做列名推断，纯按差分/绝对量级），它最符合物理直觉；其次按
+    # 候选顺序取首个落回合理区间的。
+    magnitude_unit = infer_unit(arr)["unit"]
+    if magnitude_unit in _UNIT_TO_NS and magnitude_unit != initial_unit and _plausible(_rate_for(magnitude_unit)):
+        r2 = _rate_for(magnitude_unit)
+        return {
+            "unit": magnitude_unit,
+            "corrected": True,
+            "corrected_from": initial_unit,
+            "sample_rate_hz": round(r2, 3),
+            "basis": f"单位经自我纠正：{initial_unit}→{magnitude_unit}（{initial_unit} 采样率 "
+                     f"{rate:.3g}Hz 超物理区间，按量级重新推断得 {magnitude_unit}，"
+                     f"采样率 {r2:.3g}Hz 在合理区间）",
+        }
+    for alt in ("s", "ms", "us", "ns"):
+        if alt == initial_unit or alt == magnitude_unit:
+            continue
+        r2 = _rate_for(alt)
+        if _plausible(r2):
+            return {
+                "unit": alt,
+                "corrected": True,
+                "corrected_from": initial_unit,
+                "sample_rate_hz": round(r2, 3),
+                "basis": f"单位经自我纠正：{initial_unit}→{alt}（{initial_unit} 采样率 "
+                         f"{rate:.3g}Hz 超物理区间，{alt} 得 {r2:.3g}Hz 在合理区间）",
+            }
+    return {"unit": initial_unit, "corrected": False, "sample_rate_hz": round(rate, 3),
+            "basis": f"所有候选单位采样率均超物理区间，保留初始单位 {initial_unit}"}
+
+
 def unit_to_ns_factor(unit: str) -> int | None:
     """返回某单位到纳秒的换算倍数；非时间单位（frame_index/unknown）返回 None。
 
