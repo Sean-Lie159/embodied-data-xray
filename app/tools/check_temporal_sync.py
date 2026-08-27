@@ -21,7 +21,13 @@ from agents.decorators import tool
 from app.agent.context import RunContext
 from app.config import get_settings
 from app.tools.inspect_streams import _read_timestamp_only
-from app.tools.timestamp_units import FRAME_UNIT, TIME_UNITS, to_ns, unit_to_ns_factor
+from app.tools.timestamp_units import (
+    FRAME_UNIT,
+    TIME_UNITS,
+    self_correct_unit,
+    to_ns,
+    unit_to_ns_factor,
+)
 
 
 def _read_stream_timestamps(stream: dict[str, Any]) -> np.ndarray | None:
@@ -410,6 +416,12 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
         else:
             ts = _read_stream_timestamps(s)
             unit = s.get("timestamp_unit", "unknown")
+            # 单位自我纠正：嗅探判错的单位（如 parquet 时间戳被判 ns 实为 s）经
+            # self_correct_unit 换候选重算，避免算出 2.5e10 Hz 这类非物理值。
+            if ts is not None and unit in TIME_UNITS:
+                correction = self_correct_unit(ts, unit)
+                if correction.get("corrected"):
+                    unit = correction["unit"]
             ts_ns, unit_info = (
                 _normalize_to_ns(ts, unit) if ts is not None else (None, None)
             )
