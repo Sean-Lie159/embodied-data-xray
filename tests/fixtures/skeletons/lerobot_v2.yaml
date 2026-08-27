@@ -1,0 +1,45 @@
+# 数据格式骨架：lerobot_v2（LeRobot v2 布局）
+#
+# 用途：把 LeRobot v2 真实采集目录的"文件名模式 + 类型构成"固化为合成夹具。
+# 匿名化（episode_000000 等代表性样本，不带真实设备/项目名）。
+#
+# 结构指纹：
+#   - meta/info.json（数据集元数据，含 fps / video.fps）
+#   - data/chunk-*/ 下 episode_*.parquet 与同名 episode_*.json（mirror）
+#   - videos/chunk-*/ 下视频
+
+name: lerobot_v2
+description: "LeRobot v2 布局：meta/info.json + data/chunk-* + videos/chunk-*"
+
+files:
+  # ---- 数据集元数据（不进流清单、不参与对齐、不算空流）----
+  - name: meta/info.json
+    type: json
+    generate: "info.json：{\"fps\": 25, \"video\": {\"fps\": 60}}"
+  # ---- data/chunk-*：episode 表 + JSON 镜像 ----
+  - name: data/chunk-000/episode_000000.parquet
+    type: parquet
+    generate: "3 行 parquet（含 timestamp_ns 列）"
+  - name: data/chunk-000/episode_000000.json
+    type: json
+    generate: "episode JSON 镜像（与同名 parquet 行数一致，3 行）"
+  - name: data/chunk-001/episode_000001.parquet
+    type: parquet
+    generate: "3 行 parquet（含 timestamp_ns 列）"
+  - name: data/chunk-001/episode_000001.json
+    type: json
+    generate: "episode JSON 镜像（与同名 parquet 行数一致，3 行）"
+  # ---- videos/chunk-*：视频 ----
+  - name: videos/chunk-000/observation.images.wrist.mp4
+    type: video
+    generate: "0 字节 mp4 占位"
+
+expectations:
+  # 4 个数据文件 + 1 视频 + 1 info.json = 6 个文件（info.json 为元数据）。
+  total_files: 6
+  # 两个 episode parquet 同规模（3行×2列），主表按行数×列数最大 + 字母序逆序取后者。
+  main_table: episode_000001.parquet
+  empty_streams: []
+  system_files_skipped: 0
+  dataset_format: lerobot
+  version_groups: 0

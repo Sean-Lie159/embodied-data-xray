@@ -279,10 +279,15 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     # 表格候选 = probe["tables"]（csv/parquet） + cals 中**非标定**的 .json
     # （nuScenes 等数据表 JSON；标定 JSON 仍归 cals，不作为数据表流登记）。
-    table_candidates = list(probe["tables"])
+    table_candidates = [
+        t for t in probe["tables"]
+        if not _sniffing._is_dataset_metadata_file(t)
+    ]
     for p_str in probe["cals"]:
         if Path(p_str).suffix.lower() != ".json":
             continue
+        if _sniffing._is_dataset_metadata_file(p_str):
+            continue  # meta/*.json 是数据集元数据，不作为数据表流登记
         obj = _parse_calibration(Path(p_str))
         is_cal = _sniffing.is_calibration_file(obj) or bool(
             _sniffing.fingerprint_calibration(obj).get("present")
@@ -470,6 +475,22 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
 
     # 流配对规则（mp4↔metainfo、accel+gyro=六轴IMU）。
     stream_pairs = _sniffing.pair_streams(probe["videos"], probe["tables"], probe["audios"])
+    stream_pairs.extend(_sniffing.detect_episode_mirrors(probe))
+
+    # LeRobot 元数据（仅解析 meta/info.json 的 fps/features，不做深度解析）。
+    lerobot_info: dict[str, Any] = {}
+    dataset_metadata: list[str] = []
+    if _sniffing.detect_dataset_format(probe) == "lerobot":
+        info_path = next(
+            (p for p in probe["cals"] + probe["tables"] if _sniffing._is_dataset_metadata_file(p) and Path(p).name == "info.json"),
+            None,
+        )
+        if info_path:
+            lerobot_info = _sniffing.parse_lerobot_info(info_path)
+        dataset_metadata = [
+            p for p in probe["tables"] + probe["cals"]
+            if _sniffing._is_dataset_metadata_file(p)
+        ]
     has_imu_6axis_pair = any(p["type"] == "imu_6axis" for p in stream_pairs)
     caps_result["capabilities"]["has_imu_6axis_pair"] = has_imu_6axis_pair
     caps_result["capabilities"]["has_media_metainfo_pair"] = any(
@@ -502,8 +523,11 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         "streams": _sniffing.build_streams_registry(
             probe, table_info, video_meta, audio_meta, image_meta
         ),
-        # 流配对规则结果（mp4↔metainfo、accel+gyro=六轴IMU）。
+        # 流配对规则结果（mp4↔metainfo、accel+gyro=六轴IMU、episode mirror）。
         "stream_pairs": stream_pairs,
+        # LeRobot 元数据（info.json 的 fps/features）与数据集元数据文件清单。
+        "lerobot_info": lerobot_info,
+        "dataset_metadata": dataset_metadata,
         # 探测失败的文件清单（兜底：单文件失败不中断，记录原因供定位）。
         "probe_errors": probe_errors,
         # 标定文件细节（第 2 层指纹确认的键与依据）。

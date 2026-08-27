@@ -1328,6 +1328,149 @@ def _role_for_kind(kind: str, path: str, semantic_label: str | None = None) -> d
 
 # --- 能力聚合与流登记表 ----------------------------------------------------
 
+def _is_lerobot_layout(probe: dict[str, Any]) -> bool:
+    """判定目录是否为 LeRobot v2 布局。
+
+    指纹：meta/info.json + data/chunk-* 或 videos/chunk-*（LeRobot v2 的元数据与
+    chunk 数据/视频目录）。
+
+    Args:
+        probe: probe_directory 的结果。
+
+    Returns:
+        是 LeRobot v2 布局返回 True。
+    """
+    paths = probe["tables"] + probe["videos"] + probe["cals"]
+    rel = [Path(p).as_posix() for p in paths]
+    has_info = any("/meta/info.json" in p or p.endswith("meta/info.json") for p in rel)
+    has_data_chunk = any("/data/chunk-" in p for p in rel)
+    has_video_chunk = any("/videos/chunk-" in p for p in rel)
+    return has_info and (has_data_chunk or has_video_chunk)
+
+
+def _is_dataset_metadata_file(path: str) -> bool:
+    """判定文件是否为数据集元数据（LeRobot 的 meta/*.json），不进流清单/不对齐。"""
+    p = Path(path).as_posix()
+    return "/meta/" in p and p.endswith(".json")
+
+
+def parse_lerobot_info(info_path: str) -> dict[str, Any]:
+    """解析 LeRobot info.json 的 fps / video.fps / features（确定性解释用）。
+
+    只提取 fps 与 features 元信息，不做深度解析。
+
+    Args:
+        info_path: meta/info.json 路径。
+
+    Returns:
+        dict，含 fps、video_fps、features（可能存在）。
+    """
+    import json as _json
+
+    try:
+        obj = _json.loads(Path(info_path).read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return {}
+        result: dict[str, Any] = {}
+        if "fps" in obj:
+            result["fps"] = obj.get("fps")
+        video = obj.get("video") if isinstance(obj.get("video"), dict) else None
+        if video and "fps" in video:
+            result["video_fps"] = video.get("fps")
+        if "features" in obj:
+            result["features"] = obj.get("features")
+        return result
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def explain_fps_mismatch(table_rows: int, video_frames: int, info: dict[str, Any]) -> dict[str, Any] | None:
+    """用 info.json 的 fps 解释视频帧数与表行数不一致（确定性说明）。
+
+    当 video.fps 与数据 fps 存在比例关系且能解释帧数差异时，给出确定性结论。
+
+    Args:
+        table_rows: 表格行数。
+        video_frames: 视频帧数（约）。
+        info: parse_lerobot_info 的结果。
+
+    Returns:
+        解释 dict（含 ratio、note）或 None（无法解释）。
+    """
+    data_fps = info.get("fps")
+    video_fps = info.get("video_fps")
+    if not (data_fps and video_fps and data_fps > 0 and video_fps > 0):
+        return None
+    ratio = round(video_fps / data_fps, 3)
+    expected_frames = round(table_rows * ratio)
+    if abs(expected_frames - video_frames) / max(video_frames, 1) < 0.1:
+        return {
+            "data_fps": data_fps,
+            "video_fps": video_fps,
+            "ratio": ratio,
+            "expected_video_frames": expected_frames,
+            "note": f"视频 {video_fps}fps vs 数据 {data_fps}Hz，比例 {ratio} 吻合，正常",
+        }
+    return None
+
+
+def detect_episode_mirrors(probe: dict[str, Any]) -> list[dict[str, Any]]:
+    """检测 episode JSON 与其同名 parquet 的镜像（同一数据的 JSON 镜像）。
+
+    LeRobot 中 episode_XXXXXX.json 与同名 parquet 行数一致 → 标 mirror，不参与对齐。
+
+    Args:
+        probe: probe_directory 的结果。
+
+    Returns:
+        list[dict]，每项含 json、parquet、rows（行数）。
+    """
+    import re as _re
+
+    from app.tools import _data_access
+
+    # episode JSON 可能登记在 cals（json 路由），parquet 在 tables；都纳入。
+    all_files = probe.get("tables", []) + probe.get("cals", [])
+    ep_json = {}
+    ep_parquet = {}
+    for t in all_files:
+        p = Path(t)
+        if _re.match(r"episode_\d+\.json", p.name):
+            ep_json[p.name] = t
+        elif _re.match(r"episode_\d+\.parquet", p.name):
+            ep_parquet[p.name] = t
+    mirrors: list[dict[str, Any]] = []
+    for name, jpath in ep_json.items():
+        pname = name.replace(".json", ".parquet")
+        ppath = ep_parquet.get(pname)
+        if ppath is None:
+            continue
+        jrows = _data_access.read_table_nrows(jpath, "json")
+        prows = _data_access.read_table_nrows(ppath, "parquet")
+        if jrows is not None and prows is not None and jrows == prows:
+            mirrors.append({
+                "type": "episode_mirror",
+                "json": jpath, "parquet": ppath, "rows": jrows,
+                "source": "content_fingerprint",
+                "evidence": f"episode JSON {Path(jpath).name} 与 parquet {Path(ppath).name} 行数一致（{jrows}），为同一数据镜像",
+            })
+    return mirrors
+
+
+def detect_dataset_format(probe: dict[str, Any]) -> str:
+    """识别数据集格式（当前仅 LeRobot v2）。
+
+    Args:
+        probe: probe_directory 的结果。
+
+    Returns:
+        格式名（"lerobot" / "unknown"）。
+    """
+    if _is_lerobot_layout(probe):
+        return "lerobot"
+    return "unknown"
+
+
 def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]) -> dict[str, Any]:
     """汇总能力标签与推测类型。
 
@@ -1356,6 +1499,7 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
                      if isinstance(s.get("imu_axes"), int)]
     imu_axes = max(imu_axes_vals) if imu_axes_vals else None
 
+    dataset_format = detect_dataset_format(probe)
     capabilities: dict[str, Any] = {
         "has_video_streams": has_video,
         "has_audio": has_audio,
@@ -1366,11 +1510,14 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
         "has_actions": actions_present,
         "has_hand_tracking": hand_present,
         "has_pose": pose_present,
+        "dataset_format": dataset_format,
     }
 
     guessed_type = "unknown"
     conf = 0.0
-    if has_video and imu_present and pose_present:
+    if dataset_format == "lerobot":
+        guessed_type, conf = "LeRobot", 0.8
+    elif has_video and imu_present and pose_present:
         guessed_type, conf = "Ego", 0.7
     elif has_video and (imu_present or pose_present):
         guessed_type, conf = "Ego", 0.5

@@ -64,6 +64,14 @@ def test_skeleton_loads_and_registers(tmp_path: Path, skeleton_name: str) -> Non
     else:
         assert actual_main == exp_main, f"{skeleton_name} 主表 {actual_main} != 期望 {exp_main}"
 
+    # 数据集格式能力符合预期（若清单声明了）。
+    exp_format = manifest["expectations"].get("dataset_format")
+    if exp_format is not None:
+        actual_format = ctx.meta.get("capabilities", {}).get("dataset_format")
+        assert actual_format == exp_format, (
+            f"{skeleton_name} dataset_format {actual_format} != 期望 {exp_format}"
+        )
+
 
 def test_skeleton_deterministic(tmp_path: Path) -> None:
     """同一骨架两次生成逐字节一致（确定性）。"""

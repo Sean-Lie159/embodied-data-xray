@@ -47,14 +47,15 @@ def build_skeleton(dest: Path, skeleton_name: str) -> Path:
 
 
 def _write_file(root: Path, entry: dict) -> None:
-    """按条目的 type 生成对应文件内容（确定性）。"""
+    """按条目的 type 生成对应文件内容（确定性）；支持子目录路径。"""
     name = entry["name"]
     typ = entry["type"]
     path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
     if typ == "csv":
         path.write_text(_csv_content(name), encoding="utf-8")
     elif typ == "json":
-        path.write_text(_json_content(entry.get("generate", "")), encoding="utf-8")
+        path.write_text(_json_content(name, entry.get("generate", "")), encoding="utf-8")
     elif typ == "parquet":
         _parquet_content(name).to_parquet(path)
     elif typ == "system":
@@ -84,9 +85,18 @@ def _csv_content(name: str) -> str:
     return header + "\n" + "\n".join(rows) + "\n"
 
 
-def _json_content(generate: str) -> str:
-    """按生成规则生成最小合法 JSON（确定性）。"""
+def _json_content(name: str, generate: str) -> str:
+    """按文件名与生成规则生成最小合法 JSON（确定性）。"""
     gen = (generate or "").lower()
+    # LeRobot episode JSON 镜像：与同名 parquet 行数一致（3 行）。
+    if name.startswith("episode_") and name.endswith(".json"):
+        return json.dumps(
+            [{"timestamp_ns": [0, 1_000_000, 2_000_000][i], "observation": i} for i in range(3)],
+            ensure_ascii=False,
+        )
+    # LeRobot meta/info.json。
+    if name == "meta/info.json" or name.endswith("info.json"):
+        return json.dumps({"fps": 25, "video": {"fps": 60}, "features": {"observation.images.wrist": {"dtype": "video"}}}, ensure_ascii=False)
     # 标定 JSON。
     if "intrinsics" in gen or "extrinsic" in gen or "calib" in gen:
         return json.dumps({"intrinsics": {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0}}, ensure_ascii=False)
@@ -98,8 +108,12 @@ def _json_content(generate: str) -> str:
 
 
 def _parquet_content(name: str) -> pd.DataFrame:
-    """生成确定性最小 parquet（含 timestamp_ns 列）。"""
+    """生成确定性最小 parquet（含 timestamp_ns 列）。
+
+    episode_*.parquet 用 3 行，与同名 episode_*.json 镜像行数一致（mirror 检测）。
+    """
+    n = 3 if name.startswith("episode_") else 2
     return pd.DataFrame({
-        "timestamp_ns": [0, 1_000_000],
-        "idx": [0, 1],
+        "timestamp_ns": [i * 1_000_000 for i in range(n)],
+        "idx": list(range(n)),
     })
