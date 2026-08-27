@@ -837,10 +837,62 @@ def _read_table_columns_cheap(path: str, fmt: str) -> list[str] | None:
         return None
 
 
+def _is_frame_level_table(cols: list[str]) -> bool:
+    """判断表格是否为"帧级/曝光级"时间戳表（可作为视频 metainfo）。
+
+    判据：主时间戳列必须是帧级/曝光级——即 find_timestamp_columns 的主列为
+    frame 类型（frame_index/pts 等）或以 exposure_ 开头。仅以通用 timestamp 列为主
+    时间戳的普通数据表不视为 metainfo（避免把数据表当视频曝光时间戳造成假漂移）。
+
+    Args:
+        cols: 表格列名列表。
+
+    Returns:
+        是帧级/曝光级时间戳表返回 True。
+    """
+    ts_info = find_timestamp_columns(cols)
+    main = ts_info.get("main")
+    if main is None:
+        return False
+    lower_main = str(main).lower().strip()
+    # 主时间戳列本身是帧序号（frame/pts/index）或曝光时间戳。
+    if ts_info.get("frame_main"):
+        return True
+    if lower_main.startswith("exposure_"):
+        return True
+    if lower_main in ("frame_index", "frame_id", "pts", "pts_us", "frame"):
+        return True
+    if lower_main.startswith("frame_"):
+        return True
+    return False
+
+
+def _rows_match_frames(path: str, fmt: str, video_frames: int) -> bool:
+    """判断表格行数是否与视频帧数相符（同量级，容忍 10% 偏差）。
+
+    Args:
+        path: 表格文件路径。
+        fmt: 格式。
+        video_frames: 视频帧数。
+
+    Returns:
+        行数可判定且与帧数相符返回 True；行数不可判定返回 True（不因未知而误拒）。
+    """
+    from app.tools import _data_access
+
+    rows = _data_access.read_table_nrows(path, fmt)
+    if rows is None:
+        return True  # 行数未知，不因无法判定而误拒
+    if video_frames <= 0:
+        return True
+    return abs(rows - video_frames) / video_frames < 0.1
+
+
 def pair_streams(
     video_files: list[str],
     table_files: list[str],
     audio_files: list[str],
+    video_frame_counts: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """流配对规则。
 
@@ -880,13 +932,19 @@ def pair_streams(
         ]
         # 判定每个候选是否含可识别时间戳列。_metainfo.csv 是命名线索（快速路径，无需
         # 读文件即视为 metainfo）；其余同 stem 表格需读列名确认含时间戳列。
+        # 附加判据：候选须为"帧级/曝光级"时间戳表（命名线索或含 frame/exposure/pts 列），
+        # 普通数据表（如 episode_*.parquet 的 timestamp 列）不作为视频 metainfo；
+        # 且行数需与视频帧数相符（能拿到帧数时），避免把数据表当曝光时间戳造成假漂移。
         metainfo_candidates: list[dict[str, Any]] = []
+        video_frames = video_frame_counts.get(media) if video_frame_counts else None
         for t in same_stem:
             tname = Path(t).name
             fmt = Path(t).suffix.lstrip(".").lower()
             if tname.endswith("_metainfo.csv"):
                 # _metainfo.csv 命名即线索：默认为 metainfo（帧序号/曝光时间戳类）。
                 ts_info = {"main": None, "frame_main": True, "source": "dictionary"}
+                if video_frames is not None and not _rows_match_frames(t, fmt, video_frames):
+                    continue  # 行数与视频帧数不符，不配（避免数据表当 metainfo）
                 metainfo_candidates.append({
                     "path": t, "format": fmt, "ts_info": ts_info,
                     "by_naming": True,
@@ -898,6 +956,10 @@ def pair_streams(
             ts_info = find_timestamp_columns(cols)
             if ts_info["main"] is None:
                 continue  # 列名无时间戳（未做内容指纹，配对阶段保持廉价）
+            if not _is_frame_level_table(cols):
+                continue  # 普通数据表（仅 timestamp 列、无 frame/exposure/index 特征）不配
+            if video_frames is not None and not _rows_match_frames(t, fmt, video_frames):
+                continue  # 行数与视频帧数不符
             metainfo_candidates.append({
                 "path": t,
                 "format": fmt,

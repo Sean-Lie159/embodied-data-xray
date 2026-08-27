@@ -472,8 +472,17 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     caps_result = _sniffing.build_capabilities(probe, table_sniffs)
     caps_result["capabilities"]["has_calibration"] = calib_detected
 
-    # 流配对规则（mp4↔metainfo、accel+gyro=六轴IMU）。
-    stream_pairs = _sniffing.pair_streams(probe["videos"], probe["tables"], probe["audios"])
+    # 流配对规则（mp4↔metainfo、accel+gyro=六轴IMU）。视频帧数（ffprobe 可用时）用于
+    # metainfo 配对的行数匹配，避免把数据表当视频曝光时间戳造成假漂移。
+    video_frame_counts: dict[str, int] = {}
+    for v in video_meta:
+        nf = v.get("nb_frames")
+        if isinstance(nf, int) and nf > 0:
+            video_frame_counts[v.get("file", "")] = nf
+    stream_pairs = _sniffing.pair_streams(
+        probe["videos"], probe["tables"], probe["audios"],
+        video_frame_counts=video_frame_counts,
+    )
     stream_pairs.extend(_sniffing.detect_episode_mirrors(probe))
 
     # LeRobot 元数据（仅解析 meta/info.json 的 fps/features，不做深度解析）。

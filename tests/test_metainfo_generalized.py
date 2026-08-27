@@ -119,3 +119,40 @@ def test_version_group_dedup_in_alignment(tmp_path: Path) -> None:
     # 变体 cam_480.mp4 不参与对齐（版本组去重）。
     vid_status = {k: v for k, v in r.get("streams_status", {}).items() if "cam" in k and ".mp4" in k}
     assert any("变体" in v for k, v in vid_status.items() if "480" in k)
+
+
+def test_data_table_not_used_as_video_metainfo(tmp_path: Path) -> None:
+    """普通数据表（主时间戳为通用 timestamp）不作为视频 metainfo，避免假漂移。
+
+    复现 PICO LeRobot：episode_000000.mp4 与 episode_000000.parquet 同 stem，但
+    parquet 是数据表（主时间戳 timestamp），不是帧级曝光时间戳表 → 不应配对。
+    """
+    root = tmp_path / "lerobot"
+    (root / "data" / "chunk-000").mkdir(parents=True)
+    (root / "videos" / "chunk-000").mkdir(parents=True)
+    # 数据表：主时间戳是通用 timestamp（25Hz 秒制），含 frame_index 列。
+    pd.DataFrame({
+        "timestamp": [i * 0.04 for i in range(100)],
+        "frame_index": list(range(100)),
+        "observation.left_hand": [f"{i}.0 0.0 0.0" for i in range(100)],
+    }).to_parquet(root / "data/chunk-000/episode_000000.parquet")
+    (root / "videos/chunk-000/episode_000000.mp4").write_bytes(b"f")
+    ctx = RunContext(output_dir=str(tmp_path))
+    load_dataset_impl(ctx, str(root))
+    # 不应产生 video↔数据表 的 media_metainfo 配对（数据表非帧级 metainfo）。
+    mm = [p for p in ctx.meta["stream_pairs"] if p.get("type") == "media_metainfo"]
+    assert not mm, f"数据表不应作为视频 metainfo 配对：{mm}"
+    # 视频流不因假配对产生假漂移源（无 media_metainfo 配对）。
+
+
+def test_index_parquet_still_pairs_as_metainfo(tmp_path: Path) -> None:
+    """worldcode 的 camera-a.mp4 ↔ camera-a.index.parquet（帧级时间戳）仍应配对。"""
+    root = tmp_path / "wc"
+    root.mkdir()
+    (root / "camera-a.mp4").write_bytes(b"f")
+    ts = [1_700_000_000_000_000_000 + i * 33_333_333 for i in range(30)]
+    pd.DataFrame({"pts": list(range(30)), "frame_timestamps_ns": ts}).to_parquet(root / "camera-a.index.parquet")
+    pairs = pair_streams([str(root / "camera-a.mp4")], [str(root / "camera-a.index.parquet")], [])
+    mm = [p for p in pairs if p["type"] == "media_metainfo"]
+    assert len(mm) == 1
+    assert mm[0]["metainfo"].endswith("camera-a.index.parquet")
