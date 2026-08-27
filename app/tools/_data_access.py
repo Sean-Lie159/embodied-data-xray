@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from app.agent.context import RunContext
@@ -57,6 +58,41 @@ def has_action_columns(df: pd.DataFrame) -> bool:
 # JSON 行列表键：顶层 dict 中这些键的值为"行记录列表"（LeRobot 用 frames，nuScenes
 # 用 data），应展开为表格；其余标量键（如 fps/episode_index）不是数据行。
 _JSON_ROW_LIST_KEYS = ("frames", "data")
+
+
+def parse_lerobot_vector(value: Any) -> np.ndarray | None:
+    """解析 LeRobot 向量值（空格/换行分隔字符串 或 JSON 数组 或 list/tuple）。
+
+    LeRobot 的 object 列（如 observation.left_hand）常存为 "0. 0. 0. \n 0. 0. ..."
+    的空格/换行分隔字符串，或 JSON 数组；本函数统一解析为数值数组。
+
+    Args:
+        value: 单元格值（str / list / tuple / ndarray）。
+
+    Returns:
+        数值数组；无法解析返回 None。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, np.ndarray)):
+        try:
+            return np.asarray(value, dtype=float)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, (int, float)):
+        return np.asarray([float(value)])
+    s = str(value).strip()
+    if not s:
+        return None
+    # 去掉可能的中括号/逗号，按空白切分。
+    s = s.replace("[", " ").replace("]", " ").replace(",", " ").replace("\n", " ")
+    parts = [p for p in s.split() if p]
+    if not parts:
+        return None
+    try:
+        return np.asarray([float(p) for p in parts], dtype=float)
+    except ValueError:
+        return None
 
 
 def _json_row_list(obj: Any) -> list | None:

@@ -150,12 +150,33 @@ def _constant_columns(
             if norm_var < threshold:
                 constant.append(c)
         else:
-            # object/数组列：全零检测（全为 0 / 空 / None → 疑似掉线）。
+            # object/数组/向量串列：全零检测（**全列**分布，而非只看前几行）。
+            # 用 parse_lerobot_vector 解析空格/换行分隔向量，逐行判断是否全零。
             arr_obj = np.asarray(arr)
             if arr_obj.size <= 10:
                 continue
             try:
-                if not any(_is_nonzero(x) for x in arr_obj):
+                from app.tools._data_access import parse_lerobot_vector
+
+                # 逐行判定是否"零"：向量串解析后全零，或容器 _is_nonzero=False。
+                all_zero = True
+                any_decided = False
+                for x in arr_obj:
+                    vec = parse_lerobot_vector(x)
+                    if vec is not None:
+                        any_decided = True
+                        if np.any(np.abs(vec) > 1e-9):
+                            all_zero = False
+                            break
+                    else:
+                        # 非向量容器回退 _is_nonzero（递归判定 dict/list）。
+                        if _is_nonzero(x):
+                            all_zero = False
+                            break
+                        any_decided = True
+                # 全列可判定且全零 → 掉线；任一行非零 → 不报（避免"起始段全零但整体
+                # 有值"被误判为全零）。
+                if any_decided and all_zero:
                     constant.append(c)
             except Exception:  # noqa: BLE001
                 continue
