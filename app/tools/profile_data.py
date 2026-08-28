@@ -89,6 +89,16 @@ def profile_data_impl(context: RunContext, max_unique: int = 20, table: str | No
                 "max": _safe_float(desc.get("max")),
                 "median": _safe_float(series.median(skipna=True)),
             }
+        else:
+            # object 列：尝试按向量解析（LeRobot 观测/动作列常为空格分隔向量串），
+            # 做**全列**零/非零分布统计——样例值只反映列首，不能据此外推整列。
+            vstats = _vector_column_stats(series)
+            if vstats is not None:
+                col["vector_stats"] = vstats
+                col["sample_values_note"] = (
+                    f"样例值仅取列首前 {max_unique} 行；该列全列分布见 vector_stats"
+                    "（起始段可能不代表整体，勿据样例外推全列）"
+                )
 
         columns.append(col)
 
@@ -118,6 +128,55 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _vector_column_stats(series) -> dict[str, Any] | None:
+    """对 object 列做全列向量分布统计（零/非零行占比与维度）。
+
+    逐行尝试用 parse_lerobot_vector 解析（空格/换行分隔向量串 / JSON 数组 / list）。
+    仅当**多数行可解析**（占比 ≥ 0.5）时才认定该列为向量列并返回统计，避免把普通
+    字符串列误套向量统计。
+
+    Args:
+        series: 列 Series（object 类型）。
+
+    Returns:
+        dict，含 n_parsed（解析成功行数）、n_zero（全零向量行数）、
+        n_nonzero（含非零分量的行数）、zero_row_ratio（全零行占比）、dims（向量维度，
+        取众数）；非向量列返回 None。
+    """
+    import numpy as np
+
+    from app.tools._data_access import parse_lerobot_vector
+
+    total = len(series)
+    if total == 0:
+        return None
+    n_parsed = 0
+    n_zero = 0
+    n_nonzero = 0
+    dim_counter: dict[int, int] = {}
+    for v in series:
+        vec = parse_lerobot_vector(v)
+        if vec is None:
+            continue
+        n_parsed += 1
+        dim_counter[int(vec.size)] = dim_counter.get(int(vec.size), 0) + 1
+        if np.any(np.abs(vec) > 1e-9):
+            n_nonzero += 1
+        else:
+            n_zero += 1
+    # 多数行可解析才认定是向量列。
+    if n_parsed < total * 0.5:
+        return None
+    dims = max(dim_counter, key=dim_counter.get) if dim_counter else None
+    return {
+        "n_parsed": n_parsed,
+        "n_zero": n_zero,
+        "n_nonzero": n_nonzero,
+        "zero_row_ratio": round(n_zero / n_parsed, 4) if n_parsed else None,
+        "dims": dims,
+    }
 
 
 @tool
