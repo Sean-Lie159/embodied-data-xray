@@ -106,7 +106,13 @@ def plot_chart_impl(
         title_safe = _safe_title(title, f"{chart_type} chart")
         path = _output_path(context, chart_type)
         fig, ax = plt.subplots()
-        desc, plot_spec = _plot_generic_to_ax(resolved["df"], chart_type, x, y, color, title_safe, fig, ax)
+        # 把数据集声明的语义元数据挂到 df.attrs，供向量列绘图取维度名（不推测）。
+        plot_df = resolved["df"]
+        try:
+            plot_df.attrs["lerobot_info"] = context.meta.get("lerobot_info") or {}
+        except Exception:  # noqa: BLE001
+            pass
+        desc, plot_spec = _plot_generic_to_ax(plot_df, chart_type, x, y, color, title_safe, fig, ax)
         _save_fig(fig, path)
         chart_table_name = resolved["table_name"]
 
@@ -214,6 +220,42 @@ def _plot_generic_to_ax(
     if ycol is None:
         nums = [c for c in df.columns if c != xcol and pd.api.types.is_numeric_dtype(df[c])]
         ycol = nums[0] if nums else xcol
+
+    # 向量列（如 LeRobot 的 observation.head_pose，每行为多维数组）：
+    # 展开为多条曲线，图例优先用数据集声明的维度名（meta/info.json features.names），
+    # 无声明时用 col[i] 占位——不得推测维度含义。
+    vec = _vector_matrix(df[ycol]) if ycol in df.columns else None
+    if vec is not None:
+        dim_names = _dimension_names_for(df, ycol, vec.shape[1])
+        x_vals = df[xcol]
+        max_dims = 8  # 维度过多时只画前若干，避免图不可读
+        drawn = list(range(min(vec.shape[1], max_dims)))
+        for i in drawn:
+            label = dim_names[i] if i < len(dim_names) else f"{ycol}[{i}]"
+            if chart_type == "scatter":
+                ax.scatter(x_vals, vec[:, i], label=label, s=6)
+            else:
+                ax.plot(x_vals, vec[:, i], label=label)
+        ax.legend(fontsize="small")
+        ax.set_xlabel(str(xcol)); ax.set_ylabel(str(ycol))
+        ax.set_title(title)
+        spec = {
+            "x_axis": str(xcol),
+            "y_axis": [dim_names[i] if i < len(dim_names) else f"{ycol}[{i}]" for i in drawn],
+            "grouped_by": None,
+            "n_series": len(drawn),
+            "vector_column": str(ycol),
+            "dims_total": int(vec.shape[1]),
+            "dims_drawn": len(drawn),
+            "dimension_source": _dimension_source_for(df, ycol),
+        }
+        note = f"（向量列，共 {vec.shape[1]} 维，已画前 {len(drawn)} 维）"
+        return (
+            f"{chart_type.capitalize()} of '{ycol}' (expanded by dimension) vs "
+            f"'{xcol}'{note}",
+            spec,
+        )
+
     grouped = color if (color and color in df.columns) else None
     n_series = int(df[grouped].nunique()) if grouped else 1
     if grouped:
@@ -232,6 +274,72 @@ def _plot_generic_to_ax(
     ax.set_title(title)
     spec = {"x_axis": str(xcol), "y_axis": [str(ycol)], "grouped_by": grouped, "n_series": n_series}
     return f"{chart_type.capitalize()} of '{ycol}' vs '{xcol}'", spec
+
+
+def _vector_matrix(series) -> np.ndarray | None:
+    """把向量列解析为 (n_rows, n_dims) 数值矩阵；非向量列返回 None。
+
+    Args:
+        series: 列 Series（object，每行可能是向量串/list/ndarray）。
+
+    Returns:
+        数值矩阵；多数行不可解析时返回 None。
+    """
+    from app.tools._data_access import parse_lerobot_vector
+
+    # 标量数值列（int/float）不是向量列：保持既有单序列绘图行为，避免回归。
+    if pd.api.types.is_numeric_dtype(series.dtype):
+        return None
+
+    vals = series.tolist()
+    if not vals:
+        return None
+    parsed: list[np.ndarray] = []
+    for v in vals:
+        vec = parse_lerobot_vector(v)
+        parsed.append(vec if vec is not None else None)
+    ok = [v for v in parsed if v is not None]
+    # 多数行可解析且维度一致才认定为向量列。
+    if len(ok) < len(vals) * 0.5:
+        return None
+    dim = ok[0].size
+    if any(v.size != dim for v in ok):
+        return None
+    mat = np.full((len(vals), dim), np.nan)
+    for i, v in enumerate(parsed):
+        if v is not None:
+            mat[i] = v
+    return mat
+
+
+def _dimension_names_for(df, column: str, n_dims: int) -> list[str]:
+    """取向量列各维度名：优先数据集声明（meta/info.json），其次 col[i] 占位。"""
+    names: list[str] = []
+    try:
+        info = df.attrs.get("lerobot_info") or {}
+        declared = _sniffing.column_dimension_names(info, str(column))
+    except Exception:  # noqa: BLE001
+        declared = None
+    if declared and len(declared) == n_dims:
+        names.extend(str(n) for n in declared)
+    elif declared and len(declared) == 1:
+        # 单一组合名（如 'body_24x7'/'action_fullbody_hands'）：无逐维声明，用占位。
+        names.extend(f"{column}[{i}]" for i in range(n_dims))
+    else:
+        names.extend(f"{column}[{i}]" for i in range(n_dims))
+    return names
+
+
+def _dimension_source_for(df, column: str) -> str:
+    """维度名来源说明（供 plot_spec 透出）。"""
+    try:
+        info = df.attrs.get("lerobot_info") or {}
+        declared = _sniffing.column_dimension_names(info, str(column))
+    except Exception:  # noqa: BLE001
+        declared = None
+    if declared:
+        return "meta/info.json features（数据集声明）"
+    return "数据集未声明维度名，使用 col[i] 占位"
 
 
 def _plot_trajectory_to_file(df, title, path) -> tuple[str, str, dict[str, Any]] | None:
