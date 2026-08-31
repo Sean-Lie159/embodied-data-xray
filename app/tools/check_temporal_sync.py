@@ -175,26 +175,39 @@ def _single_stream_checks(
     # 重复时间戳计数。
     duplicates = int(np.sum(np.diff(ts_sorted) == 0)) if len(ts) > 1 else 0
 
-    # 实际采样率（中位数间隔倒数）。
+    # 实际采样率（**平均**间隔倒数）。守恒口径：平均采样率 × 时长 = 样本数，
+    # 这是"期望帧数"计算唯一自洽的口径；中位差分代表"典型间隔"（受抖动影响的
+    # 分布众数附近值），用它乘时长会在抖动存在时系统性虚报丢帧（真实案例：
+    # 抖动 6.6ms 使中位 38.6ms < 平均 39.5ms，虚报 2.28% 丢帧并误判 FAIL）。
     actual_rate = None
+    median_interval_s = None
     if len(diffs) > 0:
         med = float(np.median(diffs))
-        if med > 0:
-            actual_rate = round(1.0 / med, 3)
+        mean_d = float(np.mean(diffs))
+        median_interval_s = round(med, 6) if med > 0 else None
+        if mean_d > 0:
+            actual_rate = round(1.0 / mean_d, 3)
 
     # 时长（秒）。
     duration_s = None
     if len(ts_sorted) >= 2:
         duration_s = round(float(ts_sorted[-1] - ts_sorted[0]), 4)
 
-    # 丢帧率：以"时长 × 实际采样率 + 1"推算期望帧数，与实际帧数比得缺失比例。
-    # 相比"间隔 > 1.5×中位数"法，此法能正确反映整段缺失。
+    # 丢帧率：**异常间隔累加法**（对抖动鲁棒、对真实缺口敏感）。
+    # 旧公式 expected = duration × (中位采样率) + 1 在有抖动时系统性虚报
+    # （中位差分 < 平均差分 → expected 虚高 → 把抖动当丢帧）。
+    # 新口径：间隔 > 5×中位差分 视为缺口，缺失时长 = Σ(缺口间隔 - 中位差分)，
+    # 丢帧率 = 缺失时长 / 总时长。抖动（< 5×中位）不计入；整段缺失被正确累加。
     frame_loss_ratio = 0.0
-    if duration_s and actual_rate:
-        expected = max(1, duration_s * actual_rate + 1)
-        frame_loss_ratio = round(max(0.0, 1.0 - len(ts) / expected), 4)
-        if expected <= len(ts) + 1:
-            frame_loss_ratio = 0.0  # 无缺失
+    gap_count = 0
+    if duration_s and duration_s > 0 and len(diffs) > 0:
+        med = float(np.median(diffs)) if len(diffs) else 0.0
+        if med > 0:
+            K = 5.0
+            gaps = diffs[diffs > K * med]
+            gap_count = int(len(gaps))
+            missing_duration = float(np.sum(gaps - med)) if len(gaps) else 0.0
+            frame_loss_ratio = round(min(1.0, missing_duration / duration_s), 4)
 
     # 实际 vs 标称偏差：标称缺失时该项标记为 skipped（不得静默消失）。
     rate_deviation = None
@@ -212,7 +225,9 @@ def _single_stream_checks(
         "disorder_count": disorder,
         "duplicate_count": duplicates,
         "frame_loss_ratio": frame_loss_ratio,
+        "gap_count": gap_count,
         "actual_rate_hz": actual_rate,
+        "median_interval_s": median_interval_s,
         "nominal_rate_hz": nominal,
         "rate_deviation": rate_deviation,
         "nominal_check": nominal_check,

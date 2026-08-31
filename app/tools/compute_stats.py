@@ -143,6 +143,12 @@ def _skeleton_pose_range(
         ) and len(dim_order) == dof
 
         block_stats: dict[str, Any] = {}
+        # 全列级缺失/质量统计（跨所有块）：全零行是"缺失占位"，会污染按行平均的
+        # 质量指标，必须与有效行分层报告（真实案例：62 个全零行使平均范数降至
+        # 0.917，但剔除后有效行范数精确 =1.0——数据质量本身无问题）。
+        all_zero_rows = int(
+            np.sum(~np.any(np.abs(mat) > 1e-9, axis=1))
+        )
         shown = min(blocks, _MAX_SKELETON_BLOCKS_SHOWN)
         for b in range(shown):
             seg = mat[:, b * dof : (b + 1) * dof]
@@ -157,10 +163,23 @@ def _skeleton_pose_range(
             if can_split and dof >= 4:
                 quats = seg[:, 3:7]
                 norms = np.linalg.norm(quats, axis=1)
+                # 分层：全零行（缺失占位，范数=0）与有效行分开统计。
+                valid = norms[~np.isnan(norms) & (norms > 1e-9)]
                 entry["quaternion_norm_mean"] = round(float(np.nanmean(norms)), 4)
-                entry["quaternion_norm_stable"] = bool(
-                    np.nanstd(norms) < 0.01 and abs(float(np.nanmean(norms)) - 1.0) < 0.01
+                entry["quaternion_norm_mean_valid"] = (
+                    round(float(np.mean(valid)), 4) if valid.size else None
                 )
+                # 稳定性只对有效行判定（全零行不参与，避免污染质量结论）。
+                entry["quaternion_norm_stable"] = bool(
+                    valid.size > 0
+                    and float(np.std(valid)) < 0.01
+                    and abs(float(np.mean(valid)) - 1.0) < 0.01
+                )
+                if all_zero_rows:
+                    entry["zero_row_note"] = (
+                        f"全列含 {all_zero_rows} 个全零行（缺失占位，范数=0），"
+                        "已从质量统计中剔除；有效行范数见 quaternion_norm_mean_valid"
+                    )
             block_stats[f"block_{b}"] = entry
 
         result[str(col)] = {
