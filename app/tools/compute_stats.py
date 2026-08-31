@@ -29,6 +29,8 @@ _EPISODE_COLS = ("episode", "ep", "eps", "episode_id", "traj_id", "trajectory_id
 _SUCCESS_COLS = ("success", "successful", "done")
 # 关节列前缀（活动范围）。
 _JOINT_PREFIXES = ("qpos", "joint", "q_")
+# 骨骼位姿块最多展开的块数（避免返回体积爆炸；总数仍完整给出）。
+_MAX_SKELETON_BLOCKS_SHOWN = 8
 
 
 def _find_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
@@ -81,6 +83,104 @@ def _generic_stats(
                 "max": round(float(series.max()), 4) if series.notna().any() else None,
                 "median": round(float(series.median()), 4) if series.notna().any() else None,
             }
+    return result
+
+
+def _skeleton_pose_range(
+    df: pd.DataFrame, lerobot_info: dict[str, Any]
+) -> dict[str, Any]:
+    """骨骼位姿范围（skeleton_pose_range）：按数据集声明的块分解展开统计。
+
+    与 joint_range_of_motion 严格区分：
+    - joint_range_of_motion = **关节角度**范围（机器人学 ROM，标量列，常 rad/deg）；
+    - skeleton_pose_range = **骨骼位姿**范围（向量列按 N 块 × M DoF 展开，
+      含位置（米）与四元数，非关节角度）。
+
+    仅处理**数据集显式声明**且自洽的块分解（names 为 `xxx_NxM` 且 N*M == shape[0]）；
+    块内维度顺序优先用本列逐维声明，否则参照同数据集同 dof 的逐维声明列（如
+    head_pose）**推断并标注**；无依据时用 dim_i 占位且不解读语义。
+
+    Args:
+        df: 数据表。
+        lerobot_info: parse_lerobot_info 的返回（含 column_semantics）。
+
+    Returns:
+        dict：列名 → {block_count, dof_per_block, declared_name, blocks(前若干块
+        的 min/max/range), dimension_order, semantic_note}；无声明列则返回 {}。
+    """
+    from app.tools._data_access import parse_lerobot_vector
+    from app.tools._sniffing import infer_dof_order, parse_block_declaration
+
+    if not lerobot_info:
+        return {}
+
+    result: dict[str, Any] = {}
+    for col in df.columns:
+        decl = parse_block_declaration(lerobot_info, str(col))
+        if decl is None:
+            continue  # 未声明块分解 → 不处理（不猜测）。
+        blocks, dof = decl["block_count"], decl["dof_per_block"]
+        # 解析向量列为 (n_rows, dims) 矩阵。
+        mat = None
+        vals = df[col].tolist()
+        rows: list[np.ndarray] = []
+        for v in vals:
+            vec = parse_lerobot_vector(v)
+            rows.append(vec if vec is not None else None)
+        ok = [v for v in rows if v is not None]
+        if len(ok) < len(vals) * 0.5 or not ok or any(v.size != dof * blocks for v in ok):
+            continue  # 多数行不可解析或维度与声明不符 → 跳过（不猜测）。
+        mat = np.full((len(vals), dof * blocks), np.nan)
+        for i, v in enumerate(rows):
+            if v is not None:
+                mat[i] = v
+
+        order_info = infer_dof_order(lerobot_info, str(col), dof)
+        dim_order = order_info["order"]
+        # 位置/四元数切分：仅在维度名可判定（含 p?/q? 前缀）时给出，否则不解读。
+        can_split = all(
+            str(n).startswith(("p", "q")) for n in dim_order
+        ) and len(dim_order) == dof
+
+        block_stats: dict[str, Any] = {}
+        shown = min(blocks, _MAX_SKELETON_BLOCKS_SHOWN)
+        for b in range(shown):
+            seg = mat[:, b * dof : (b + 1) * dof]
+            entry: dict[str, Any] = {
+                "position_min": [round(float(x), 4) for x in np.nanmin(seg[:, :3], axis=0)],
+                "position_max": [round(float(x), 4) for x in np.nanmax(seg[:, :3], axis=0)],
+                "position_range": [
+                    round(float(x), 4)
+                    for x in (np.nanmax(seg[:, :3], axis=0) - np.nanmin(seg[:, :3], axis=0))
+                ],
+            }
+            if can_split and dof >= 4:
+                quats = seg[:, 3:7]
+                norms = np.linalg.norm(quats, axis=1)
+                entry["quaternion_norm_mean"] = round(float(np.nanmean(norms)), 4)
+                entry["quaternion_norm_stable"] = bool(
+                    np.nanstd(norms) < 0.01 and abs(float(np.nanmean(norms)) - 1.0) < 0.01
+                )
+            block_stats[f"block_{b}"] = entry
+
+        result[str(col)] = {
+            "block_count": blocks,
+            "dof_per_block": dof,
+            "declared_name": decl["declared_name"],
+            "declaration_source": decl["declaration_source"],
+            "blocks_shown": shown,
+            "blocks_truncated": blocks > shown,
+            "dimension_order": dim_order,
+            "dimension_order_source": order_info["source"],
+            "dimension_order_inferred": order_info["is_inferred"],
+            "blocks": block_stats,
+            "semantic_note": (
+                f"{blocks} 块 × {dof}DoF（"
+                + ("3 位置 + 4 四元数" if can_split else "维度语义未声明")
+                + "）；位置单位为米，非关节角度——本指标为骨骼位姿范围，"
+                "不等同 joint_range_of_motion（关节角度范围）。"
+            ),
+        }
     return result
 
 
@@ -195,6 +295,19 @@ def compute_stats_impl(
                 }
         metrics["joint_range_of_motion"] = rom
 
+    # 骨骼位姿范围：仅处理数据集声明的块分解列（如 body_24x7 / left_hand_26x7）。
+    # 与 joint_range_of_motion（关节角度）严格区分，避免"位姿范围"被当"关节角度"解读。
+    lerobot_info = context.meta.get("lerobot_info") or {}
+    skeleton = _skeleton_pose_range(df, lerobot_info)
+    if skeleton:
+        metrics["skeleton_pose_range"] = skeleton
+        inferred = [c for c, v in skeleton.items() if v.get("dimension_order_inferred")]
+        if inferred:
+            semantic_notes.append(
+                f"骨骼位姿列 {', '.join(inferred)} 的块内维度顺序为**参照推断**"
+                "（本列 names 仅为组合名），非数据集直接声明，引用时请注意。"
+            )
+
     # 任务完成时长离群 episode（IQR 法，基于每 episode 时长）。
     duration_col = None
     for c in df.columns:
@@ -260,6 +373,7 @@ def compute_stats_impl(
             "n_episodes": metrics.get("episode_distribution", {}).get("n_episodes"),
             "success_rate": metrics.get("success_rate", {}).get("overall"),
             "joint_range_of_motion": metrics.get("joint_range_of_motion"),
+            "skeleton_pose_range": metrics.get("skeleton_pose_range"),
             "outlier_episodes": metrics.get("outlier_episodes"),
             "episode_duration": metrics.get("episode_duration"),
         },
@@ -314,6 +428,10 @@ def compute_stats_impl(
             f"{metrics.get('episode_distribution', {}).get('n_episodes', 0)} 个 episode。"
             + (f" 成功率 {metrics['success_rate']['overall']}。" if 'success_rate' in metrics else "")
             + (f" 离群 episode {len(outlier_episodes)} 个。" if outlier_episodes else "")
+            + (
+                f" 骨骼位姿范围（{len(skeleton)} 列，按声明块分解，非关节角度）。"
+                if skeleton else ""
+            )
             + (f" {data_scope['note']}" if data_scope else "")
         ),
     }

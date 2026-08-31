@@ -1649,6 +1649,101 @@ def parse_lerobot_info(info_path: str) -> dict[str, Any]:
         return {}
 
 
+def parse_block_declaration(info: dict[str, Any], column: str) -> dict[str, Any] | None:
+    """解析向量列的"块分解"声明（如 body_24x7 = 24 块 × 7DoF）。
+
+    仅当数据集**显式声明**且自洽时才认定：names 为单一组合名且匹配 `NxM` 模式，
+    且 N*M == shape[0]。不做任何形态猜测——不满足即返回 None（调用方不得推测）。
+
+    Args:
+        info: parse_lerobot_info 的返回。
+        column: 列名。
+
+    Returns:
+        dict，含 block_count / dof_per_block / declared_name；无声明返回 None。
+    """
+    import re as _re
+
+    semantics = info.get("column_semantics")
+    if not isinstance(semantics, dict):
+        return None
+    spec = semantics.get(str(column))
+    if not isinstance(spec, dict):
+        return None
+    names = spec.get("names")
+    shape = spec.get("shape")
+    if not isinstance(names, list) or len(names) != 1:
+        return None  # 逐维声明（如 head_pose）或无名 → 不是块分解声明。
+    if not isinstance(shape, list) or not shape or not isinstance(shape[0], int):
+        return None
+    m = _re.fullmatch(r"([A-Za-z0-9_]+)_(\d+)x(\d+)", str(names[0]))
+    if not m:
+        return None
+    blocks, dof = int(m.group(2)), int(m.group(3))
+    if blocks * dof != shape[0]:
+        return None  # 声明不自洽 → 不采信（不猜测）。
+    return {
+        "block_count": blocks,
+        "dof_per_block": dof,
+        "declared_name": str(names[0]),
+        "declaration_source": "meta/info.json features.names（数据集声明）",
+    }
+
+
+def infer_dof_order(info: dict[str, Any], column: str, dof: int) -> dict[str, Any]:
+    """推断块内 dof 维的排列顺序（参照同数据集的逐维声明列，如 head_pose）。
+
+    full_body/left_hand 的 names 只有组合名（body_24x7），**没有逐维名**；而同一
+    数据集的 head_pose 有逐维声明 ['px','py','pz','qx','qy','qz','qw']。因此块内
+    "前 3 位置 + 后 4 四元数" 属**参照推断**（有依据但非本列直接声明），必须标注。
+
+    Args:
+        info: parse_lerobot_info 的返回。
+        column: 列名（用于说明）。
+        dof: 每块自由度数。
+
+    Returns:
+        dict，含 order（维度角色列表）、source（来源说明）、is_inferred（是否推断）。
+    """
+    # 优先：本列自身有逐维声明 → 直接采用（非推断）。
+    own = column_dimension_names(info, column)
+    if own and len(own) == dof:
+        return {
+            "order": list(own),
+            "source": f"本列 meta 声明（{column}.names）",
+            "is_inferred": False,
+        }
+    # 次选：参照同数据集中 dof 相同且带逐维名的列（如 head_pose 7 维）。
+    semantics = info.get("column_semantics")
+    if isinstance(semantics, dict):
+        for other, spec in semantics.items():
+            if str(other) == str(column) or not isinstance(spec, dict):
+                continue
+            other_names = spec.get("names")
+            other_shape = spec.get("shape")
+            if (
+                isinstance(other_names, list)
+                and len(other_names) == dof
+                and isinstance(other_shape, list)
+                and other_shape
+                and other_shape[0] == dof
+            ):
+                return {
+                    "order": list(other_names),
+                    "source": (
+                        f"参照同数据集 {other} 的逐维声明推断"
+                        "（本列 names 仅为组合名，非直接声明）"
+                    ),
+                    "is_inferred": True,
+                }
+    # 无依据：返回占位，标注未声明（调用方不得当作位置/四元数解读）。
+    return {
+        "order": [f"dim_{i}" for i in range(dof)],
+        "source": "数据集未声明维度顺序（占位，不得解读为位置/四元数）",
+        "is_inferred": True,
+    }
+
+
 def parse_lerobot_stats(stats_path: str) -> dict[str, Any]:
     """解析 LeRobot meta/stats.json 的每列统计量（确定性，直接采用不重算）。
 
