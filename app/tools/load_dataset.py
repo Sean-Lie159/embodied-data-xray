@@ -181,6 +181,74 @@ def _read_table_columns(path: Path) -> list[str] | None:
         return None
 
 
+# file_survey 序列化体积上限（字符数）；超出则压缩为分组计数摘要。
+_MAX_SURVEY_CHARS = 50_000
+
+
+def _compress_file_survey(survey: dict[str, Any]) -> str | None:
+    """file_survey 体积护栏：超限时压缩为分组计数摘要，避免撑爆模型上下文。
+
+    压缩策略：保留 total_files / ext_dist（截断）/ 各组**计数**（total/shown/
+    truncated），丢弃具体路径列表与 subdirs。返回说明文本（供 note 字段）；
+    未超限返回 None。
+
+    Args:
+        survey: file_survey（原地压缩）。
+
+    Returns:
+        压缩说明文本；未压缩返回 None。
+    """
+    import json as _json
+
+    def _size(obj: Any) -> int:
+        try:
+            return len(_json.dumps(obj, ensure_ascii=False, default=str))
+        except Exception:  # noqa: BLE001
+            return _MAX_SURVEY_CHARS + 1
+
+    if _size(survey) <= _MAX_SURVEY_CHARS:
+        return None
+
+    # 渐进降级：先砍掉最不关键的 subdirs / ext_dist（保留路径），仍超限才砍路径列表。
+    # 这样中等规模目录（几百个文件）能保留具体路径，只有极端情况才退化为纯计数。
+    if _size(survey) > _MAX_SURVEY_CHARS:
+        survey.pop("subdirs", None)
+        survey["note"] = "子目录清单已省略（文件清单体积接近上限）。"
+    if _size(survey) > _MAX_SURVEY_CHARS:
+        survey.pop("ext_dist", None)
+        survey["note"] = "扩展名分布已省略（文件清单体积超过上限）。"
+    if _size(survey) <= _MAX_SURVEY_CHARS:
+        return survey.get("note")
+
+    compressed: dict[str, Any] = {
+        "total_files": survey.get("total_files"),
+        "max_listed_per_group": survey.get("max_listed_per_group"),
+        "excluded_dirs": survey.get("excluded_dirs", []),
+    }
+    # 各组只保留计数，不保留路径。
+    for key in ("tables", "videos", "audios", "images", "cals", "others"):
+        view = survey.get(key)
+        if isinstance(view, dict):
+            compressed[key] = {
+                "total": view.get("total"),
+                "shown": view.get("shown"),
+                "truncated": view.get("truncated"),
+                "paths": [],  # 已压缩，路径列表丢弃
+            }
+    # ext_dist 只保留数量最多的若干项。
+    ext_dist = survey.get("ext_dist") or {}
+    if isinstance(ext_dist, dict):
+        top = sorted(ext_dist.items(), key=lambda kv: -kv[1])[:20]
+        compressed["ext_dist_top"] = dict(top)
+    compressed["compressed"] = True
+    survey.clear()
+    survey.update(compressed)
+    return (
+        "文件清单因体积超限已压缩为分组计数摘要（各组路径未列出，计数仍完整）；"
+        "如需查看具体文件，请缩小目录范围或改用子目录加载。"
+    )
+
+
 def _read_table_nrows(path: Path) -> int | None:
     """只读表格行数（不读全量数据），用于主表选择评分。
 
@@ -275,13 +343,14 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     probe_errors: list[dict[str, Any]] = []  # 探测失败的文件清单
     # 主表候选：（路径、列名、原始嗅探、分类结果、行数、列数）。
     candidates: list[dict[str, Any]] = []
-    # 表格候选 = probe["tables"]（csv/parquet） + cals 中**非标定**的 .json
-    # （nuScenes 等数据表 JSON；标定 JSON 仍归 cals，不作为数据表流登记）。
+    # 表格候选 = probe tables（csv/parquet，用完整路径逐条探测） + cals 中**非标定**
+    # 的 .json（nuScenes 等数据表 JSON；标定 JSON 仍归 cals，不作为数据表流登记）。
+    # 注意：探测必须用完整清单，不能只探测返回里截断的前若干条。
     table_candidates = [
-        t for t in probe["tables"]
+        t for t in _sniffing.probe_full_paths(probe, "tables")
         if not _sniffing._is_dataset_metadata_file(t)
     ]
-    for p_str in probe["cals"]:
+    for p_str in _sniffing.probe_full_paths(probe, "cals"):
         if Path(p_str).suffix.lower() != ".json":
             continue
         if _sniffing._is_dataset_metadata_file(p_str):
@@ -420,7 +489,7 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     # 内容指纹（fingerprint_calibration）确认，二者任一命中即判为标定。
     calib_detected = False
     calib_detail: list[dict[str, Any]] = []
-    for p_str in probe["cals"]:
+    for p_str in _sniffing.probe_full_paths(probe, "cals"):
         try:
             obj = _parse_calibration(Path(p_str))
             is_cal = _sniffing.is_calibration_file(obj) or bool(
@@ -446,7 +515,7 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     video_files: list[str] = []
     video_meta: list[dict[str, Any]] = []
     ffprobe_degraded: str | None = None
-    for p_str in probe["videos"]:
+    for p_str in _sniffing.probe_full_paths(probe, "videos"):
         video_files.append(p_str)
         try:
             meta = _sniffing.probe_video(p_str)
@@ -464,9 +533,9 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     # 音频/图片：只登记路径与格式，不读取内容（覆盖全部文件）。
     audio_meta: list[dict[str, Any]] = []
     image_meta: list[dict[str, Any]] = []
-    for p_str in probe["audios"]:
+    for p_str in _sniffing.probe_full_paths(probe, "audios"):
         audio_meta.append({"file": p_str, "format": Path(p_str).suffix.lstrip(".").lower()})
-    for p_str in probe["images"]:
+    for p_str in _sniffing.probe_full_paths(probe, "images"):
         image_meta.append({"file": p_str, "format": Path(p_str).suffix.lstrip(".").lower()})
 
     caps_result = _sniffing.build_capabilities(probe, table_sniffs)
@@ -480,7 +549,9 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         if isinstance(nf, int) and nf > 0:
             video_frame_counts[v.get("file", "")] = nf
     stream_pairs = _sniffing.pair_streams(
-        probe["videos"], probe["tables"], probe["audios"],
+        _sniffing.probe_full_paths(probe, "videos"),
+        _sniffing.probe_full_paths(probe, "tables"),
+        _sniffing.probe_full_paths(probe, "audios"),
         video_frame_counts=video_frame_counts,
     )
     stream_pairs.extend(_sniffing.detect_episode_mirrors(probe))
@@ -494,7 +565,10 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     dataset_metadata: list[str] = []
     if _sniffing.detect_dataset_format(probe) == "lerobot":
         meta_files = [
-            p for p in probe["cals"] + probe["tables"]
+            p for p in (
+                _sniffing.probe_full_paths(probe, "cals")
+                + _sniffing.probe_full_paths(probe, "tables")
+            )
             if _sniffing._is_dataset_metadata_file(p)
         ]
         info_path = next((p for p in meta_files if Path(p).name == "info.json"), None)
@@ -572,22 +646,33 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     context.dataset_id = dataset_id
     context.df = main_table
 
+    file_survey: dict[str, Any] = {
+        "total_files": probe["total_files"],
+        "ext_dist": probe["ext_dist"],
+        "subdirs": probe["subdirs"][:20],
+        # 文件清单按类型分组。计数与分类完整（每个文件都归类），但单组路径最多列
+        # max_listed_per_group 条并标注 truncated——不静默抽样，也不把数万条路径
+        # 灌进上下文（曾导致超百万 token 触发模型上下文超限）。
+        "max_listed_per_group": probe.get("max_listed_per_group"),
+        "excluded_dirs": probe.get("excluded_dirs", []),
+        "tables": probe["tables"],
+        "videos": probe["videos"],
+        "audios": probe["audios"],
+        "images": probe["images"],
+        "cals": probe["cals"],
+        "others": probe["others"],
+    }
+    # 体积护栏：极端情况下（如含超长路径的巨型目录）压缩为分组计数摘要，
+    # 保证返回不会撑爆上下文。
+    survey_note = _compress_file_survey(file_survey)
+    if survey_note:
+        file_survey["note"] = survey_note
+
     result: dict[str, Any] = {
         "success": True,
         "dataset_id": dataset_id,
         "kind": "directory",
-        "file_survey": {
-            "total_files": probe["total_files"],
-            "ext_dist": probe["ext_dist"],
-            "subdirs": probe["subdirs"][:20],
-            # 完整文件清单，按类型分组（全部路径，不抽样、不省略）。
-            "tables": probe["tables"],
-            "videos": probe["videos"],
-            "audios": probe["audios"],
-            "images": probe["images"],
-            "cals": probe["cals"],
-            "others": probe["others"],
-        },
+        "file_survey": file_survey,
         "capabilities": caps_result["capabilities"],
         "guessed_type": caps_result["guessed_type"],
         "guessed_type_confidence": caps_result["guessed_type_confidence"],
@@ -633,6 +718,26 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         msg_parts.append(
             f"{len(probe_errors)} 个文件探测失败（详见 probe_errors），已跳过并继续其余文件。"
         )
+    # 透明告知：默认排除了版本控制/缓存等非数据目录。
+    excluded = probe.get("excluded_dirs") or []
+    if excluded:
+        msg_parts.append(
+            f"已跳过 {len(excluded)} 个非数据目录（如 .git/__pycache__/node_modules 等，"
+            "详见 file_survey.excluded_dirs）。"
+        )
+    # 透明告知：清单被截断/压缩（不静默）。
+    truncated_groups = [
+        k for k in ("tables", "videos", "audios", "images", "cals", "others")
+        if isinstance(probe.get(k), dict) and probe[k].get("truncated")
+    ]
+    if truncated_groups:
+        msg_parts.append(
+            f"文件清单中 {len(truncated_groups)} 个分组超过展示上限"
+            f"（每组最多 {probe.get('max_listed_per_group')} 条路径），已截断但计数完整，"
+            "详见 file_survey 各组的 total/shown/truncated。"
+        )
+    if file_survey.get("note"):
+        msg_parts.append(file_survey["note"])
     result["user_message"] = " ".join(msg_parts)
     return result
 

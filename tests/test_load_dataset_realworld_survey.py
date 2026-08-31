@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 from app.agent.context import RunContext
-from app.tools._sniffing import probe_directory
+from app.tools._sniffing import probe_directory, probe_full_paths
 from app.tools.load_dataset import load_dataset_impl
 
 # 真实采集目录的文件名清单（内容可合成，文件名必须一致）。
@@ -84,22 +84,31 @@ def test_probe_directory_lists_all_18_files_grouped() -> None:
     # 总数应为 18。
     assert probe["total_files"] == 18
 
-    # 所有 18 个文件名应出现在某个分组列表中（路径完整，取 basename 比较）。
+    # 所有 18 个文件名应出现在某个分组的**完整**清单中（不被静默抽样）。
+    def full(group: str) -> list[str]:
+        return probe_full_paths(probe, group)
+
     all_listed = (
-        probe["tables"] + probe["videos"] + probe["audios"]
-        + probe["images"] + probe["cals"] + probe["others"]
+        full("tables") + full("videos") + full("audios")
+        + full("images") + full("cals") + full("others")
     )
     listed_names = {Path(p).name for p in all_listed}
     assert listed_names == set(_REAL_FILES)
 
-    # 按类型分组的期望分布。
-    assert Path(probe["tables"][0]).name if probe["tables"] else None  # 列表非空
-    assert len(probe["videos"]) == 3   # ctrl/rgb/tracking.mp4
-    assert len(probe["audios"]) == 1   # audio.m4a
-    assert len(probe["images"]) == 1   # 信息.jpg
-    assert len(probe["cals"]) == 4     # 4 个 json（含标定键）
+    # 按类型分组的期望分布（用完整清单计数）。
+    assert Path(full("tables")[0]).name if full("tables") else None  # 列表非空
+    assert len(full("videos")) == 3   # ctrl/rgb/tracking.mp4
+    assert len(full("audios")) == 1   # audio.m4a
+    assert len(full("images")) == 1   # 信息.jpg
+    assert len(full("cals")) == 4     # 4 个 json（含标定键）
     # csv 共 9 个表格。
-    assert len(probe["tables"]) == 9
+    assert len(full("tables")) == 9
+
+    # 小目录（18 个文件）不应触发截断：视图 paths 与完整清单一致，truncated=False。
+    for group in ("tables", "videos", "audios", "images", "cals", "others"):
+        view = probe[group]
+        assert view["truncated"] is False, f"{group} 不应截断（仅 {view['total']} 条）"
+        assert view["paths"] == full(group)
 
 
 def test_load_directory_survey_complete_and_streams_full() -> None:
@@ -115,12 +124,14 @@ def test_load_directory_survey_complete_and_streams_full() -> None:
     survey = result["file_survey"]
     assert survey["total_files"] == 18
 
-    # file_survey 各分组非空且覆盖全部文件。
+    # file_survey 各分组非空且覆盖全部文件（18 个文件未超限，视图 paths 即完整清单）。
     listed = (
-        survey["tables"] + survey["videos"] + survey["audios"]
-        + survey["images"] + survey["cals"] + survey["others"]
+        survey["tables"]["paths"] + survey["videos"]["paths"] + survey["audios"]["paths"]
+        + survey["images"]["paths"] + survey["cals"]["paths"] + survey["others"]["paths"]
     )
     assert {Path(p).name for p in listed} == set(_REAL_FILES)
+    # 未截断：计数与完整清单一致。
+    assert survey["tables"]["truncated"] is False
 
     # 流登记表应覆盖：9 表格 + 3 视频 + 1 音频 + 1 图片 = 14 条。
     streams = ctx.meta["streams"]

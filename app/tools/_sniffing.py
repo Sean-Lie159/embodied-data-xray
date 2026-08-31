@@ -184,72 +184,150 @@ def _is_system_file(path: Path) -> bool:
     return False
 
 
-def probe_directory(root: Path) -> dict[str, Any]:
-    """递归普查目录，返回完整文件清单（按类型分组）与扩展名分布。
+# 默认排除的目录名（版本控制 / 缓存 / 依赖等非数据目录）。这些目录不是"数据角色"，
+# 普查它们只会产生噪音（如 .git/objects 可达数万文件，撑爆上下文）。
+_EXCLUDED_DIR_NAMES = {
+    ".git", ".svn", ".hg", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", "node_modules", ".venv", "venv", ".idea", ".vscode",
+    ".DS_Store",
+}
+# 文件清单每组最多列出的路径条数（超出则截断并声明，避免上下文爆炸）。
+_MAX_LISTED_PER_GROUP = 50
 
-    返回完整路径清单、不抽样、不省略；所有列表按相对路径排序，保证同一目录
-    两次加载结果完全一致（确定性）。
+
+def probe_directory(root: Path, include_hidden: bool = False) -> dict[str, Any]:
+    """递归普查目录，返回文件清单（按类型分组）与扩展名分布。
+
+    普查完整性：每个文件都被归类到某个类型组；分组计数准确；**不静默抽样**——
+    单组路径超过 _MAX_LISTED_PER_GROUP 时截断并显式标注 truncated/shown/total。
+
+    默认跳过版本控制与缓存目录（.git/__pycache__/node_modules 等）：它们不是数据
+    角色，且可达数万文件（曾导致返回百万 token 撑爆上下文）。如需完整普查（含
+    这些目录），传 include_hidden=True。
 
     Args:
         root: 数据集根目录。
+        include_hidden: 是否纳入默认排除的目录（默认 False）。
 
     Returns:
-        dict，含 total_files、ext_dist（扩展名→数量）、subdirs（子目录清单）、
-        以及按类型分组的完整文件路径清单：tables / videos / audios / images /
-        cals（标定候选）/ others（其余）。所有路径均为完整路径字符串，按相对
-        root 的顺序排序，保证确定性。
+        dict，含 total_files、ext_dist、subdirs、excluded_dirs（被排除的目录名
+        清单）、以及按类型分组的路径清单（每组可能为截断视图，见各组 truncated）。
     """
     ext_counter: Counter[str] = Counter()
     subdirs: list[str] = []
+    excluded_dirs: list[str] = []
     grouped: dict[str, list[Path]] = {
         "tables": [], "videos": [], "audios": [], "images": [],
         "cals": [], "others": [],
     }
     total_files = 0
-    for item in root.rglob("*"):
-        if item.is_dir():
-            subdirs.append(str(item.relative_to(root)))
-        elif item.is_file():
-            # 桌面/系统文件直接跳过，不参与任何探测（不崩、不进清单）。
-            if _is_system_file(item):
-                continue
-            ext = item.suffix.lower()
-            total_files += 1
-            ext_counter[ext] += 1
-            # 标定候选（json/yaml）优先归入 cals，避免被当作数据表。.json 既可能是
-            # 标定也可能是数据表（nuScenes 等）——由 load_dataset 在标定判定后把
-            # 非标定 JSON 补入 tables 探测（见 _load_directory_impl）。
-            if ext in _CALIB_EXTS:
-                grouped["cals"].append(item)
-            elif ext in _TABLE_EXTS:
-                grouped["tables"].append(item)
-            elif ext in _VIDEO_EXTS:
-                grouped["videos"].append(item)
-            elif ext in _AUDIO_EXTS:
-                grouped["audios"].append(item)
-            elif ext in _IMAGE_EXTS:
-                grouped["images"].append(item)
-            else:
-                grouped["others"].append(item)
+
+    def _walk(directory: Path) -> None:
+        """递归遍历；遇到排除目录即剪枝（不深入、不枚举其子孙）。"""
+        nonlocal total_files
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return
+        for item in entries:
+            if item.is_dir():
+                rel = str(item.relative_to(root))
+                # 默认排除非数据目录：记录排除根（不深入），避免枚举 .git 内部数万对象。
+                if not include_hidden and item.name in _EXCLUDED_DIR_NAMES:
+                    excluded_dirs.append(rel)
+                    continue
+                subdirs.append(rel)
+                _walk(item)
+            elif item.is_file():
+                if _is_system_file(item):
+                    continue
+                _classify_file(item)
+
+    def _classify_file(item: Path) -> None:
+        nonlocal total_files
+        ext = item.suffix.lower()
+        total_files += 1
+        ext_counter[ext] += 1
+        # 标定候选（json/yaml）优先归入 cals，避免被当作数据表。.json 既可能是
+        # 标定也可能是数据表（nuScenes 等）——由 load_dataset 在标定判定后把
+        # 非标定 JSON 补入 tables 探测（见 _load_directory_impl）。
+        if ext in _CALIB_EXTS:
+            grouped["cals"].append(item)
+        elif ext in _TABLE_EXTS:
+            grouped["tables"].append(item)
+        elif ext in _VIDEO_EXTS:
+            grouped["videos"].append(item)
+        elif ext in _AUDIO_EXTS:
+            grouped["audios"].append(item)
+        elif ext in _IMAGE_EXTS:
+            grouped["images"].append(item)
+        else:
+            grouped["others"].append(item)
+
+    _walk(root)
 
     # 固定排序（按相对 root 的路径），再转完整路径字符串：保证确定性。
     subdirs.sort()
     for key in grouped:
         grouped[key].sort(key=lambda p: str(p.relative_to(root)))
-    for key in grouped:
-        grouped[key] = [str(p) for p in grouped[key]]
+
+    # 每组路径转为"截断视图"：总数准确，超出上限时标注 truncated（不静默抽样）。
+    group_views: dict[str, dict[str, Any]] = {}
+    for key, paths in grouped.items():
+        total = len(paths)
+        shown = [str(p) for p in paths[:_MAX_LISTED_PER_GROUP]]
+        group_views[key] = {
+            "total": total,
+            "shown": len(shown),
+            "truncated": total > _MAX_LISTED_PER_GROUP,
+            "paths": shown,
+        }
+
+    # 完整清单（供代码内部探测使用，不进返回给模型的字段，避免上下文爆炸）。
+    full_paths = {
+        key: [str(p) for p in paths] for key, paths in grouped.items()
+    }
 
     return {
         "total_files": total_files,
         "ext_dist": dict(sorted(ext_counter.items())),
         "subdirs": subdirs,
-        "tables": grouped["tables"],
-        "videos": grouped["videos"],
-        "audios": grouped["audios"],
-        "images": grouped["images"],
-        "cals": grouped["cals"],
-        "others": grouped["others"],
+        "excluded_dirs": sorted(set(excluded_dirs)),
+        "max_listed_per_group": _MAX_LISTED_PER_GROUP,
+        # 公开视图（截断，供模型/返回）；完整路径见 _full。
+        "tables": group_views["tables"],
+        "videos": group_views["videos"],
+        "audios": group_views["audios"],
+        "images": group_views["images"],
+        "cals": group_views["cals"],
+        "others": group_views["others"],
+        "_full": full_paths,
     }
+
+
+def probe_full_paths(probe: dict[str, Any], group: str) -> list[str]:
+    """取某类型组的**完整**路径列表（供代码探测使用，不受返回截断影响）。
+
+    Args:
+        probe: probe_directory 的返回。
+        group: 组名（tables/videos/audios/images/cals/others）。
+
+    Returns:
+        完整路径列表；缺失返回 []。
+    """
+    full = probe.get("_full")
+    if isinstance(full, dict):
+        paths = full.get(group)
+        if isinstance(paths, list):
+            return list(paths)
+    # 兜底：无 _full 时用视图 paths（旧结构或已截断）。
+    view = probe.get(group)
+    if isinstance(view, dict):
+        paths = view.get("paths")
+        return list(paths) if isinstance(paths, list) else []
+    if isinstance(view, list):
+        return list(view)
+    return []
 
 
 # --- 第 1 层：词典先验（降级为线索） ----------------------------------------
@@ -1402,7 +1480,11 @@ def _is_lerobot_layout(probe: dict[str, Any]) -> bool:
     Returns:
         是 LeRobot v2 布局返回 True。
     """
-    paths = probe["tables"] + probe["videos"] + probe["cals"]
+    paths = (
+        probe_full_paths(probe, "tables")
+        + probe_full_paths(probe, "videos")
+        + probe_full_paths(probe, "cals")
+    )
     rel = [Path(p).as_posix() for p in paths]
     has_info = any("/meta/info.json" in p or p.endswith("meta/info.json") for p in rel)
     has_data_chunk = any("/data/chunk-" in p for p in rel)
@@ -1661,8 +1743,9 @@ def detect_episode_mirrors(probe: dict[str, Any]) -> list[dict[str, Any]]:
 
     from app.tools import _data_access
 
-    # episode JSON 可能登记在 cals（json 路由），parquet 在 tables；都纳入。
-    all_files = probe.get("tables", []) + probe.get("cals", [])
+    # episode JSON 可能登记在 cals（json 路由），parquet 在 tables；都纳入（用完整
+    # 路径，不受返回截断影响）。
+    all_files = probe_full_paths(probe, "tables") + probe_full_paths(probe, "cals")
     ep_json = {}
     ep_parquet = {}
     for t in all_files:
@@ -1713,10 +1796,10 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
     Returns:
         dict，含 capabilities、guessed_type、guessed_type_confidence、imu_confidence。
     """
-    has_video = len(probe["videos"]) > 0 or any(
+    has_video = len(probe_full_paths(probe, "videos")) > 0 or any(
         v in _VIDEO_EXTS for v in probe["ext_dist"]
     )
-    has_audio = len(probe["audios"]) > 0
+    has_audio = len(probe_full_paths(probe, "audios")) > 0
 
     # 汇总表格流 kind。
     kinds = [s.get("kind") for s in table_sniffs]
@@ -1738,7 +1821,7 @@ def build_capabilities(probe: dict[str, Any], table_sniffs: list[dict[str, Any]]
         "has_imu": imu_present,
         "imu_axes": imu_axes,
         "has_force": force_present,
-        "has_calibration": len(probe["cals"]) > 0,
+        "has_calibration": len(probe_full_paths(probe, "cals")) > 0,
         "has_actions": actions_present,
         "has_hand_tracking": hand_present,
         "has_pose": pose_present,
