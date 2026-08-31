@@ -59,6 +59,13 @@ def profile_data_impl(context: RunContext, max_unique: int = 20, table: str | No
     df = resolved["df"]
     dataset = resolved["dataset"]
     table_name = resolved["table_name"]
+    # 数据集声明的语义元数据（LeRobot meta/*.json，确定性解析结果）：
+    # 列维度名（features.names）与每列统计量（stats.json），供直接引用而非推测。
+    lerobot_info = context.meta.get("lerobot_info") or {}
+    lerobot_stats = context.meta.get("lerobot_stats") or {}
+    stats_features = lerobot_stats.get("features")
+    stats_features = stats_features if isinstance(stats_features, dict) else {}
+
     columns: list[dict[str, Any]] = []
     for name in df.columns:
         series = df[name]
@@ -79,6 +86,20 @@ def profile_data_impl(context: RunContext, max_unique: int = 20, table: str | No
                 str(v) for v in series.dropna().head(max_unique).tolist()
             ],
         }
+
+        # 列维度名：以数据集声明为准（有则引用，无则不得推测）。
+        dim_names = _column_dimension_names(lerobot_info, str(name))
+        if dim_names:
+            col["dimension_names"] = dim_names
+            col["dimension_source"] = "meta/info.json features（数据集声明）"
+            if isinstance(lerobot_info.get("column_semantics", {}).get(str(name)), dict):
+                col["declared_shape"] = lerobot_info["column_semantics"][str(name)].get("shape")
+
+        # 数据集自带统计量（stats.json）：直接采用，避免重算。
+        col_stats = stats_features.get(str(name))
+        if isinstance(col_stats, dict):
+            col["dataset_stats"] = col_stats
+            col["dataset_stats_source"] = "meta/stats.json"
 
         if series.dtype.kind in "iufc":  # 数值列（int/uint/float/complex）
             desc = series.describe()
@@ -128,6 +149,23 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _column_dimension_names(lerobot_info: dict[str, Any], column: str) -> list[str] | None:
+    """取列各维度的权威名称（来自 LeRobot meta/info.json 的 features.names）。
+
+    Args:
+        lerobot_info: parse_lerobot_info 的返回。
+        column: 列名。
+
+    Returns:
+        维度名列表；数据集未声明则返回 None（此时工具不得推测维度含义）。
+    """
+    if not lerobot_info:
+        return None
+    from app.tools._sniffing import column_dimension_names
+
+    return column_dimension_names(lerobot_info, column)
 
 
 def _vector_column_stats(series) -> dict[str, Any] | None:

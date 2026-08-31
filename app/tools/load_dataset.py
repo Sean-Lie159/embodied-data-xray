@@ -485,20 +485,25 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     )
     stream_pairs.extend(_sniffing.detect_episode_mirrors(probe))
 
-    # LeRobot 元数据（仅解析 meta/info.json 的 fps/features，不做深度解析）。
+    # LeRobot 元数据：确定性解析 meta/info.json（fps / features 列语义 / hand_tracked /
+    # robot_type / coordinate_frame / task / total_frames / source）与 meta/stats.json
+    # （每列统计量，直接采用不重算）。解析结果供 profile_data 等引用维度名，
+    # 避免"疑为/未验证"式推测。
     lerobot_info: dict[str, Any] = {}
+    lerobot_stats: dict[str, Any] = {}
     dataset_metadata: list[str] = []
     if _sniffing.detect_dataset_format(probe) == "lerobot":
-        info_path = next(
-            (p for p in probe["cals"] + probe["tables"] if _sniffing._is_dataset_metadata_file(p) and Path(p).name == "info.json"),
-            None,
-        )
-        if info_path:
-            lerobot_info = _sniffing.parse_lerobot_info(info_path)
-        dataset_metadata = [
-            p for p in probe["tables"] + probe["cals"]
+        meta_files = [
+            p for p in probe["cals"] + probe["tables"]
             if _sniffing._is_dataset_metadata_file(p)
         ]
+        info_path = next((p for p in meta_files if Path(p).name == "info.json"), None)
+        if info_path:
+            lerobot_info = _sniffing.parse_lerobot_info(info_path)
+        stats_path = next((p for p in meta_files if Path(p).name == "stats.json"), None)
+        if stats_path:
+            lerobot_stats = _sniffing.parse_lerobot_stats(stats_path)
+        dataset_metadata = meta_files
     has_imu_6axis_pair = any(p["type"] == "imu_6axis" for p in stream_pairs)
     caps_result["capabilities"]["has_imu_6axis_pair"] = has_imu_6axis_pair
     caps_result["capabilities"]["has_media_metainfo_pair"] = any(
@@ -533,8 +538,10 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
         ),
         # 流配对规则结果（mp4↔metainfo、accel+gyro=六轴IMU、episode mirror）。
         "stream_pairs": stream_pairs,
-        # LeRobot 元数据（info.json 的 fps/features）与数据集元数据文件清单。
+        # LeRobot 语义元数据：info.json（fps/列语义/hand_tracked/robot_type/
+        # coordinate_frame/task/total_frames/source）与 stats.json（每列统计量）。
         "lerobot_info": lerobot_info,
+        "lerobot_stats": lerobot_stats,
         "dataset_metadata": dataset_metadata,
         # 探测失败的文件清单（兜底：单文件失败不中断，记录原因供定位）。
         "probe_errors": probe_errors,

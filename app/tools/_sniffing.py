@@ -1511,15 +1511,22 @@ def _is_dataset_metadata_file(path: str) -> bool:
 
 
 def parse_lerobot_info(info_path: str) -> dict[str, Any]:
-    """解析 LeRobot info.json 的 fps / video.fps / features（确定性解释用）。
+    """解析 LeRobot meta/info.json 的语义元数据（确定性解析，仅供工具引用）。
 
-    只提取 fps 与 features 元信息，不做深度解析。
+    提取内容（全部为确定性字段，不含推测）：
+    - fps / video.fps：帧率（fps 为视频帧率；数据表降采样后频率可能不同）；
+    - features：展开为"列名 → dtype/shape/names"的列语义表（names 是该列各
+      维度的权威定义，如 head_pose 的 ['px','py','pz','qx','qy','qz','qw']）；
+    - hand_tracked / robot_type / coordinate_frame / task / total_frames /
+      total_episodes / source：数据集级语义（hand_tracked 可直接终结"手部数据
+      是否采集"的推测）。
 
     Args:
         info_path: meta/info.json 路径。
 
     Returns:
-        dict，含 fps、video_fps、features（可能存在）。
+        dict，含 fps、video_fps、features（原始）、column_semantics（列语义表）、
+        以及数据集级语义字段；解析失败返回 {}。
     """
     import json as _json
 
@@ -1533,11 +1540,80 @@ def parse_lerobot_info(info_path: str) -> dict[str, Any]:
         video = obj.get("video") if isinstance(obj.get("video"), dict) else None
         if video and "fps" in video:
             result["video_fps"] = video.get("fps")
-        if "features" in obj:
-            result["features"] = obj.get("features")
+
+        # features → 列语义表（列名 → dtype/shape/names）。
+        features = obj.get("features")
+        if isinstance(features, dict):
+            result["features"] = features
+            semantics: dict[str, dict[str, Any]] = {}
+            for col, spec in features.items():
+                if not isinstance(spec, dict):
+                    continue
+                names = spec.get("names")
+                semantics[str(col)] = {
+                    "dtype": spec.get("dtype"),
+                    "shape": spec.get("shape"),
+                    "names": list(names) if isinstance(names, (list, tuple)) else None,
+                }
+            result["column_semantics"] = semantics
+
+        # 数据集级语义字段（确定性，直接取）。
+        for key in ("hand_tracked", "robot_type", "coordinate_frame", "task",
+                    "total_frames", "total_episodes", "source", "repo_id"):
+            if key in obj:
+                result[key] = obj.get(key)
         return result
     except Exception:  # noqa: BLE001
         return {}
+
+
+def parse_lerobot_stats(stats_path: str) -> dict[str, Any]:
+    """解析 LeRobot meta/stats.json 的每列统计量（确定性，直接采用不重算）。
+
+    stats.json 结构为 {"computed_on": ..., "features": {列名: {min/max/mean/std...}}}。
+    直接采用可避免重复计算，且比本地重算更权威（由数据集生产者计算）。
+
+    Args:
+        stats_path: meta/stats.json 路径。
+
+    Returns:
+        dict，含 computed_on 与 features（列名 → 统计量）；解析失败返回 {}。
+    """
+    import json as _json
+
+    try:
+        obj = _json.loads(Path(stats_path).read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return {}
+        result: dict[str, Any] = {}
+        if "computed_on" in obj:
+            result["computed_on"] = obj.get("computed_on")
+        features = obj.get("features")
+        if isinstance(features, dict):
+            result["features"] = features
+        return result
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def column_dimension_names(info: dict[str, Any], column: str) -> list[str] | None:
+    """取某列各维度的权威名称（来自 info.json 的 features.names）。
+
+    Args:
+        info: parse_lerobot_info 的返回。
+        column: 列名。
+
+    Returns:
+        维度名列表；无声明返回 None（此时不得推测维度含义）。
+    """
+    semantics = info.get("column_semantics")
+    if not isinstance(semantics, dict):
+        return None
+    spec = semantics.get(str(column))
+    if not isinstance(spec, dict):
+        return None
+    names = spec.get("names")
+    return list(names) if isinstance(names, list) else None
 
 
 def explain_fps_mismatch(table_rows: int, video_frames: int, info: dict[str, Any]) -> dict[str, Any] | None:
