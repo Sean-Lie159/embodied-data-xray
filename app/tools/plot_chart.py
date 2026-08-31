@@ -141,12 +141,21 @@ def plot_chart_impl(
             }
         title_safe = _safe_title(title, "trajectory")
         path = _output_path(context, chart_type)
+        # 注入数据集声明的语义元数据，供骨骼块轨迹取维度名（不推测）。
+        try:
+            traj_df.attrs["lerobot_info"] = context.meta.get("lerobot_info") or {}
+        except Exception:  # noqa: BLE001
+            pass
         result = _plot_trajectory_to_file(traj_df, title_safe, path)
         if result is None:
             return {
                 "success": False, "error": "not_applicable",
-                "reason": "无关节列（qpos/joint）也无末端位姿列（ee/tcp/pose）",
-                "user_message": "绘制 trajectory 需要关节列（qpos/joint）或末端位姿列（ee/tcp/pose）。当前数据集两类列都没有，不适用。建议改用 line/scatter/histogram。",
+                "reason": "无关节列（qpos/joint）、无末端位姿列（ee/tcp/pose）、也无数据集声明的骨骼块列",
+                "user_message": (
+                    "绘制 trajectory 需要关节列（qpos/joint）、末端位姿列（ee/tcp/pose），"
+                    "或数据集声明块分解的骨骼位姿列（如 meta/info.json 中 names=xxx_NxM）。"
+                    "当前数据集三类列都没有，不适用。建议改用 line/scatter/histogram。"
+                ),
                 "dataset": dataset_id,
                 "suggested_charts": ["line", "scatter", "histogram"],
             }
@@ -342,9 +351,134 @@ def _dimension_source_for(df, column: str) -> str:
     return "数据集未声明维度名，使用 col[i] 占位"
 
 
+def _skeleton_trajectory_column(df) -> dict[str, Any] | None:
+    """找可用于骨骼轨迹绘制的列：向量列 + 数据集声明的块分解（含 3 位置维）。
+
+    仅当 meta/info.json 声明了块分解（names=xxx_NxM 且 N*M==shape[0]）时认定，
+    不猜测；向量矩阵解析失败则返回 None（由调用方回退其他轨迹类型）。
+
+    Args:
+        df: 数据表（需带 attrs["lerobot_info"]）。
+
+    Returns:
+        dict，含 column / mat（n_rows, dims）/ blocks / dof / dim_order /
+        order_source / pos_idx；无可用列返回 None。
+    """
+    info = df.attrs.get("lerobot_info") or {}
+    if not info:
+        return None
+    for col in df.columns:
+        decl = _sniffing.parse_block_declaration(info, str(col))
+        if decl is None:
+            continue
+        mat = _vector_matrix(df[col])
+        if mat is None or mat.shape[1] != decl["block_count"] * decl["dof_per_block"]:
+            continue
+        dof = decl["dof_per_block"]
+        order = _sniffing.infer_dof_order(info, str(col), dof)
+        dim_order = order["order"]
+        # 位置维索引：取维度名以 p 开头的（如 px/py/pz）；前三位置维。
+        pos_idx = [i for i, n in enumerate(dim_order) if str(n).startswith("p")][:3]
+        if len(pos_idx) < 2:
+            continue  # 无法判定位置维 → 不画（不猜测）。
+        return {
+            "column": str(col),
+            "mat": mat,
+            "blocks": decl["block_count"],
+            "dof": dof,
+            "declared_name": decl["declared_name"],
+            "dim_order": dim_order,
+            "order_source": order["source"],
+            "order_inferred": order["is_inferred"],
+            "pos_idx": pos_idx,
+        }
+    return None
+
+
+def _plot_skeleton_trajectory(
+    df, skel: dict[str, Any], title: str, path
+) -> tuple[str, str, dict[str, Any]] | None:
+    """按骨骼块画位置轨迹（3D 若可，否则 XY）。
+
+    Args:
+        df: 数据表。
+        skel: _skeleton_trajectory_column 的返回。
+        title: 图标题。
+        path: 输出路径。
+
+    Returns:
+        (说明, 轨迹类型, plot_spec)；无法绘制返回 None。
+    """
+    mat = skel["mat"]
+    dof = skel["dof"]
+    pos_idx = skel["pos_idx"]
+    # 取前若干块绘制（块数过多时图不可读）。
+    max_blocks = 6
+    drawn_blocks = list(range(min(skel["blocks"], max_blocks)))
+    has_z = len(pos_idx) >= 3
+
+    fig = plt.figure()
+    if has_z:
+        ax = fig.add_subplot(111, projection="3d")
+        for b in drawn_blocks:
+            seg = mat[:, b * dof : (b + 1) * dof]
+            ax.plot(
+                seg[:, pos_idx[0]], seg[:, pos_idx[1]], seg[:, pos_idx[2]],
+                label=f"block_{b}",
+            )
+        ax.set_xlabel(str(skel["dim_order"][pos_idx[0]]))
+        ax.set_ylabel(str(skel["dim_order"][pos_idx[1]]))
+        ax.set_zlabel(str(skel["dim_order"][pos_idx[2]]))
+        desc = (
+            f"Skeleton 3D trajectory of '{skel['column']}' "
+            f"({skel['declared_name']}: {skel['blocks']} blocks x {dof}DoF; "
+            f"drew {len(drawn_blocks)} blocks)"
+        )
+        spec_y = [str(skel["dim_order"][pos_idx[1]]), str(skel["dim_order"][pos_idx[2]])]
+    else:
+        ax = fig.add_subplot(111)
+        for b in drawn_blocks:
+            seg = mat[:, b * dof : (b + 1) * dof]
+            ax.plot(seg[:, pos_idx[0]], seg[:, pos_idx[1]], label=f"block_{b}")
+        ax.set_xlabel(str(skel["dim_order"][pos_idx[0]]))
+        ax.set_ylabel(str(skel["dim_order"][pos_idx[1]]))
+        desc = (
+            f"Skeleton XY trajectory of '{skel['column']}' "
+            f"({skel['declared_name']}: {skel['blocks']} blocks x {dof}DoF; "
+            f"drew {len(drawn_blocks)} blocks)"
+        )
+        spec_y = [str(skel["dim_order"][pos_idx[1]])]
+    ax.set_title(title)
+    ax.legend(fontsize="small")
+    _save_fig(fig, path)
+    spec = {
+        "x_axis": str(skel["dim_order"][pos_idx[0]]),
+        "y_axis": spec_y,
+        "grouped_by": None,
+        "n_series": len(drawn_blocks),
+        "skeleton_column": skel["column"],
+        "declared_name": skel["declared_name"],
+        "blocks_total": skel["blocks"],
+        "blocks_drawn": len(drawn_blocks),
+        "dof_per_block": dof,
+        "dimension_order": list(skel["dim_order"]),
+        "dimension_source": skel["order_source"],
+        "dimension_order_inferred": skel["order_inferred"],
+    }
+    return (desc, "skeleton", spec)
+
+
 def _plot_trajectory_to_file(df, title, path) -> tuple[str, str, dict[str, Any]] | None:
     joint_cols = [c for c in df.columns if str(c).lower().startswith(_sniffing._JOINT_PREFIXES)]
     pose_cols = [c for c in df.columns if _sniffing._is_pose_column(str(c))]
+
+    # 骨骼位姿列（向量列 + 数据集声明块分解，如 body_24x7 / left_hand_26x7）：
+    # 优先按块画位置轨迹。仅处理**声明**的块分解，不做形态猜测。
+    skeleton = _skeleton_trajectory_column(df)
+    if skeleton is not None:
+        result = _plot_skeleton_trajectory(df, skeleton, title, path)
+        if result is not None:
+            return result
 
     if joint_cols:
         fig, ax = plt.subplots()
