@@ -1,7 +1,7 @@
-# 数据格式骨架：worldcode_nuscenes（带 nuScenes schema 的具身采集格式）
+# 数据格式骨架：nuscenes_reorg（带 nuScenes schema 的具身采集格式）
 #
 # 用途：把真实采集目录的"文件名模式 + 类型构成"固化为合成夹具，永久进入回归套件。
-# 文件名匿名化（camera-a / mipi-fpv-right-camera 等代表性样本，不带真实设备/项目名）。
+# 文件名匿名化（camera-a / camera-b 等代表性样本，不带真实设备/项目名）。
 #
 # 刻意保留的"刁难特征"（结构指纹，正是打崩过我们的东西）：
 #   - 2 字节空 JSON（ego_pose.json）
@@ -10,8 +10,8 @@
 #   - 多分辨率/预览版本组（_480/_960/_pre.mp4 + _pre.webp）
 #   - nuScenes schema 表族（sample.json / sample_data.json 等 dict 结构 JSON）
 
-name: worldcode_nuscenes
-description: "worldcode 采集：nuScenes schema JSON 表族 + 多分辨率相机视频版本组 + .index.parquet"
+name: nuscenes_reorg
+description: "nuScenes 重组布局：nuScenes schema JSON 表族 + 多分辨率相机视频版本组 + .index.parquet"
 
 files:
   # ---- nuScenes schema 表族（dict 结构 JSON，非数组 → 空流/登记）----

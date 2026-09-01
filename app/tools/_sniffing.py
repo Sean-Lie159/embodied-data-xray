@@ -66,7 +66,7 @@ _ACTION_STATE_COLS = ("qpos", "qvel", "qacc", "action", "obs", "state", "cmd")
 _FORCE_COLS = ("force", "torque", "ft_", "force_torque", "_ft", "fx", "fy",
                "fz", "tx", "ty", "tz", "wrench")
 
-# 常见时间戳列名（用于第 2 层时间戳指纹）。扩展词表覆盖 worldcode 的
+# 常见时间戳列名（用于第 2 层时间戳指纹）。扩展词表覆盖 nuScenes 重组布局的
 # index.parquet（pts / frame_timestamps_ns）与曝光时间戳（exposure_*）。
 _TIMESTAMP_COLS = ("timestamp", "timestamp_ns", "time", "ts", "ts_ns", "t", "stamp",
                    "frame_time", "pts", "pts_us", "frame_timestamps_ns",
@@ -883,7 +883,8 @@ def _read_table_columns_cheap(path: str, fmt: str) -> list[str] | None:
     """只读表格列名（不读全量数据），用于配对时判断是否含时间戳列。
 
     与 load_dataset._read_table_columns 等价，但作为 _sniffing 内部轻量实现，
-    避免配对阶段加载全量（worldcode 的 .json 元信息达 840KB，只读列名是廉价的）。
+    避免配对阶段加载全量（某些采集格式的 .json 元信息可达数百 KB，只读列名是
+    廉价的）。
 
     Args:
         path: 文件路径。

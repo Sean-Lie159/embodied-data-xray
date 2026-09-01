@@ -35,7 +35,7 @@ streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 ```
 
 在对话中输入 `加载 data/tobii_ego`，即可走通「加载 → 质检 → 统计 → 绘图 → 报告」全链路。
-也可换 `worldcode_nuscenes` 或 `lerobot_v2` 骨架，体验不同格式的识别。
+也可换 `nuscenes_reorg` 或 `lerobot_v2` 骨架，体验不同格式的识别。
 
 ## 支持的数据布局清单
 

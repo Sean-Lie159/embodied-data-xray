@@ -19,7 +19,7 @@ def _make_malformed_dir(tmp_path: Path, name: str = "weird") -> Path:
     root = tmp_path / name
     root.mkdir()
     # 畸形文件名（含特殊字符、无扩展名）。
-    (root / "worldcode_ISuit").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+    (root / "pipeline_Device").write_text("a,b,c\n1,2,3\n", encoding="utf-8")
     (root / "no_ext").write_text("x,y\n1,2\n", encoding="utf-8")
     # 无扩展名但内容是 CSV 的畸形文件。
     (root / "data 2 [v1]").write_text("p,q\n1,2\n", encoding="utf-8")

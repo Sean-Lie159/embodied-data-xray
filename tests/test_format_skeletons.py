@@ -84,7 +84,7 @@ def test_skeleton_deterministic(tmp_path: Path) -> None:
 
 
 def test_manifests_anonymized_and_have_tricky_features() -> None:
-    """清单匿名化（无真实项目名/设备序列号/日期）且 worldcode 含刁难特征。"""
+    """清单匿名化（无真实项目名/设备序列号/日期）且 nuscenes_reorg 含刁难特征。"""
     for sk in _SKELETONS:
         manifest = _manifest(sk)
         joined = yaml.safe_dump(manifest).lower()
@@ -93,7 +93,7 @@ def test_manifests_anonymized_and_have_tricky_features() -> None:
         assert "vlta_reorg" not in joined
         assert "2026-" not in joined
     # worldcode 骨架必须包含刁难特征（结构指纹）。
-    wc = _manifest("worldcode_nuscenes")
+    wc = _manifest("nuscenes_reorg")
     names = [f["name"] for f in wc["files"]]
     assert "ego_pose.json" in names             # 2 字节空 JSON
     assert "desktop.ini" in names               # 系统文件
