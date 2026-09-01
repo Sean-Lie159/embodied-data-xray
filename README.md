@@ -63,9 +63,7 @@ streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 
 ### 架构文档
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 分层设计、数据识别架构（语义角色优先 / 支持清单 / LLM 假设边界）
 - [docs/行为测试.md](docs/行为测试.md) — 行为回归用例（含数据识别三层防御的终身回归）
-- [docs/技术债.md](docs/技术债.md) — 已知限制与决策记录
 
 ## ffmpeg / ffprobe（可选）
 

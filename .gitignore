@@ -25,5 +25,10 @@ Desktop.ini
 # 个人开发过程记录（含个人工作流，不进仓库）
 docs/使用日志.md
 
+# 内部设计/决策文档（含内部讨论与外部不可见的设计过程，不进仓库）
+docs/技术债.md
+docs/四层语义识别架构.md
+docs/ARCHITECTURE.md
+
 # 临时提交信息文件
 scripts/_commit_msg_*.txt
