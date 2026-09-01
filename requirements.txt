@@ -1,12 +1,16 @@
-openai-agents
-openai
-pydantic-settings
-pandas
-numpy
-pyarrow
-h5py
-pyyaml
-matplotlib
-plotly
-streamlit
-pytest
+# 依赖已按实测环境锁定（Python 3.12）。openai-agents 等 SDK 的破坏性更新
+# 可能改变内部接口（如 RunResult 的 usage 访问路径），故锁定小版本；
+# 如需升级，请先跑 tests/ 全量回归。
+openai-agents==0.21.1
+openai==3.2.0
+pydantic==2.13.4
+pydantic-settings==2.15.0
+pandas==2.3.3
+numpy==2.2.6
+pyarrow==24.0.0
+h5py==3.16.0
+PyYAML==6.0.3
+matplotlib==3.11.0
+plotly==6.9.0
+streamlit==1.61.1
+pytest==9.1.1

@@ -21,3 +21,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# 个人开发过程记录（含个人工作流，不进仓库）
+docs/使用日志.md
+
+# 临时提交信息文件
+scripts/_commit_msg_*.txt
