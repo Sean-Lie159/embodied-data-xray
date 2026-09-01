@@ -135,14 +135,24 @@ class ChatService:
         )
 
     def dataset_summary(self) -> dict[str, Any]:
-        """返回当前数据集的能力标签与流清单摘要（供 UI 展示）。"""
+        """返回当前数据集的能力标签与流清单摘要（供 UI 展示）。
+
+        含 video_fps_by_file（视频文件 → fps，来自 ffprobe），供流清单表格展示
+        视频帧率（否则视频流采样率显示"未知"，但 fps 实际可得）。
+        """
         caps = self.context.meta.get("capabilities", {})
         streams = self.context.meta.get("streams", [])
+        video_fps_by_file: dict[str, Any] = {}
+        for v in self.context.meta.get("video_meta", []):
+            fps = v.get("fps")
+            if fps is not None:
+                video_fps_by_file[v.get("file", "")] = fps
         return {
             "dataset_id": self.context.dataset_id,
             "capabilities": caps,
             "streams": streams,
             "guessed_type": self.context.meta.get("guessed_type"),
+            "video_fps_by_file": video_fps_by_file,
         }
 
 

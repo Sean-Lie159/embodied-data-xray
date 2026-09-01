@@ -127,12 +127,17 @@ def _measure_rate_from_file(
         # 归一化到纳秒时按 1e9/间隔(ns) 算 Hz；未归一化时按 1/间隔(秒) 算 Hz。
         sample_rate = (1e9 / mean_interval if normalized else 1.0 / mean_interval)
         jitter_ms = float(diffs.std()) / 1e6 if normalized else float(diffs.std()) * 1000.0
-        unit_note = (
-            f"（原始单位 {unit}，已归一化到纳秒）"
-            if normalized else f"（原始单位 {init_unit}，未归一化，按秒兜底计算）"
-        )
         if corrected:
-            unit_note += f"；{correction.get('basis', '')}"
+            # 发生纠正时只显示纠正后的连贯表述，避免与"原始单位 s"拼接自相矛盾。
+            unit_note = (
+                f"（{correction.get('basis', '单位经自我纠正')}；"
+                f"当前按单位 {unit} 归一化到纳秒计算）"
+            )
+        else:
+            unit_note = (
+                f"（原始单位 {unit}，已归一化到纳秒）"
+                if normalized else f"（原始单位 {init_unit}，未归一化，按秒兜底计算）"
+            )
         return {
             "present": True,
             "sample_rate_hz": round(sample_rate, 3),

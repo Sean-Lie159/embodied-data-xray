@@ -193,8 +193,9 @@ def _vector_column_stats(series) -> dict[str, Any] | None:
     n_parsed = 0
     n_zero = 0
     n_nonzero = 0
+    zero_idx: list[int] = []
     dim_counter: dict[int, int] = {}
-    for v in series:
+    for i, v in enumerate(series):
         vec = parse_lerobot_vector(v)
         if vec is None:
             continue
@@ -204,17 +205,33 @@ def _vector_column_stats(series) -> dict[str, Any] | None:
             n_nonzero += 1
         else:
             n_zero += 1
+            zero_idx.append(i)
     # 多数行可解析才认定是向量列。
     if n_parsed < total * 0.5:
         return None
     dims = max(dim_counter, key=dim_counter.get) if dim_counter else None
-    return {
+    stats: dict[str, Any] = {
         "n_parsed": n_parsed,
         "n_zero": n_zero,
         "n_nonzero": n_nonzero,
         "zero_row_ratio": round(n_zero / n_parsed, 4) if n_parsed else None,
         "dims": dims,
     }
+    # 全零行位置摘要：缺失"发生在哪"直接影响补全策略（补零/裁剪/插值），
+    # 只有数量会让 agent 误把散布的缺失说成"集中在开头"。
+    if zero_idx:
+        consecutive = zero_idx == list(range(zero_idx[0], zero_idx[0] + len(zero_idx)))
+        # 十分位分布（把序列均分 10 段，统计每段全零行数）。
+        bins = np.array_split(np.arange(total), 10)
+        dist = [int(sum(1 for i in zero_idx if i in seg)) for seg in bins]
+        stats["zero_row_positions"] = {
+            "first": zero_idx[0],
+            "last": zero_idx[-1],
+            "contiguous": consecutive,
+            "in_head_20": int(sum(1 for i in zero_idx if i < 20)),
+            "decile_distribution": dist,
+        }
+    return stats
 
 
 @tool

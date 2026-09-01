@@ -148,12 +148,17 @@ def render_dataset_overview(summary: dict[str, Any]) -> None:
 
     caps = summary.get("capabilities", {})
     st.markdown("**能力标签**")
-    # IMU 轴数：None 或 "unknown" 时显示"未知"，避免侧栏出现 "None 轴"。
+    # IMU 轴数：无 IMU（✗）时不显示轴数（避免"✗（未知轴）"的冗余）；有 IMU 但
+    # 轴数未知时才显示"未知轴"。
     imu_axes = caps.get("imu_axes")
-    imu_axes_txt = "未知" if imu_axes is None or imu_axes == "unknown" else f"{imu_axes} 轴"
+    if caps.get("has_imu"):
+        imu_axes_txt = "未知轴" if imu_axes is None or imu_axes == "unknown" else f"{imu_axes} 轴"
+        imu_line = f"- IMU: ✓（{imu_axes_txt}）"
+    else:
+        imu_line = "- IMU: ✗"
     cap_lines = [
         f"- 视频流: {'✓' if caps.get('has_video_streams') else '✗'}",
-        f"- IMU: {'✓' if caps.get('has_imu') else '✗'}（{imu_axes_txt}）",
+        imu_line,
         f"- 力/力矩: {'✓' if caps.get('has_force') else '✗'}",
         f"- 标定: {'✓' if caps.get('has_calibration') else '✗'}",
         f"- 状态/动作: {'✓' if caps.get('has_actions') else '✗'}",
@@ -163,12 +168,20 @@ def render_dataset_overview(summary: dict[str, Any]) -> None:
     streams = summary.get("streams", [])
     if streams:
         st.markdown("**流清单**")
+        # 视频 fps 映射（ffprobe 实测），供视频流展示帧率而非"未知"。
+        fps_by_file = summary.get("video_fps_by_file") or {}
         rows = []
         for s in streams:
-            name = Path(s.get("path", "")).name if s.get("path") else "(main)"
+            path = s.get("path", "")
+            name = Path(path).name if path else "(main)"
             role = (s.get("role") or {}).get("role", s.get("kind", "?"))
             mr = s.get("measured_rate")
             rate = (mr or {}).get("sample_rate_hz") if isinstance(mr, dict) else None
-            rate_str = f"{rate} Hz" if rate is not None else "未知"
+            if rate is not None:
+                rate_str = f"{rate} Hz"
+            elif path in fps_by_file:
+                rate_str = f"{fps_by_file[path]} fps（视频）"
+            else:
+                rate_str = "未知"
             rows.append({"流": name, "角色": role, "采样率": rate_str})
         st.table(rows)
