@@ -37,25 +37,20 @@ streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 在对话中输入 `加载 data/tobii_ego`，即可走通「加载 → 质检 → 统计 → 绘图 → 报告」全链路。
 也可换 `worldcode_nuscenes` 或 `lerobot_v2` 骨架，体验不同格式的识别。
 
-## Supported dataset layouts
+## 支持的数据布局清单
 
-Currently **verified** layouts (each has its structural skeleton locked in as
-regression tests):
+当前**已验证**的数据布局（每种布局的结构骨架已固化为回归测试）：
 
-| Layout | Characteristics | Status |
+| 布局 | 特征 | 状态 |
 |---|---|---|
-| Single file | CSV / JSON / Parquet / HDF5 | ✅ Supported |
-| Multi-stream collection dir | CSV sensor streams + per-video timestamp companion tables + camera-calibration JSON + media files | ✅ Supported |
-| Frame-index + video dir | Per-video frame-index tables (`.index.parquet`) + multi-resolution/preview video variants + same-stem sidecar JSON | ✅ Supported |
-| LeRobot v2 | `meta/info.json` + `data/chunk-*` + `videos/chunk-*` | ✅ Supported |
+| 单文件 | CSV / JSON / Parquet / HDF5 单表 | ✅ 支持 |
+| 多流采集目录 | CSV 传感器流 + 每路视频的时间戳伴随表 + 相机标定 JSON + 媒体文件 | ✅ 支持 |
+| 帧索引 + 视频目录 | 每路视频的帧索引表（`.index.parquet`）+ 多分辨率/预览视频变体 + 同名 sidecar JSON | ✅ 支持 |
+| LeRobot v2 | `meta/info.json` + `data/chunk-*` + `videos/chunk-*` | ✅ 支持 |
 
-**Beyond the list**: the agent will still try to load it (best-effort survey &
-sniffing), but recognition may be limited — unknown semantic roles are honestly
-reported as `unknown` instead of being guessed. New layouts are added by
-dropping a structural skeleton into the test suite first.
-
-数据识别按**语义角色**匹配（时间戳伴随表、元数据文件、索引列），不绑定具体后缀或
-固定列名；词表未命中时回退内容指纹（数值列单调递增 + 差分均匀 + 量级符合时间单位）。
+**清单外格式**：agent 仍会尝试加载（普查/嗅探尽力而为），但识别可能受限——未知语义
+角色会被如实标注为 `unknown`，而不是硬猜。新布局建议先把结构骨架加入测试套件，
+再进入分析流程。
 
 ## 数据识别如何工作
 
