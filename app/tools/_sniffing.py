@@ -35,7 +35,9 @@ _AUDIO_EXTS = {".m4a", ".wav", ".mp3", ".flac", ".aac", ".ogg"}
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
 # 表格扩展名（用于列名嗅探）。
-_TABLE_EXTS = {".csv", ".json", ".parquet"}
+# 注意：.jsonl 与 .json 是两种不同格式（前者每行一个 JSON 对象，后者整体一个
+# JSON 值），必须并列登记、分别处理，不得混用。
+_TABLE_EXTS = {".csv", ".json", ".jsonl", ".parquet"}
 
 # 标定相关扩展名（json/yaml 可能含标定键，需进一步解析判定）。
 _CALIB_EXTS = {".yaml", ".yml", ".json"}
@@ -888,7 +890,7 @@ def _read_table_columns_cheap(path: str, fmt: str) -> list[str] | None:
 
     Args:
         path: 文件路径。
-        fmt: 格式（csv/parquet/json）。
+        fmt: 格式（csv/parquet/json/jsonl）。
 
     Returns:
         列名列表；读取失败返回 None。
@@ -903,6 +905,12 @@ def _read_table_columns_cheap(path: str, fmt: str) -> list[str] | None:
         if fmt == "parquet":
             import pyarrow.parquet as pq
             return list(pq.ParquetFile(p).schema.names)
+        if fmt == "jsonl":
+            # JSONL：逐行解析，取首个有效行的键（等价于 lines=True 的列结构）。
+            from app.tools._data_access import read_jsonl_rows
+
+            rows = read_jsonl_rows(path, limit=1, encoding="utf-8")
+            return [str(k) for k in rows[0].keys()] if rows else []
         if fmt == "json":
             encoding = "utf-8"
             obj = _json.loads(p.read_text(encoding=encoding))

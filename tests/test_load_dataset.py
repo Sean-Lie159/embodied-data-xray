@@ -93,7 +93,7 @@ def test_load_unsupported_format_returns_error(tmp_path: Path) -> None:
     assert "user_message" in result
     # user_message 应明确转达支持格式。
     assert "csv" in result["user_message"]
-    assert result["supported_formats"] == [".csv", ".json", ".parquet", ".h5"]
+    assert result["supported_formats"] == [".csv", ".json", ".jsonl", ".parquet", ".h5"]
     # 错误返回不应附带文件内容预览。
     assert "x" not in result
 

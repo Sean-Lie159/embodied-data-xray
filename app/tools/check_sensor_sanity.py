@@ -28,7 +28,7 @@ def _read_columns(path: str, fmt: str, columns: list[str]) -> dict[str, np.ndarr
 
     Args:
         path: 文件路径。
-        fmt: 格式（csv / parquet / json）。
+        fmt: 格式（csv / parquet / json / jsonl）。
         columns: 需要读取的列名。
 
     Returns:
@@ -50,6 +50,11 @@ def _read_columns(path: str, fmt: str, columns: list[str]) -> dict[str, np.ndarr
         if fmt == "json":
             encoding = _detect_encoding(Path(path).read_bytes())
             df = pd.read_json(path, encoding=encoding)
+            return {c: _column_array(df[c]) for c in columns if c in df.columns}
+        if fmt == "jsonl":
+            # JSONL：lines=True（与 .json 严格区分，不得混用）。
+            encoding = _detect_encoding(Path(path).read_bytes())
+            df = pd.read_json(path, lines=True, encoding=encoding)
             return {c: _column_array(df[c]) for c in columns if c in df.columns}
         return None
     except Exception:  # noqa: BLE001

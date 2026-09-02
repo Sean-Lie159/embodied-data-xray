@@ -117,15 +117,56 @@ def _json_row_list(obj: Any) -> list | None:
     return None
 
 
+def read_jsonl_rows(
+    path: str,
+    limit: int | None = None,
+    encoding: str = "utf-8",
+) -> list[dict]:
+    """逐行读取 JSONL 文件的行记录（每行一个 JSON 对象），最多 limit 行。
+
+    **JSONL 与 JSON 严格区分**：本函数逐行解析（等价于 `pd.read_json(lines=True)`
+    的语义），绝不把整个文件当作单个 JSON 值解析。空行与非法行跳过而不中断，
+    用于嗅探阶段廉价地取得列结构与 dtype（无需读全量）。
+
+    Args:
+        path: 文件路径。
+        limit: 最多读取的有效行数；None 表示读全部。
+        encoding: 文本编码。
+
+    Returns:
+        行记录字典列表；无有效行时返回 []。
+    """
+    import json as _json
+
+    rows: list[dict] = []
+    try:
+        with Path(path).open("r", encoding=encoding, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = _json.loads(line)
+                except ValueError:
+                    continue  # 单行非法：跳过该行，不中断整体读取
+                if isinstance(obj, dict):
+                    rows.append(obj)
+                if limit is not None and len(rows) >= limit:
+                    break
+    except Exception:  # noqa: BLE001
+        return rows
+    return rows
+
+
 def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
     """按需读取流文件的全表。
 
     JSON 顶层 dict 时按行列表键（frames/data）展开为 DataFrame，避免把标量键
-    （如 fps）当数据列。
+    （如 fps）当数据列。JSONL 按行解析（lines=True），与 JSON 严格区分。
 
     Args:
         path: 文件路径。
-        fmt: 格式（csv/parquet/json）。
+        fmt: 格式（csv/parquet/json/jsonl）。
 
     Returns:
         DataFrame；读取失败返回 None。
@@ -147,6 +188,10 @@ def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
             if rows is None:
                 return None
             return pd.DataFrame(rows)
+        if fmt == "jsonl":
+            # JSONL：每行一个 JSON 对象 → 必须 lines=True（与 .json 严格区分）。
+            encoding = _detect_encoding(Path(path).read_bytes())
+            return pd.read_json(path, lines=True, encoding=encoding)
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -160,7 +205,7 @@ def read_table_nrows(path: str, fmt: str) -> int | None:
 
     Args:
         path: 文件路径。
-        fmt: 格式（csv/parquet/json）。
+        fmt: 格式（csv/parquet/json/jsonl）。
 
     Returns:
         行数（不含表头）；读取失败返回 None。
@@ -181,6 +226,11 @@ def read_table_nrows(path: str, fmt: str) -> int | None:
             obj = _json.loads(Path(path).read_text(encoding=encoding))
             rows = _json_row_list(obj)
             return len(rows) if rows is not None else 0
+        if fmt == "jsonl":
+            # JSONL：非空行即一行记录（与 lines=True 读取语义一致）。
+            encoding = _detect_encoding(Path(path).read_bytes())
+            with Path(path).open("r", encoding=encoding, errors="replace") as f:
+                return sum(1 for line in f if line.strip())
         return None
     except Exception:  # noqa: BLE001
         return None

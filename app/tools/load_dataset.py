@@ -26,15 +26,24 @@ from app.tools import _data_access, _sniffing
 from app.tools import profile_store
 
 # 本工具支持的扩展名 → 说明。
+# .json（整体一个 JSON 值）与 .jsonl（每行一个 JSON 对象）是两种格式，分别读取，
+# 不得混用：.jsonl 一律走 lines=True。
 _SUPPORTED_FORMATS: dict[str, str] = {
     ".csv": "逗号分隔文本",
     ".json": "JSON 数组",
+    ".jsonl": "JSON Lines（每行一个 JSON 对象）",
     ".parquet": "Parquet 列式存储",
     ".h5": "HDF5 表",
 }
 
 # 尝试解码文本文件时使用的编码回退链。
 _ENCODINGS: tuple[str, ...] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+
+# JSONL 嗅探采样行数：目录嗅探时只取前若干行判列结构与 dtype。
+# 取 5 行而非 _FINGERPRINT_SAMPLE_ROWS(500)：JSONL 需逐行解析 JSON，成本高于
+# csv/parquet 的列裁剪；而判别列结构与 dtype（含嵌套值 → object）5 行已足够。
+# 全量统计仍由 profile_data / check_sensor_sanity 读全表完成，不依赖此采样。
+_JSONL_SNIFF_ROWS = 5
 
 
 def _detect_encoding(raw: bytes) -> str:
@@ -176,6 +185,12 @@ def _read_table_columns(path: Path) -> list[str] | None:
             if rows and isinstance(rows[0], dict):
                 return [str(c) for c in rows[0].keys()]
             return []
+        if ext == ".jsonl":
+            # JSONL：逐行解析取首个有效行的键（不读全量）。
+            from app.tools._data_access import read_jsonl_rows
+
+            rows = read_jsonl_rows(str(path), limit=1, encoding=_detect_encoding(path.read_bytes()))
+            return [str(k) for k in rows[0].keys()] if rows else []
         return None
     except Exception:  # noqa: BLE001
         return None
@@ -295,6 +310,16 @@ def _read_table_sample(path: Path) -> pd.DataFrame | None:
             if rows is not None:
                 return pd.DataFrame(rows[:_FINGERPRINT_SAMPLE_ROWS])
             return None
+        if ext == ".jsonl":
+            # JSONL：读前 _JSONL_SNIFF_ROWS 行判列结构与 dtype（不读全量）。
+            # 嵌套列表/对象值在此保留为 object dtype，供下游指纹与统计判定。
+            from app.tools._data_access import read_jsonl_rows
+
+            rows = read_jsonl_rows(
+                str(path), limit=_JSONL_SNIFF_ROWS,
+                encoding=_detect_encoding(path.read_bytes()),
+            )
+            return pd.DataFrame(rows) if rows else None
         return None
     except Exception:  # noqa: BLE001
         return None
@@ -437,6 +462,9 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             elif ext == ".json":
                 # 经统一 reader（JSON 顶层 dict 按行列表键 frames/data 展开）。
                 main_table = _data_access.read_stream_full(main_table_path, "json")
+            elif ext == ".jsonl":
+                # 经统一 reader（JSONL 逐行解析，lines=True）。
+                main_table = _data_access.read_stream_full(main_table_path, "jsonl")
         except Exception:  # noqa: BLE001
             main_table = None
 
@@ -813,6 +841,9 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
             df = _load_csv(path)
         elif ext == ".json":
             df = pd.read_json(path, encoding=_detect_encoding(source.read_bytes()))
+        elif ext == ".jsonl":
+            # JSONL：lines=True（每行一个对象）。与 .json 严格区分，不得混用。
+            df = pd.read_json(path, lines=True, encoding=_detect_encoding(source.read_bytes()))
         elif ext == ".parquet":
             df = pd.read_parquet(path)
         elif ext == ".h5":
@@ -933,7 +964,8 @@ def load_dataset(
     """加载数据集到当前会话，返回元信息。
 
     支持两种输入：
-    - 单文件：按格式读取（.csv / .json / .parquet / .h5）；
+    - 单文件：按格式读取（.csv / .json / .jsonl / .parquet / .h5）；
+      .jsonl 为 JSON Lines（每行一个 JSON 对象），与 .json 分别处理；
     - 目录：递归文件普查 + 能力嗅探，生成能力标签与推测类型（不整表读入内存，
       视频等大文件仅记录路径清单；若 ffprobe 不可用则跳过视频嗅探并提示）。
 

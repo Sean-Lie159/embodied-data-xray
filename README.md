@@ -43,7 +43,7 @@ streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 
 | 布局 | 特征 | 状态 |
 |---|---|---|
-| 单文件 | CSV / JSON / Parquet / HDF5 单表 | ✅ 支持 |
+| 单文件 | CSV / JSON / JSONL / Parquet / HDF5 单表 | ✅ 支持 |
 | 多流采集目录 | CSV 传感器流 + 每路视频的时间戳伴随表 + 相机标定 JSON + 媒体文件 | ✅ 支持 |
 | 帧索引 + 视频目录 | 每路视频的帧索引表（`.index.parquet`）+ 多分辨率/预览视频变体 + 同名 sidecar JSON | ✅ 支持 |
 | LeRobot v2 | `meta/info.json` + `data/chunk-*` + `videos/chunk-*` | ✅ 支持 |
@@ -60,6 +60,7 @@ streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 - **元数据文件**：小尺寸 JSON + 配置型键（fps/features 等）→ 不进流清单、不参与对齐
 - **骨骼位姿块**：数据集声明 `names=xxx_NxM` 且 N×M==shape → 按块分解统计位姿范围与四元数范数
 - **时间戳列**：词表命中优先，未命中回退内容指纹（单调递增 + 量级符合时间单位）；单位推断带自我纠正（采样率超物理区间自动换单位重算）
+- **JSONL vs JSON**：`.jsonl` 每行一个 JSON 对象（`lines=True`），`.json` 整体一个 JSON 值——两者分别读取、不混用；JSONL 的嵌套列表/对象值保留为 object 列，可被概况统计（非空计数/样例值）与合理性检查（全零/恒定）覆盖
 
 ### 架构文档
 

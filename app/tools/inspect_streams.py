@@ -36,7 +36,7 @@ def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
 
     Args:
         path: 文件路径。
-        fmt: 格式（csv / parquet / json）。
+        fmt: 格式（csv / parquet / json / jsonl）。
 
     Returns:
         时间戳列 Series（其 name 为列名）；无时间戳列或读取失败返回 None。
@@ -67,6 +67,15 @@ def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
         if fmt == "json":
             # 经统一 reader 读取（JSON 顶层 dict 按行列表键 frames/data 展开，
             # 避免把标量键如 fps 当数据列）。
+            from app.tools import _data_access
+
+            df = _data_access.read_stream_full(path, fmt)
+            if df is None:
+                return None
+            ts_info = find_timestamp_columns(list(df.columns), df.head(sample_rows))
+            return df[ts_info["main"]] if ts_info["main"] else None
+        if fmt == "jsonl":
+            # JSONL：经统一 reader 逐行解析（lines=True），与 .json 严格区分。
             from app.tools import _data_access
 
             df = _data_access.read_stream_full(path, fmt)
