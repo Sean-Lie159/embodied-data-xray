@@ -66,7 +66,7 @@ _ACTION_STATE_COLS = ("qpos", "qvel", "qacc", "action", "obs", "state", "cmd")
 _FORCE_COLS = ("force", "torque", "ft_", "force_torque", "_ft", "fx", "fy",
                "fz", "tx", "ty", "tz", "wrench")
 
-# 常见时间戳列名（用于第 2 层时间戳指纹）。扩展词表覆盖 nuScenes 重组布局的
+# 常见时间戳列名（用于第 2 层时间戳指纹）。扩展词表覆盖帧索引重组布局的
 # index.parquet（pts / frame_timestamps_ns）与曝光时间戳（exposure_*）。
 _TIMESTAMP_COLS = ("timestamp", "timestamp_ns", "time", "ts", "ts_ns", "t", "stamp",
                    "frame_time", "pts", "pts_us", "frame_timestamps_ns",
@@ -249,7 +249,7 @@ def probe_directory(root: Path, include_hidden: bool = False) -> dict[str, Any]:
         total_files += 1
         ext_counter[ext] += 1
         # 标定候选（json/yaml）优先归入 cals，避免被当作数据表。.json 既可能是
-        # 标定也可能是数据表（nuScenes 等）——由 load_dataset 在标定判定后把
+        # 标定也可能是数据表——由 load_dataset 在标定判定后把
         # 非标定 JSON 补入 tables 探测（见 _load_directory_impl）。
         if ext in _CALIB_EXTS:
             grouped["cals"].append(item)
@@ -1503,8 +1503,8 @@ _METADATA_CONFIG_KEYS = {
 _METADATA_MAX_BYTES = 100_000
 # 标定键（小写副本）：含任一即归标定角色，不参与元数据判定。
 _CALIB_KEYS_LOWER = {k.lower() for k in _CALIB_KEYS}
-# JSON 行列表键：顶层 dict 中这些键的值为"行记录列表"（LeRobot 用 frames，
-# nuScenes 用 data），应展开为表格；其余标量键（如 fps）不是数据行。
+# JSON 行列表键：顶层 dict 中这些键的值为"行记录列表"（部分格式用 frames，
+# 部分用 data），应展开为表格；其余标量键（如 fps）不是数据行。
 _JSON_ROW_LIST_KEYS = ("frames", "data")
 
 

@@ -15,8 +15,8 @@ from app.llm import factory
 def _settings(**overrides) -> Settings:
     base = dict(
         openai_api_key="sk-test-key",
-        openai_base_url="https://api.moonshot.cn/v1",
-        default_model="kimi-k2-0711-preview",
+        openai_base_url="https://api.example.com/v1",
+        default_model="example-model",
     )
     base.update(overrides)
     return Settings(_env_file=None, **base)
@@ -45,10 +45,10 @@ def test_build_model_assembles_openai_compatible_model(monkeypatch) -> None:
     model = factory.build_model(settings)
 
     assert isinstance(model, _FakeModel)
-    assert model.model == "kimi-k2-0711-preview"
+    assert model.model == "example-model"
     # 客户端收到了正确的密钥与端点
     assert model.openai_client.kwargs["api_key"] == "sk-test-key"
-    assert model.openai_client.kwargs["base_url"] == "https://api.moonshot.cn/v1"
+    assert model.openai_client.kwargs["base_url"] == "https://api.example.com/v1"
 
 
 def test_build_model_raises_when_config_incomplete(monkeypatch) -> None:

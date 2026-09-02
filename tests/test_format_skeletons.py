@@ -14,9 +14,16 @@ from pathlib import Path
 import pytest
 import yaml
 
+import re
+
 from tests.fixtures.make_skeleton import _SKELETONS_DIR, build_skeleton
 from app.agent.context import RunContext
 from app.tools.load_dataset import load_dataset_impl
+
+# 匿名化守卫用的通用模式（不列举任何真实项目名/序列号字面量）：
+# 日期串（YYYY-MM-DD）、8 位以上十六进制序列号（设备/会话 ID 常见形态）。
+_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+_HEX_ID_PATTERN = re.compile(r"\b[0-9a-f]{8,}\b", re.IGNORECASE)
 
 _SKELETONS = sorted(p.stem for p in _SKELETONS_DIR.glob("*.yaml"))
 
@@ -84,17 +91,17 @@ def test_skeleton_deterministic(tmp_path: Path) -> None:
 
 
 def test_manifests_anonymized_and_have_tricky_features() -> None:
-    """清单匿名化（无真实项目名/设备序列号/日期）且 nuscenes_reorg 含刁难特征。"""
+    """清单匿名化（无真实项目名/设备序列号/日期）且 frame_index_reorg 含刁难特征。"""
     for sk in _SKELETONS:
         manifest = _manifest(sk)
         joined = yaml.safe_dump(manifest).lower()
-        # 匿名化检查：不得含真实设备/项目名、序列号、日期模式。
-        assert "01350f7c" not in joined
-        assert "vlta_reorg" not in joined
-        assert "2026-" not in joined
-    # worldcode 骨架必须包含刁难特征（结构指纹）。
-    wc = _manifest("nuscenes_reorg")
-    names = [f["name"] for f in wc["files"]]
+        # 匿名化检查：不得含日期串、设备/会话序列号形态的十六进制 ID。
+        # 用通用模式而非列举字面量，避免守卫本身泄漏真实标识。
+        assert not _DATE_PATTERN.search(joined), f"{sk} 清单含日期串（应匿名化）"
+        assert not _HEX_ID_PATTERN.search(joined), f"{sk} 清单含序列号形态 ID（应匿名化）"
+    # frame_index_reorg 骨架必须包含刁难特征（结构指纹）。
+    fi = _manifest("frame_index_reorg")
+    names = [f["name"] for f in fi["files"]]
     assert "ego_pose.json" in names             # 2 字节空 JSON
     assert "desktop.ini" in names               # 系统文件
     assert "camera-a.index.parquet" in names    # .index.parquet 双扩展名

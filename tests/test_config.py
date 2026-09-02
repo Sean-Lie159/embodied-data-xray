@@ -16,8 +16,8 @@ def _settings_with(**overrides) -> Settings:
     """构造 Settings 并强制忽略 .env 与 OS 环境变量，避免测试被真实配置干扰。"""
     base = dict(
         openai_api_key="sk-test-key",
-        openai_base_url="https://api.moonshot.cn/v1",
-        default_model="kimi-k2-0711-preview",
+        openai_base_url="https://api.example.com/v1",
+        default_model="example-model",
     )
     base.update(overrides)
     return Settings(_env_file=None, **base)
@@ -26,8 +26,8 @@ def _settings_with(**overrides) -> Settings:
 def test_settings_loads_valid_values() -> None:
     s = _settings_with()
     assert s.openai_api_key == "sk-test-key"
-    assert s.openai_base_url == "https://api.moonshot.cn/v1"
-    assert s.default_model == "kimi-k2-0711-preview"
+    assert s.openai_base_url == "https://api.example.com/v1"
+    assert s.default_model == "example-model"
     assert s.default_temperature == 0.2
     assert s.max_turns == 15
     # 主表装载行数阈值（安全阀）：默认足够大，使常规采集数据（数万行）不被静默截断。

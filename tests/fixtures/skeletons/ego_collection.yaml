@@ -1,4 +1,4 @@
-# 数据格式骨架：tobii_ego（Tobii 风格 Ego 采集）
+# 数据格式骨架：ego_collection（第一人称 Ego 采集目录）
 #
 # 用途：把真实采集目录的"文件名模式 + 类型构成"固化为合成夹具，永久进入回归套件。
 # 所有文件名均为代表性样本（匿名化，不含真实项目名/序列号/日期）。
@@ -7,8 +7,8 @@
 # 结构指纹：CSV 表格流（IMU/位姿/动作/metainfo）、相机参数 JSON 标定、
 # mp4/m4a/jpg 媒体、controller_poses 空流（仅表头）。
 
-name: tobii_ego
-description: "Tobii 风格 Ego 采集：CSV 传感器流 + JSON 相机标定 + 媒体文件"
+name: ego_collection
+description: "第一人称 Ego 采集：CSV 传感器流 + JSON 相机标定 + 媒体文件"
 
 files:
   - name: accel.csv

@@ -19,7 +19,7 @@ def _pure_media_dir(tmp_path: Path) -> Path:
     # 视频（多分辨率）。
     (root / "cam.mp4").write_bytes(b"fakemovie")
     (root / "cam_480.mp4").write_bytes(b"fakemovie")
-    # JSON：dict 结构（nuScenes 表，非数组 → 不作为 CSV 表格候选；非标定）。
+    # JSON：dict 结构（schema 表，非数组 → 不作为 CSV 表格候选；非标定）。
     (root / "sample.json").write_text('{"data": []}', encoding="utf-8")
     (root / "sensor.json").write_text('{"data": []}', encoding="utf-8")
     return root

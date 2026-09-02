@@ -9,7 +9,7 @@
 
 用法（测试内调用）：
     from tests.fixtures.make_skeleton import build_skeleton
-    root = build_skeleton(tmp_path / "sk", "tobii_ego")
+    root = build_skeleton(tmp_path / "sk", "ego_collection")
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def build_skeleton(dest: Path, skeleton_name: str) -> Path:
 
     Args:
         dest: 目标父目录（生成的骨架子目录在此之下）。
-        skeleton_name: 清单文件名（不含 .yaml，如 "tobii_ego"）。
+        skeleton_name: 清单文件名（不含 .yaml，如 "ego_collection"）。
 
     Returns:
         生成的骨架目录路径（dest / <skeleton_name>）。
@@ -103,7 +103,7 @@ def _json_content(name: str, generate: str) -> str:
     # 2 字节空 JSON。
     if gen.strip().startswith("{}"):
         return "{}"
-    # 最小合法 dict（nuScenes schema 表族 / 相机同名 json）。
+    # 最小合法 dict（schema 表族 / 相机同名 json）。
     return json.dumps({"data": []}, ensure_ascii=False)
 
 

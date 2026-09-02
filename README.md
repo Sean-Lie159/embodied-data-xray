@@ -27,15 +27,15 @@ copy .env.example .env
 # 3) 没有数据？用内置结构骨架生成一个示例目录（零数据体验全流程）
 python -c "from tests.fixtures.make_skeleton import build_skeleton; \
 import pathlib; \
-print(build_skeleton(pathlib.Path('data'), 'tobii_ego'))"
+print(build_skeleton(pathlib.Path('data'), 'ego_collection'))"
 
 # 4) 启动
 python main.py                      # CLI
 streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 ```
 
-在对话中输入 `加载 data/tobii_ego`，即可走通「加载 → 质检 → 统计 → 绘图 → 报告」全链路。
-也可换 `nuscenes_reorg` 或 `lerobot_v2` 骨架，体验不同格式的识别。
+在对话中输入 `加载 data/ego_collection`，即可走通「加载 → 质检 → 统计 → 绘图 → 报告」全链路。
+也可换 `frame_index_reorg` 或 `lerobot_v2` 骨架，体验不同格式的识别。
 
 ## 支持的数据布局清单
 

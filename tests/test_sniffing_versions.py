@@ -1,4 +1,4 @@
-"""Commit 2：多分辨率版本组 / 同名配对 / nuScenes 登记级的单元测试。"""
+"""多分辨率版本组 / 同名配对 / schema 表族登记级的单元测试。"""
 
 from __future__ import annotations
 
@@ -76,11 +76,11 @@ def test_inspect_streams_surfaces_variant_of(tmp_path: Path) -> None:
     # 视频变体仅对 mp4 版本组（_480/_960/_pre.mp4）标 variant_of。
 
 
-def test_nuscenes_json_registers_not_crash(tmp_path: Path) -> None:
-    """nuScenes schema 表族（sample.json 等 dict 结构）登记为流，不崩；ego_pose 空文件→空流。"""
-    root = tmp_path / "nu"
+def test_schema_json_registers_not_crash(tmp_path: Path) -> None:
+    """schema 表族（sample.json 等 dict 结构）登记为流，不崩；ego_pose 空文件→空流。"""
+    root = tmp_path / "schema_tables"
     root.mkdir()
-    # nuScenes 表：dict 结构（含 data 列表）。
+    # schema 表：dict 结构（含 data 列表）。
     (root / "sample.json").write_text('{"__version__": "1.0", "data": []}', encoding="utf-8")
     (root / "sample_data.json").write_text('{"data": []}', encoding="utf-8")
     (root / "sensor.json").write_text('{"data": []}', encoding="utf-8")
@@ -91,7 +91,7 @@ def test_nuscenes_json_registers_not_crash(tmp_path: Path) -> None:
     r = load_dataset_impl(ctx, str(root))
     assert r["success"] is True  # 不崩
     names = [Path(s["path"]).name for s in ctx.meta["streams"]]
-    # nuScenes JSON 与 ego_pose 均登记在册（空流标注），不被丢弃、不崩溃。
+    # schema JSON 与 ego_pose 均登记在册（空流标注），不被丢弃、不崩溃。
     assert "sample.json" in names
     assert "sample_data.json" in names
     assert "sensor.json" in names

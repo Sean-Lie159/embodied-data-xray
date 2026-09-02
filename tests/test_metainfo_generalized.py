@@ -124,7 +124,7 @@ def test_version_group_dedup_in_alignment(tmp_path: Path) -> None:
 def test_data_table_not_used_as_video_metainfo(tmp_path: Path) -> None:
     """普通数据表（主时间戳为通用 timestamp）不作为视频 metainfo，避免假漂移。
 
-    复现 PICO LeRobot：episode_000000.mp4 与 episode_000000.parquet 同 stem，但
+    复现真实采集场景：episode_000000.mp4 与 episode_000000.parquet 同 stem，但
     parquet 是数据表（主时间戳 timestamp），不是帧级曝光时间戳表 → 不应配对。
     """
     root = tmp_path / "lerobot"
@@ -146,8 +146,8 @@ def test_data_table_not_used_as_video_metainfo(tmp_path: Path) -> None:
 
 
 def test_index_parquet_still_pairs_as_metainfo(tmp_path: Path) -> None:
-    """worldcode 的 camera-a.mp4 ↔ camera-a.index.parquet（帧级时间戳）仍应配对。"""
-    root = tmp_path / "wc"
+    """帧索引目录的 camera-a.mp4 ↔ camera-a.index.parquet（帧级时间戳）仍应配对。"""
+    root = tmp_path / "frame_index"
     root.mkdir()
     (root / "camera-a.mp4").write_bytes(b"f")
     ts = [1_700_000_000_000_000_000 + i * 33_333_333 for i in range(30)]

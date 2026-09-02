@@ -344,7 +344,7 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     # 主表候选：（路径、列名、原始嗅探、分类结果、行数、列数）。
     candidates: list[dict[str, Any]] = []
     # 表格候选 = probe tables（csv/parquet，用完整路径逐条探测） + cals 中**非标定**
-    # 的 .json（nuScenes 等数据表 JSON；标定 JSON 仍归 cals，不作为数据表流登记）。
+    # 的 .json（数据表 JSON；标定 JSON 仍归 cals，不作为数据表流登记）。
     # 注意：探测必须用完整清单，不能只探测返回里截断的前若干条。
     table_candidates = [
         t for t in _sniffing.probe_full_paths(probe, "tables")

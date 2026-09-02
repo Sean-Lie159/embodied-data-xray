@@ -1,6 +1,6 @@
 """profile_data 对象列全列向量分布统计的单元测试。
 
-复现真实 PICO LeRobot 误判：向量串列起始段全零但整体有值，旧版 profile_data 的
+复现真实采集数据误判：向量串列起始段全零但整体有值，旧版 profile_data 的
 sample_values 只取列首 → agent 误判"全 0 疑似未采集"。修复后 profile_data 提供
 全列 zero/nonzero 分布（vector_stats）与样例值说明（sample_values_note）。
 """
