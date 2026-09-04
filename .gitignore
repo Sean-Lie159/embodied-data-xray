@@ -29,6 +29,7 @@ docs/使用日志.md
 docs/技术债.md
 docs/四层语义识别架构.md
 docs/ARCHITECTURE.md
+docs/上下文超限修复设计.md
 
 # 临时提交信息文件
 scripts/_commit_msg_*.txt

@@ -48,6 +48,23 @@ class Settings(BaseSettings):
     max_rows_in_context: int = 500_000
     max_turns: int = 15
 
+    # --- 上下文预算（防 input length too long / HTTP 400）--------------------
+    # 模型上下文窗口（token）。0 = 按内置模型表推定；认不出时按 256K 兜底
+    # （以本项目基准模型 HY3 为准）。**换模型时建议显式配置此项**——
+    # 内置表可能过时，且兜底值对小上下文模型并不安全。
+    context_window_tokens: int = Field(default=0, ge=0)
+    # 上下文可用比例：预算 = 上下文窗口 × 此比例，其余留给 system prompt、
+    # 本轮用户输入与模型输出。
+    context_budget_ratio: float = Field(default=0.6, gt=0.0, le=1.0)
+    # 历史压缩触发阈值占总预算的比例（超出即自动压缩，在送模型之前拦截）。
+    history_budget_ratio: float = Field(default=0.75, gt=0.0, le=1.0)
+    # 单次工具返回硬上限占总预算的比例（第 2 层兜底截断）。
+    tool_output_budget_ratio: float = Field(default=0.25, gt=0.0, le=1.0)
+    # 自动压缩开关。关闭后仅能手动触发，不保证不再撞上下文上限。
+    history_compaction_enabled: bool = True
+    # 压缩时保留最近若干轮的完整工具返回（保持上下文连贯）。
+    history_keep_recent_turns: int = Field(default=3, ge=0)
+
     # --- 质检阈值（check_temporal_sync / check_sensor_sanity 可调阈值）--------
     # 丢帧率触发 fail 的阈值（0.02 = 2%）。
     sync_frame_loss_ratio: float = Field(default=0.02, ge=0.0, le=1.0)
