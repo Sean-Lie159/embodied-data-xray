@@ -19,10 +19,11 @@ from typing import Any
 from agents import RunResult
 from agents.usage import Usage
 
-from app.agent.agent import build_agent, format_tool_activity, run_turn
+from app.agent.agent import build_agent, format_tool_activity, guard_tools, run_turn
 from app.agent.context import RunContext
 from app.config import get_settings
 from app.llm import build_model
+from app.llm.context_window import derive_budget
 from app.tools import (
     check_sensor_sanity,
     check_temporal_sync,
@@ -106,7 +107,17 @@ class ChatService:
     def _build_agent(self):
         settings = get_settings()
         model = build_model(settings)
-        return build_agent(model, _ALL_TOOLS)
+        # 套上工具返回体积护栏（第 2 层防御）：单工具返回绝不超预算。
+        budget = derive_budget(
+            settings.default_model,
+            configured_window=settings.context_window_tokens,
+            budget_ratio=settings.context_budget_ratio,
+            history_ratio=settings.history_budget_ratio,
+            tool_output_ratio=settings.tool_output_budget_ratio,
+        )
+        return build_agent(
+            model, guard_tools(_ALL_TOOLS, budget_tokens=budget.tool_output_budget)
+        )
 
     def reply(self, user_input: str) -> ChatTurn:
         """同步执行单轮对话（内部用 asyncio.run 启动事件循环）。

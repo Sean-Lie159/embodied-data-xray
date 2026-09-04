@@ -67,7 +67,7 @@ def build_agent(model: Model, tools: list[Tool]) -> Agent[RunContext]:
 
     Args:
         model: openai-agents 的 Model 实例。
-        tools: 要注册给 Agent 的工具列表。
+        tools: 要注册给 Agent 的工具列表（应已过 :func:`guard_tools` 包装）。
 
     Returns:
         配置好的 ``Agent`` 实例。
@@ -78,6 +78,71 @@ def build_agent(model: Model, tools: list[Tool]) -> Agent[RunContext]:
         model=model,
         tools=list(tools),
     )
+
+
+# 各工具"档 1 优先丢弃"的次要字段（按丢弃优先级排列）。
+# 原则：先丢可再生的明细/清单，保留结论与计数；未列出的工具只走档 2/3 通用降级。
+_TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
+    "load_dataset": ("subdirs", "ext_dist", "streams"),
+    "profile_data": ("sample_values", "columns"),
+    "inspect_streams": ("streams", "video_streams", "table_streams"),
+    "check_temporal_sync": ("streams_status", "per_stream", "gaps"),
+    "check_sensor_sanity": ("checks", "skipped_checks"),
+    "compute_stats": ("per_episode", "episodes"),
+    "plot_chart": (),
+    "generate_report": ("report_markdown", "content"),
+}
+
+
+def guard_tools(tools: list[Any], *, budget_tokens: int) -> list[Any]:
+    """给工具套上"返回体积护栏"（第 2 层防御，安全网）。
+
+    为什么在 agent 层统一做：即使某个工具自身漏做结构化降级，本层也保证返回
+    绝不超出预算——宁可信息不全，不可撑爆上下文导致 HTTP 400。
+
+    Args:
+        tools: FunctionTool 列表。
+        budget_tokens: 单次工具返回的 token 预算。
+
+    Returns:
+        包装后的工具列表（非 FunctionTool 原样透传，不改动其 schema）。
+    """
+    from agents.tool import FunctionTool
+
+    from app.tools._output_guard import enforce_output_limit
+
+    guarded: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, FunctionTool):
+            guarded.append(tool)
+            continue
+        original_invoke = tool.on_invoke_tool
+        droppable = _TOOL_DROPPABLE.get(tool.name, ())
+
+        async def _invoke(ctx: Any, input_json: str, *,
+                          _orig: Any = original_invoke,
+                          _name: str = tool.name,
+                          _droppable: tuple[str, ...] = droppable) -> Any:
+            raw = await _orig(ctx, input_json)
+            try:
+                return enforce_output_limit(
+                    raw, budget_tokens, droppable=_droppable, tool_name=_name,
+                )
+            except Exception:  # noqa: BLE001
+                # 护栏自身出错不得吞掉工具结果——原样返回（由调用方/SDK 处理）。
+                return raw
+
+        guarded.append(
+            FunctionTool(
+                name=tool.name,
+                description=tool.description,
+                params_json_schema=tool.params_json_schema,
+                on_invoke_tool=_invoke,
+                strict_json_schema=tool.strict_json_schema,
+                is_enabled=tool.is_enabled,
+            )
+        )
+    return guarded
 
 
 async def run_turn(
