@@ -161,6 +161,138 @@ def _nominal_rate(stream: dict[str, Any]) -> float | None:
     return float(rate) if isinstance(rate, (int, float)) and rate > 0 else None
 
 
+# 基线排除的文件名关键词：静态变换广播 / 标定 / 元数据（大小写不敏感，子串匹配）。
+_BASELINE_NAME_EXCLUDE = (
+    "tf_static", "static_tf", "_static", "static_",
+    "calib", "metadata", "metainfo",
+)
+
+
+def _stream_baseline_exclude_reason(
+    path: str,
+    stream: dict[str, Any],
+    n_samples: int,
+    min_samples: int,
+) -> str | None:
+    """判断一条流是否不得作为对齐基线，返回排除原因（不排除返回 None）。
+
+    判据（按语义角色优先原则，参照 detect_episode_mirrors / is_calibration_file 的
+    既有排除先例）：静态变换广播（tf_static 等只发布一次、不随时间变化）、标定
+    文件、元数据表、样本数过少的稀疏流。这些流参与"帧率最低"竞选时会胜出并污染
+    残差（真实事故：以 105 点的 tf_static.jsonl 为基线）。
+
+    Args:
+        path: 流路径（用于文件名关键词判定）。
+        stream: 流登记项（kind / semantic_label）。
+        n_samples: 该流时间戳样本数。
+        min_samples: 基线候选的最小样本数（config.sync_static_min_samples）。
+
+    Returns:
+        排除原因（中文，可直接转述）；不排除返回 None。
+    """
+    name = Path(path).name.lower()
+    if n_samples < min_samples:
+        return f"样本数 {n_samples} < {min_samples}，疑似静态/稀疏流"
+    for kw in _BASELINE_NAME_EXCLUDE:
+        if kw in name:
+            return f"文件名含 {kw!r}，疑似静态/标定/元数据流（不随时间变化，不适合做对齐基准）"
+    if str(stream.get("kind") or "") == "calibration":
+        return "标定文件（不随时间变化）"
+    if "标定" in str(stream.get("semantic_label") or ""):
+        return "语义标签为标定类（不随时间变化）"
+    return None
+
+
+def _recommend_baseline(
+    valid_ts: list[tuple[str, np.ndarray]],
+    per_stream: dict[str, dict[str, Any]],
+    streams: list[dict[str, Any]],
+    settings: Any,
+) -> tuple[str | None, dict[str, Any]]:
+    """推荐对齐基线：先排除静态/标定/元数据流，再按覆盖×稳定×规模打分。
+
+    打分公式：score = coverage_ratio × stability × log10(n_samples)
+      coverage_ratio = 该流时间跨度 / 全部候选流的最大跨度（覆盖完整性）
+      stability      = 1 / (1 + 差分变异系数)（间隔稳定性，抖动越小越高）
+    即"覆盖整段录制、间隔稳定、样本充足"的周期型流优先。
+
+    Args:
+        valid_ts: 可对齐流 [(key, 纳秒时间戳数组)]（单位未知/帧序号流已被排除）。
+        per_stream: 逐流检查数据（取样本数）。
+        streams: 流登记表（取 kind / semantic_label）。
+        settings: 应用配置（sync_static_min_samples / sync_baseline_min_coverage）。
+
+    Returns:
+        (baseline_key, recommendation)。recommendation 含 stream、reason（可直接
+        转述的推荐理由）、score、excluded（被排除的流及原因）；无候选时
+        baseline_key 为 None 并在 note 说明。
+    """
+    meta_by_path = {s.get("path") or "": s for s in streams}
+    spans: dict[str, float] = {}
+    cvs: dict[str, float] = {}
+    for key, ts in valid_ts:
+        if len(ts) < 2:
+            continue
+        t_sorted = np.sort(ts)
+        d = np.diff(t_sorted)
+        d_pos = d[d > 0]
+        spans[key] = float(t_sorted[-1] - t_sorted[0])
+        if len(d_pos) > 1 and float(d_pos.mean()) > 0:
+            cvs[key] = float(d_pos.std() / d_pos.mean())
+        else:
+            cvs[key] = 0.0
+
+    if not spans:
+        return None, {
+            "stream": None, "reason": "无可打分的候选流", "score": None,
+            "excluded": [],
+        }
+
+    max_span = max(spans.values())
+    excluded: list[dict[str, str]] = []
+    candidates: list[tuple[str, float, float, float, int]] = []
+    for key in spans:
+        cov = spans[key] / max_span if max_span > 0 else 0.0
+        reason = _stream_baseline_exclude_reason(
+            key, meta_by_path.get(key, {}), len(per_stream[key]["ts"]),
+            settings.sync_static_min_samples,
+        )
+        if reason:
+            excluded.append({"stream": Path(key).name, "reason": reason})
+            continue
+        if cov < settings.sync_baseline_min_coverage:
+            excluded.append({
+                "stream": Path(key).name,
+                "reason": f"时间覆盖率 {cov:.0%} 低于阈值 "
+                          f"{settings.sync_baseline_min_coverage:.0%}（未覆盖整段录制）",
+            })
+            continue
+        n = int(len(per_stream[key]["ts"]))
+        score = cov * (1.0 / (1.0 + cvs[key])) * float(np.log10(max(n, 10)))
+        candidates.append((key, score, cov, cvs[key], n))
+
+    if not candidates:
+        return None, {
+            "stream": None,
+            "reason": "所有候选流均被排除（静态/标定/元数据/覆盖率不足），"
+                      "无法推荐基线，跳过流间残差与漂移检测",
+            "score": None,
+            "excluded": excluded,
+        }
+
+    best_key, best_score, cov, cv, n = max(candidates, key=lambda x: x[1])
+    recommendation: dict[str, Any] = {
+        "stream": best_key,
+        "reason": (
+            f"覆盖整段录制（{cov:.0%}）、间隔稳定（变异系数 {cv:.2f}）、"
+            f"样本 {n}，为覆盖完整且间隔稳定的周期型流"
+        ),
+        "score": round(best_score, 4),
+        "excluded": excluded,
+    }
+    return best_key, recommendation
+
+
 def _single_stream_checks(
     ts: np.ndarray, nominal: float | None, unit_known: bool = True
 ) -> dict[str, Any]:
@@ -553,27 +685,17 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     )
     episode_note = "未检测到 episode 划分，将整个录制视为单个 episode。"
 
-    # 流间对齐残差 + 漂移：以帧率最低（采样间隔最大）的流为基准。
+    # 流间对齐残差 + 漂移：基线经"排除静态/标定/元数据流 + 打分推荐"选出。
     align: dict[str, Any] = {"baseline": None, "residuals": {}}
     drift: dict[str, Any] = {"detected": False, "detail": {}}
     max_interval_hz = 0.0
-    baseline_key = None
     for key, ts in valid_ts:
         if len(ts) > 1:
             med = float(np.median(np.diff(np.sort(ts))))
             if med > 0 and 1e9 / med > max_interval_hz:
                 max_interval_hz = 1e9 / med  # 纳秒间隔 → Hz
 
-    # 基准 = 帧率最低的流（采样间隔最大）。
-    if valid_ts:
-        min_rate = np.inf
-        for key, ts in valid_ts:
-            if len(ts) > 1:
-                med = float(np.median(np.diff(np.sort(ts))))
-                rate = 1e9 / med if med > 0 else np.inf  # 纳秒间隔 → Hz
-                if rate < min_rate:
-                    min_rate = rate
-                    baseline_key = key
+    baseline_key, baseline_rec = _recommend_baseline(valid_ts, per_stream, streams, settings)
 
     if baseline_key is not None:
         base_ts = per_stream[baseline_key]["ts"]
@@ -695,6 +817,8 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
         "result": result,
         "episode_note": episode_note if not has_episodes else "存在 episode 划分。",
         "baseline_stream": align["baseline"],
+        # 基线推荐说明（含被排除的静态/标定流及原因），模型可直接转述。
+        "baseline_recommendation": baseline_rec,
         "streams_status": streams_status,
         "skipped_checks": skipped_checks,
         # 单位未知/不可用的流显式列出，避免模型把"未参与"误读为"已检查通过"。

@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     sync_drift_slope_ms_per_s: float = Field(default=0.5, ge=0.0)
     # pass 残差阈值：最高帧率流采样间隔的比例（0.5 = 采样间隔的一半）。
     sync_residual_ratio: float = Field(default=0.5, ge=0.0)
+    # 基线推荐：样本数低于该值的流视为静态/稀疏流，不作为对齐基线候选
+    # （真实案例：tf_static.jsonl 仅 105 点被推上基线，残差被严重放大）。
+    sync_static_min_samples: int = Field(default=100, ge=2)
+    # 基线推荐：时间覆盖率（该流跨度 / 最大跨度）低于该值不作为候选。
+    sync_baseline_min_coverage: float = Field(default=0.95, ge=0.0, le=1.0)
 
     # --- 传感器合理性（check_sensor_sanity）阈值 -----------------------------
     # 静止段判定：滑动窗口内加速度计模长的方差低于该值视为静止（g² 或 (m/s²)² 量级）。
