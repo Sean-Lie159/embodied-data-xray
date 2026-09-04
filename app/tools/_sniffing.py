@@ -486,8 +486,10 @@ def is_calibration_file(obj: Any) -> bool:
 def fingerprint_timestamp(sample: pd.DataFrame, columns: list[str]) -> dict[str, Any]:
     """第 2 层：时间戳指纹。
 
-    规则：列名属时间戳候选（_TIMESTAMP_COLS）且数值列单调递增、差分大致均匀
-    （中位数间隔下，差分 < 1.5×中位数的占比 ≥ 0.9）。返回命中的时间戳列与依据。
+    规则：经 ``find_timestamp_columns`` 取主时间戳列（词表命中优先，**词表未命中时
+    走内容指纹回退**，与 ``inspect_streams._read_timestamp_only`` 同源），再校验该列
+    数值单调递增、差分大致均匀（差分 < 1.5×中位数的占比 ≥ 0.9）。返回命中的时间戳
+    列与依据。
 
     Args:
         sample: 表格样本 DataFrame（前若干行）。
@@ -497,13 +499,26 @@ def fingerprint_timestamp(sample: pd.DataFrame, columns: list[str]) -> dict[str,
         dict，present、column（时间戳列名或 None）、evidence（依据说明）、
         layer="content_fingerprint"。
     """
-    candidate_cols = [
-        c for c in columns
-        if str(c).lower().strip() in _TIMESTAMP_COLS and c in sample.columns
-    ]
     from app.tools.timestamp_units import infer_unit, unit_to_ns_factor
 
+    # 主列经统一入口识别（词表 + 指纹回退），避免"登记表用弱逻辑、读时间戳用强
+    # 逻辑"的分裂：此前本函数只查 _TIMESTAMP_COLS 白名单，导致 mcap_log_time_ns
+    # 这类列名被判为无时间戳列、单位落到 unknown。
+    ts_info = find_timestamp_columns(columns, sample)
+    main_col = ts_info.get("main")
+    if main_col is None:
+        return {
+            "present": False, "column": None,
+            "evidence": "无可识别的时间戳列（词表与内容指纹均未命中）",
+            "timestamp_unit": "unknown",
+            "timestamp_unit_basis": "无时间戳列，无法推断单位",
+            "layer": "content_fingerprint",
+        }
+    # 主列不满足指纹校验（如差分不均匀）时，退回备选列继续尝试。
+    candidate_cols = [main_col, *ts_info.get("alternatives", [])]
     for col in candidate_cols:
+        if col not in sample.columns:
+            continue
         s = pd.to_numeric(sample[col], errors="coerce").dropna()
         if len(s) < 3:
             continue
@@ -525,11 +540,16 @@ def fingerprint_timestamp(sample: pd.DataFrame, columns: list[str]) -> dict[str,
                 f"，到纳秒换算 ×{unit_to_ns_factor(unit)}"
                 if unit in ("s", "ms", "us", "ns") else ""
             )
+            # 识别来源透出（词表命中 / 内容指纹回退 / 备选列），便于排查单位误判。
+            if col == main_col:
+                origin = "词表命中" if ts_info.get("source") == "dictionary" else "内容指纹回退"
+            else:
+                origin = "备选列"
             return {
                 "present": True,
                 "column": col,
                 "evidence": (
-                    f"列 {col} 单调递增，间隔中位数 {med:.3g}，"
+                    f"列 {col}（{origin}）单调递增，间隔中位数 {med:.3g}，"
                     f"差分均匀占比 {uniform_ratio:.0%}"
                 ),
                 # 单位推断结果透出（供采样率 / 对齐归一化使用）。

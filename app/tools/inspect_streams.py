@@ -133,9 +133,26 @@ def _measure_rate_from_file(
         mean_interval = float(diffs.mean()) if len(diffs) > 0 else 0.0
         if mean_interval <= 0:
             return {"present": False, "reason": "时间戳间隔非正"}
-        # 归一化到纳秒时按 1e9/间隔(ns) 算 Hz；未归一化时按 1/间隔(秒) 算 Hz。
-        sample_rate = (1e9 / mean_interval if normalized else 1.0 / mean_interval)
-        jitter_ms = float(diffs.std()) / 1e6 if normalized else float(diffs.std()) * 1000.0
+        if not normalized:
+            # 单位未知：不按秒兜底。此前会算出 1e-7 Hz 这类伪值，且与
+            # check_temporal_sync 的兜底结果不一致；现统一为显式不可用。
+            return {
+                "present": True,
+                "sample_rate_hz": None,
+                "jitter_ms": None,
+                "n_samples": int(len(ts)),
+                "timestamp_column": str(ts.name) if ts.name else None,
+                "timestamp_unit": init_unit,
+                "timestamp_unit_basis": (
+                    f"单位未知（{init_unit}），未归一化，采样率与抖动不可计算"
+                    f"——{correction.get('basis', '无法推断时间单位')}"
+                ),
+                "unit_corrected": corrected,
+                "rate_unavailable": True,
+            }
+        # 已归一化到纳秒：采样率 = 1e9 / 平均间隔(ns)。
+        sample_rate = 1e9 / mean_interval
+        jitter_ms = float(diffs.std()) / 1e6
         if corrected:
             # 发生纠正时只显示纠正后的连贯表述，避免与"原始单位 s"拼接自相矛盾。
             unit_note = (
@@ -143,10 +160,7 @@ def _measure_rate_from_file(
                 f"当前按单位 {unit} 归一化到纳秒计算）"
             )
         else:
-            unit_note = (
-                f"（原始单位 {unit}，已归一化到纳秒）"
-                if normalized else f"（原始单位 {init_unit}，未归一化，按秒兜底计算）"
-            )
+            unit_note = f"（原始单位 {unit}，已归一化到纳秒）"
         return {
             "present": True,
             "sample_rate_hz": round(sample_rate, 3),

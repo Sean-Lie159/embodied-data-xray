@@ -24,36 +24,43 @@ from app.tools.inspect_streams import _read_timestamp_only
 from app.tools.timestamp_units import (
     FRAME_UNIT,
     TIME_UNITS,
+    infer_unit,
     self_correct_unit,
     to_ns,
     unit_to_ns_factor,
 )
 
 
-def _read_stream_timestamps(stream: dict[str, Any]) -> np.ndarray | None:
+def _read_stream_timestamps(
+    stream: dict[str, Any],
+) -> tuple[np.ndarray | None, str]:
     """按需读取单条流的原始时间戳序列（文件顺序，不排序）。
 
     Args:
         stream: 流登记项（含 path / format / kind）。
 
     Returns:
-        原始时间戳 numpy 数组（数值化、去 NaN）；读取失败或非表格流返回 None。
+        (原始时间戳 numpy 数组, 时间戳列名)。数组为数值化、去 NaN 结果；
+        读取失败或非表格流返回 (None, "")。列名用于单位交叉校验——流登记表的
+        timestamp_unit 可能判为 unknown，而实际列名（如 mcap_log_time_ns）能
+        重新推断出单位。
     """
     if stream.get("kind") == "video":
-        return None  # 视频流时间戳由 ffprobe 提供，见 _video_ideal_ts
+        return None, ""  # 视频流时间戳由 ffprobe 提供，见 _video_ideal_ts
     path = stream.get("path", "")
     fmt = stream.get("format", "")
     if not path or not Path(path).exists():
-        return None
+        return None, ""
     try:
         ts = _read_timestamp_only(path, fmt)
         if ts is None:
-            return None
+            return None, ""
+        col_name = str(ts.name) if ts.name is not None else ""
         arr = np.asarray(pd_to_numeric(ts), dtype=float)
         arr = arr[~np.isnan(arr)]
-        return arr if len(arr) > 0 else None
+        return (arr, col_name) if len(arr) > 0 else (None, "")
     except Exception:  # noqa: BLE001
-        return None
+        return None, ""
 
 
 def pd_to_numeric(series) -> np.ndarray:
@@ -63,22 +70,20 @@ def pd_to_numeric(series) -> np.ndarray:
     return pd.to_numeric(series, errors="coerce").to_numpy()
 
 
-def _to_seconds(ts: np.ndarray, unit_info: dict[str, Any] | None) -> np.ndarray:
-    """把时间戳换算为秒（供单流检查用）。
+def is_unit_known(unit_info: dict[str, Any] | None) -> bool:
+    """判断时间戳是否已归一化到纳秒基准（单位已知且换算成功）。
 
-    已归一化到纳秒的（normalized=True）除以 1e9；未归一化的（unknown/frame_index）
-    按原值当作秒（仅用于乱序/重复/丢帧等相对检查，不涉绝对时间）。
+    单位未知 / 帧序号的流未归一化，其时长、间隔、采样率等绝对量不可计算——
+    此前这类流被"按秒兜底"换算后，产出的 duration_s=5.28e10（实为纳秒原值）
+    等伪值会污染判定，故此处一律不参与跨流对齐与绝对量计算。
 
     Args:
-        ts: 时间戳数组（可能为纳秒或原值）。
         unit_info: _normalize_to_ns 返回的单位说明。
 
     Returns:
-        秒级时间戳数组。
+        True 表示数组已是纳秒基准，绝对量可信。
     """
-    if unit_info and unit_info.get("normalized"):
-        return np.asarray(ts, dtype=float) / 1e9
-    return np.asarray(ts, dtype=float)
+    return bool(unit_info and unit_info.get("normalized"))
 
 
 def infer_metainfo_unit(arr: np.ndarray, col_name: str) -> str:
@@ -137,12 +142,14 @@ def _normalize_to_ns(ts: np.ndarray, unit: str) -> tuple[np.ndarray, dict[str, A
             "normalized": False,
             "basis": "帧序号时间戳（无物理时间），不参与跨流对齐残差判定",
         }
-    # 单位未知：不硬猜，但为兼容历史数据（未标注单位的秒级时间戳），按秒换算到纳秒。
-    # 说明标注"默认按秒"，使下游可见这是兜底假设而非实测单位。
-    return ts * 1e9, {
+    # 单位未知：不硬猜、不兜底换算，保持原值并标 normalized=False。
+    # 说明（2026-09-04 变更）：此前按秒换算到纳秒，导致纳秒列被放大 1e9 倍后
+    # 又被下游当秒除回，产出 duration_s=5.28e10、残差 2.43e11 等伪值。现改为
+    # 显式不可用——该流不参与跨流对齐，其时长/间隔/采样率一律置 None。
+    return np.asarray(ts, dtype=float), {
         "original_unit": unit or "unknown",
-        "normalized": True,
-        "basis": "单位未知，按秒换算到纳秒（兜底假设，非实测单位；真实采集应带 timestamp_unit）",
+        "normalized": False,
+        "basis": "单位未知，未归一化；该流不参与跨流对齐，时长/间隔/采样率不可计算",
     }
 
 
@@ -155,13 +162,16 @@ def _nominal_rate(stream: dict[str, Any]) -> float | None:
 
 
 def _single_stream_checks(
-    ts: np.ndarray, nominal: float | None
+    ts: np.ndarray, nominal: float | None, unit_known: bool = True
 ) -> dict[str, Any]:
     """单流时间戳检查：单调性、重复、丢帧率、实际采样率、时长。
 
     Args:
-        ts: 原始顺序时间戳数组（**秒**，调用方已统一换算为秒）。
+        ts: 原始顺序时间戳数组（**纳秒**基准；单位未知时为原值）。
         nominal: 标称采样率（Hz），None 时跳过实际 vs 标称对比。
+        unit_known: 时间戳是否已归一化到纳秒基准。False 时绝对量（时长 / 中位
+            间隔 / 采样率）一律置 None 并在 absolute_note 注明不可用，仅保留
+            单位无关的检查项（乱序 / 重复 / 丢帧率——丢帧率是比值，与单位无关）。
 
     Returns:
         dict，含各项测量值与判定标记。
@@ -179,35 +189,42 @@ def _single_stream_checks(
     # 这是"期望帧数"计算唯一自洽的口径；中位差分代表"典型间隔"（受抖动影响的
     # 分布众数附近值），用它乘时长会在抖动存在时系统性虚报丢帧（真实案例：
     # 抖动 6.6ms 使中位 38.6ms < 平均 39.5ms，虚报 2.28% 丢帧并误判 FAIL）。
-    actual_rate = None
-    median_interval_s = None
-    if len(diffs) > 0:
-        med = float(np.median(diffs))
-        mean_d = float(np.mean(diffs))
-        median_interval_s = round(med, 6) if med > 0 else None
-        if mean_d > 0:
-            actual_rate = round(1.0 / mean_d, 3)
+    med = float(np.median(diffs)) if len(diffs) > 0 else 0.0
+    mean_d = float(np.mean(diffs)) if len(diffs) > 0 else 0.0
 
-    # 时长（秒）。
-    duration_s = None
-    if len(ts_sorted) >= 2:
-        duration_s = round(float(ts_sorted[-1] - ts_sorted[0]), 4)
+    # 绝对量（时长 / 中位间隔 / 采样率）：**仅单位已知时计算**。
+    # 单位未知的流此前被"按秒兜底"换算，产出 duration_s=5.28e10（实为纳秒原值）
+    # 等伪值并污染判定；现改为显式置 None 并注明原因。
+    actual_rate = None
+    median_interval_ns = None
+    duration_ns = None
+    absolute_note = None
+    if not unit_known:
+        absolute_note = "不可用：时间戳单位未知，未归一化（该流不参与跨流对齐）"
+    else:
+        if len(diffs) > 0:
+            median_interval_ns = round(med, 3) if med > 0 else None
+            if mean_d > 0:
+                # 输入为纳秒基准：采样率 = 1e9 / 平均间隔(ns)。
+                actual_rate = round(1e9 / mean_d, 3)
+        if len(ts_sorted) >= 2:
+            duration_ns = round(float(ts_sorted[-1] - ts_sorted[0]), 3)
 
     # 丢帧率：**异常间隔累加法**（对抖动鲁棒、对真实缺口敏感）。
     # 旧公式 expected = duration × (中位采样率) + 1 在有抖动时系统性虚报
     # （中位差分 < 平均差分 → expected 虚高 → 把抖动当丢帧）。
     # 新口径：间隔 > 5×中位差分 视为缺口，缺失时长 = Σ(缺口间隔 - 中位差分)，
     # 丢帧率 = 缺失时长 / 总时长。抖动（< 5×中位）不计入；整段缺失被正确累加。
+    # 丢帧率是比值，与单位无关，故单位未知时仍可计算（用原值跨度作分母）。
     frame_loss_ratio = 0.0
     gap_count = 0
-    if duration_s and duration_s > 0 and len(diffs) > 0:
-        med = float(np.median(diffs)) if len(diffs) else 0.0
-        if med > 0:
-            K = 5.0
-            gaps = diffs[diffs > K * med]
-            gap_count = int(len(gaps))
-            missing_duration = float(np.sum(gaps - med)) if len(gaps) else 0.0
-            frame_loss_ratio = round(min(1.0, missing_duration / duration_s), 4)
+    span = float(ts_sorted[-1] - ts_sorted[0]) if len(ts_sorted) >= 2 else None
+    if span and span > 0 and len(diffs) > 0 and med > 0:
+        K = 5.0
+        gaps = diffs[diffs > K * med]
+        gap_count = int(len(gaps))
+        missing_duration = float(np.sum(gaps - med)) if len(gaps) else 0.0
+        frame_loss_ratio = round(min(1.0, missing_duration / span), 4)
 
     # 实际 vs 标称偏差：标称缺失时该项标记为 skipped（不得静默消失）。
     rate_deviation = None
@@ -227,11 +244,13 @@ def _single_stream_checks(
         "frame_loss_ratio": frame_loss_ratio,
         "gap_count": gap_count,
         "actual_rate_hz": actual_rate,
-        "median_interval_s": median_interval_s,
+        # 字段名带单位后缀，杜绝被当作秒解读（duration_s=5.28e10 事故）。
+        "median_interval_ns": median_interval_ns,
+        "duration_ns": duration_ns,
+        "absolute_note": absolute_note,  # 仅单位未知时非 None
         "nominal_rate_hz": nominal,
         "rate_deviation": rate_deviation,
         "nominal_check": nominal_check,
-        "duration_s": duration_s,
     }
 
 
@@ -409,6 +428,7 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                         "unit_info": unit_info,
                         "timestamp_unit": meta_unit,
                         "frame_indexed": frame_indexed,
+                        "unit_known": is_unit_known(unit_info),
                     }
                     if frame_indexed:
                         streams_status[key] = (
@@ -429,11 +449,19 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                                    "source": s.get("path")}
                 streams_status[key] = "未参与：v1 不做视频帧级对齐（容器时间戳不可靠，内容级对齐属 v2）"
         else:
-            ts = _read_stream_timestamps(s)
+            ts, col_name = _read_stream_timestamps(s)
             unit = s.get("timestamp_unit", "unknown")
-            # 单位自我纠正：嗅探判错的单位（如 parquet 时间戳被判 ns 实为 s）经
-            # self_correct_unit 换候选重算，避免算出 2.5e10 Hz 这类非物理值。
-            if ts is not None and unit in TIME_UNITS:
+            # 交叉校验：登记表的 timestamp_unit 可能判为 unknown（列名未命中词表
+            # 时），用实际读到的时间戳列名重推断一次，纠正这类漏判（真实案例：
+            # mcap_log_time_ns 不在 _TIMESTAMP_COLS 内，单位被判 unknown）。
+            if ts is not None and col_name and unit not in TIME_UNITS:
+                name_unit = infer_unit(ts, col_name)["unit"]
+                if name_unit in TIME_UNITS:
+                    unit = name_unit
+            # 单位自我纠正：判错的单位（如 parquet 时间戳被判 ns 实为 s）经
+            # self_correct_unit 换候选重算，避免算出 2.5e10 Hz 这类非物理值；
+            # unknown 亦进入纠正（按数值量级重推断，不再按秒兜底）。
+            if ts is not None:
                 correction = self_correct_unit(ts, unit)
                 if correction.get("corrected"):
                     unit = correction["unit"]
@@ -443,6 +471,9 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
             # 帧序号类时间戳（如 metainfo 的 pts）无物理时间：不参与跨流对齐残差，
             # 但保留用于单流检查（乱序/重复/丢帧）。
             frame_indexed = unit == FRAME_UNIT
+            # 单位未知（未归一化）的流同样不参与跨流对齐：其数值口径不确定，
+            # 混入会产出无意义的残差（真实案例：残差 2.43e11 ms）。
+            unit_known = is_unit_known(unit_info)
             per_stream[key] = {
                 "kind": s.get("kind"),
                 "ts": ts_ns,
@@ -451,20 +482,28 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                 "nominal": _nominal_rate(s),
                 "unit_info": unit_info,
                 "timestamp_unit": unit,
+                "timestamp_column": col_name or None,
                 "frame_indexed": frame_indexed,
+                "unit_known": unit_known,
             }
             if ts is None:
                 streams_status[key] = "未参与：无法读取时间戳列"
             elif frame_indexed:
                 streams_status[key] = "仅单流检查：帧序号时间戳（不参与跨流对齐残差判定）"
+            elif not unit_known:
+                streams_status[key] = (
+                    "仅单流检查：时间戳单位未知，未归一化"
+                    "（不参与跨流对齐，时长/采样率不可计算）"
+                )
             else:
                 streams_status[key] = "参与对齐"
 
-    # 可对齐流数：统计能实际读到时间戳列、且为真实时间（非帧序号）的流。
-    # 帧序号流（frame_indexed）仅做单流检查，不参与跨流对齐残差判定。
+    # 可对齐流数：统计能实际读到时间戳列、且已归一化到纳秒基准的真实时间流。
+    # 帧序号流（frame_indexed）与单位未知流均只做单流检查，不参与跨流对齐残差。
     alignable = [
         k for k, p in per_stream.items()
         if p["ts"] is not None and not p.get("frame_indexed", False)
+        and p.get("unit_known", False)
     ]
     n_alignable = len(alignable)
     if n_alignable < 2:
@@ -480,6 +519,7 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
     # 单流检查。
     stream_checks: dict[str, Any] = {}
     valid_ts = []
+    unit_warnings: list[str] = []  # 单位未知/不可用的流，显式列出供模型转达
     for key, p in per_stream.items():
         if p["ts"] is None:
             # 无法参与对齐的流：标注未参与原因，不进入判定依据。
@@ -487,18 +527,25 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                                   "status": "skipped",
                                   "reason": streams_status.get(key, "无法读取时间戳")}
             continue
-        # 单流检查用秒；p["ts"] 已统一为纳秒（normalized）或原值（unknown/frame）。
-        ts_sec = _to_seconds(p["ts"], p.get("unit_info"))
-        checks = _single_stream_checks(ts_sec, p.get("nominal"))
+        # 单流检查直接用纳秒基准数组；单位未知时绝对量由函数内置 None。
+        unit_known = p.get("unit_known", is_unit_known(p.get("unit_info")))
+        checks = _single_stream_checks(p["ts"], p.get("nominal"), unit_known)
         checks["present"] = True
         # 透出该流时间戳的原始单位与换算说明（供核对归一化是否正确）。
         if p.get("unit_info"):
             checks["timestamp_unit"] = p.get("timestamp_unit")
             checks["timestamp_unit_basis"] = p["unit_info"].get("basis")
         stream_checks[key] = checks
-        # 仅真实时间流进入跨流对齐残差 / 漂移判定（帧序号流已在上方排除）。
-        if not p.get("frame_indexed", False):
+        # 仅"已归一化到纳秒"的真实时间流进入跨流对齐残差 / 漂移判定
+        # （帧序号流与单位未知流均已在上方排除）。
+        if not p.get("frame_indexed", False) and unit_known:
             valid_ts.append((key, p["ts"]))
+        elif not unit_known and p["ts"] is not None:
+            unit_warnings.append(
+                f"流 {Path(key).name}：时间戳单位未知（列名 "
+                f"{p.get('timestamp_column') or '未识别'} 未推断出时间单位），"
+                "未归一化，不参与跨流对齐，其时长/采样率不可计算"
+            )
 
     # episode 口径：无 episode 划分时整段视为一个 episode。
     has_episodes = bool(capabilities.get("has_episodes")) or bool(
@@ -597,6 +644,11 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
         user_message += " 检出漂移，该数据集可能各设备独立打钟，建议物理对齐实测。"
     if drift_note:
         user_message += f" {drift_note}"
+    if unit_warnings:
+        user_message += (
+            f" 有 {len(unit_warnings)} 条流的时间戳单位未能确定，已排除在跨流对齐之外，"
+            "其时长与采样率不可计算（详见 unit_warnings）。"
+        )
 
     # 质检结果写回 meta["qc"]，供 compute_stats / generate_report 读取质检明细。
     qc = context.meta.setdefault("qc", {})
@@ -613,9 +665,11 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                     "duplicate_count": v.get("duplicate_count"),
                     "frame_loss_ratio": v.get("frame_loss_ratio"),
                     "actual_rate_hz": v.get("actual_rate_hz"),
+                    "duration_ns": v.get("duration_ns"),
                 } if v.get("present") else {"status": "skipped", "reason": v.get("reason")}
                 for k, v in stream_checks.items()
             },
+            "unit_warnings": unit_warnings,
             "residuals": {
                 k: {"residual_max_ms": v.get("residual_max_ms"),
                     "residual_mean_ms": v.get("residual_mean_ms")}
@@ -643,6 +697,8 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
         "baseline_stream": align["baseline"],
         "streams_status": streams_status,
         "skipped_checks": skipped_checks,
+        # 单位未知/不可用的流显式列出，避免模型把"未参与"误读为"已检查通过"。
+        "unit_warnings": unit_warnings,
         "measurements": {
             "stream_checks": stream_checks,
             "residuals": align["residuals"],

@@ -209,9 +209,14 @@ def self_correct_unit(
     （s/ms/us/ns），取首个使采样率落回合理区间的单位。返回里记录纠正前后单位与
     依据。无法找到合理单位则保留初始单位。
 
+    初始单位为 unknown 时（2026-09-04 扩展）：先按数值量级重新推断一个起点单位，
+    再走上述流程；量级亦无法推断时保留 unknown，绝不无依据硬猜。初始单位为
+    frame_index 时不参与纠正——帧序号是整数计数序列，无量级语义，按量级推断会
+    被误判成时间单位。
+
     Args:
         ts: 时间戳数组（数值型）。
-        initial_unit: 初步推断的单位（s/ms/us/ns；frame_index/unknown 不参与纠正）。
+        initial_unit: 初步推断的单位（s/ms/us/ns/unknown；frame_index 不参与纠正）。
 
     Returns:
         dict，含 unit（纠正后单位）、corrected（是否发生纠正）、
@@ -224,9 +229,19 @@ def self_correct_unit(
     if med is None or med <= 0:
         return {"unit": initial_unit, "corrected": False, "sample_rate_hz": None,
                 "basis": "时间戳差分无效，无法纠正"}
-    if initial_unit not in _UNIT_TO_NS:
+    if initial_unit == FRAME_UNIT:
         return {"unit": initial_unit, "corrected": False, "sample_rate_hz": None,
-                "basis": "非时间单位，不参与纠正"}
+                "basis": "帧序号时间戳无物理时间，不参与单位纠正"}
+
+    # 单位未知：以数值量级推断结果为起点重估（不留无依据的兜底假设）。
+    from_unknown = False
+    if initial_unit not in _UNIT_TO_NS:
+        magnitude_unit = infer_unit(arr)["unit"]
+        if magnitude_unit not in _UNIT_TO_NS:
+            return {"unit": initial_unit, "corrected": False, "sample_rate_hz": None,
+                    "basis": f"单位未知（{initial_unit}），按数值量级亦无法推断时间单位，不参与纠正"}
+        from_unknown = True
+        initial_unit = magnitude_unit
 
     def _rate_for(unit: str) -> float:
         # 中位差分（该单位值）× 到纳秒倍数 = 纳秒间隔；采样率 = 1e9 / 间隔。
@@ -238,6 +253,11 @@ def self_correct_unit(
 
     rate = _rate_for(initial_unit)
     if _plausible(rate):
+        if from_unknown:
+            return {"unit": initial_unit, "corrected": True, "corrected_from": "unknown",
+                    "sample_rate_hz": round(rate, 3),
+                    "basis": f"单位由 unknown 经数值量级推断为 {initial_unit}"
+                             f"（采样率 {rate:.3g}Hz 在合理区间）"}
         return {"unit": initial_unit, "corrected": False, "sample_rate_hz": round(rate, 3),
                 "basis": f"单位 {initial_unit} 采样率 {rate:.3g}Hz 在合理区间，无需纠正"}
 
@@ -269,6 +289,10 @@ def self_correct_unit(
                 "basis": f"单位经自我纠正：{initial_unit}→{alt}（{initial_unit} 采样率 "
                          f"{rate:.3g}Hz 超物理区间，{alt} 得 {r2:.3g}Hz 在合理区间）",
             }
+    if from_unknown:
+        return {"unit": "unknown", "corrected": False, "sample_rate_hz": round(rate, 3),
+                "basis": f"单位由 unknown 经量级推断为 {initial_unit}，但其采样率 "
+                         f"{rate:.3g}Hz 超物理区间且所有候选单位均不落回区间，保留 unknown"}
     return {"unit": initial_unit, "corrected": False, "sample_rate_hz": round(rate, 3),
             "basis": f"所有候选单位采样率均超物理区间，保留初始单位 {initial_unit}"}
 

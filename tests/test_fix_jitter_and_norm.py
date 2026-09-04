@@ -68,10 +68,12 @@ def test_actual_rate_uses_mean_not_median() -> None:
     n = 500
     ts = np.cumsum(0.040 + rng.uniform(-0.003, 0.003, n))
     r = _single_stream_checks(ts, nominal=None)
-    duration = r["duration_s"]
-    assert r["actual_rate_hz"] is not None and duration
+    # 2026-09-04：字段名统一为纳秒口径（duration_ns），守恒式需换算回秒。
+    assert r["duration_ns"] is not None
+    duration_s = r["duration_ns"] / 1e9
+    assert r["actual_rate_hz"] is not None and duration_s
     # 守恒：rate × duration ≈ n（偏差 <2%）。
-    assert abs(r["actual_rate_hz"] * duration - n) / n < 0.02
+    assert abs(r["actual_rate_hz"] * duration_s - n) / n < 0.02
 
 
 # ---- 修复 2：采样率口径统一（inspect_streams 与 check_temporal_sync 一致）----

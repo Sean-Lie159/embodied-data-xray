@@ -111,7 +111,8 @@ def test_inspect_rate_normalized_to_ns(tmp_path) -> None:
     ts = np.arange(0, 1000 * 1000, 1000, dtype=float)  # 1000 个样本，间隔 1000us
     pd.DataFrame({"timestamp": ts, "x": 1, "y": 1, "z": 1}).to_csv(path, index=False)
 
-    # 未归一化（unit=unknown）→ 会误算成 1/1000us = 0.001 Hz。
+    # 单位未知（None）：2026-09-04 起经**量级自我纠正**推断为 us → 同为 1000 Hz。
+    # 旧行为是按秒兜底算成 0.001 Hz（伪值），此用例现在守护"不再产出伪值"。
     bad = _measure_rate_from_file(str(path), "csv", ["x", "y", "z"], None)
     # 显式给 us 单位 → 归一化到 ns → 1000 Hz。
     good = _measure_rate_from_file(str(path), "csv", ["x", "y", "z"], "us")
@@ -119,7 +120,12 @@ def test_inspect_rate_normalized_to_ns(tmp_path) -> None:
     assert good["sample_rate_hz"] == 1000.0
     assert good["timestamp_unit"] == "us"
     assert "归一化" in good["timestamp_unit_basis"] or "纳秒" in good["timestamp_unit_basis"]
-    assert bad["sample_rate_hz"] != 1000.0  # 未归一化必然算错
+    # 单位未知时也应得到物理正确的采样率，而非按秒兜底的伪值。
+    assert bad["sample_rate_hz"] == 1000.0, (
+        f"单位未知时应经量级推断纠正为 us，实得 {bad['sample_rate_hz']} "
+        f"（{bad.get('timestamp_unit_basis')}）"
+    )
+    assert bad["unit_corrected"] is True
 
 
 # --- 单位自我纠正（C1） ----------------------------------------------------
