@@ -90,6 +90,32 @@ def _main() -> None:
         )
         render_token_stats(last_usage, cumulative)
 
+        # 上下文管理：历史体积 + 手动压缩（对应"二者皆做"的手动入口）。
+        st.divider()
+        st.caption("上下文管理")
+        stats = service.history_stats()
+        st.write(
+            f"历史：约 {stats['turns']} 轮 · 估算 {stats['estimated_tokens']:,} token"
+        )
+        last_c = stats.get("last_compaction")
+        if last_c:
+            st.caption(
+                f"上次压缩：{last_c['compacted_outputs']} 条 · "
+                f"{last_c['before_tokens']:,} → {last_c['after_tokens']:,} token"
+                f"（省约 {last_c['saved_tokens']:,}）"
+            )
+        if st.button("压缩历史", help="把较早轮次的工具返回明细压缩为结论摘要"):
+            if not service.history_input:
+                st.info("历史为空，无需压缩。")
+            else:
+                r = service.compact_now()
+                st.success(
+                    f"已压缩 {r['compacted_outputs']} 条旧工具返回（保留最近 "
+                    f"{r['kept_turns']} 轮完整）：{r['before_tokens']:,} → "
+                    f"{r['after_tokens']:,} token（省约 {r['saved_tokens']:,}）"
+                )
+                st.rerun()
+
     left, right = st.columns([1, 1.2], gap="large")
 
     # ---- 左侧：对话区（固定高度独立滚动容器）----
