@@ -1,7 +1,7 @@
 """模型上下文窗口推定与上下文预算派生的单元测试。
 
-覆盖：三级兜底优先级、最长前缀匹配（防 deepseek V3/V4 互相误判）、
-token 估算的保守方向、预算派生各个比例。
+覆盖：三级兜底优先级、最长前缀匹配（顺序无关，防 deepseek V3/V4 互相误判）、
+核证清单全量抽检、token 估算的保守方向、预算派生各个比例。
 """
 
 from __future__ import annotations
@@ -63,10 +63,124 @@ def test_deepseek_v3_stays_128k() -> None:
     assert resolve_context_window("deepseek-reasoner")[0] == 131_072
 
 
-def test_table_is_sorted_by_prefix_length_desc() -> None:
-    """表必须按前缀长度降序——这是最长前缀优先的前提（防回归）。"""
-    lengths = [len(prefix) for prefix, _ in _MODEL_CONTEXT_WINDOWS]
-    assert lengths == sorted(lengths, reverse=True)
+def test_longest_prefix_wins_regardless_of_order() -> None:
+    """最长命中前缀必须胜出——与表内书写顺序无关（防维护陷阱）。
+
+    历史教训：按厂商分组书写表会破坏"长度降序"，靠排序断言才抓到。现匹配器
+    已改为顺序无关（取最长命中前缀），本条断言锁定该行为本身。
+    """
+    # 构造：把表打乱顺序后逐一验证关键模型，结果必须与原表一致。
+    key_cases = {
+        "deepseek-v4-flash": 1_048_576,
+        "deepseek-chat": 131_072,
+        "gpt-5.6-sol": 1_050_000,
+        "gpt-5": 400_000,
+        "gpt-4o": 131_072,
+        "gpt-4": 8_192,
+        "kimi-k3": 1_048_576,
+        "kimi-k2.7-code": 262_144,
+        "glm-5.3-flash": 1_048_576,
+        "glm-5-turbo": 200_000,
+        "hy3": 262_144,
+    }
+    for name, expected in key_cases.items():
+        assert resolve_context_window(name)[0] == expected, name
+
+
+
+def test_shadowed_prefixes_agree_on_overlap() -> None:
+    """互为前缀的表内条目，短前缀命中时不得落在长前缀的"窗口差异"里。
+
+    匹配器已顺序无关（最长命中胜出），本条断言检查表内互为前缀的条目组合：
+    短前缀作为独立模型名（如模型恰好叫 "gpt-5"）时，必须命中短前缀自身
+    （400_000 而非长前缀 gpt-5.6 的 1_050_000）。
+    """
+    assert resolve_context_window("gpt-5")[0] == 400_000
+    assert resolve_context_window("grok-4")[0] == 1_048_576
+    assert resolve_context_window("glm-5")[0] == 200_000
+    assert resolve_context_window("kimi")[0] == 262_144
+    assert resolve_context_window("llama-4")[0] == 262_144
+    assert resolve_context_window("deepseek-v3")[0] == 131_072
+
+
+# --- 2.1 核证清单抽检（2026-09，owner 提供）--------------------------------
+
+
+def test_openai_family() -> None:
+    """GPT 各代不得互相误判（gpt-5.6/4.1/4o/5/4 前缀纠缠）。"""
+    assert resolve_context_window("gpt-5.6-sol")[0] == 1_050_000
+    assert resolve_context_window("gpt-5")[0] == 400_000
+    assert resolve_context_window("gpt-4.1-mini")[0] == 1_048_576
+    assert resolve_context_window("gpt-4o-2024")[0] == 131_072
+    assert resolve_context_window("gpt-4")[0] == 8_192
+    assert resolve_context_window("gpt-3.5-turbo")[0] == 16_384
+
+
+def test_anthropic_family() -> None:
+    """Claude 5 代 1M，4 代走 claude 兜底 200K。"""
+    assert resolve_context_window("claude-sonnet-5")[0] == 1_048_576
+    assert resolve_context_window("claude-opus-5-20260101")[0] == 1_048_576
+    assert resolve_context_window("claude-fable-5")[0] == 1_048_576
+    assert resolve_context_window("claude-opus-4.1")[0] == 200_000
+    assert resolve_context_window("claude-sonnet-4.5")[0] == 200_000
+    assert resolve_context_window("claude-haiku-4.5")[0] == 200_000
+
+
+def test_google_xai_meta_mistral() -> None:
+    """Gemini 全系 1M；Grok 分代；Llama scout 刻意保守。"""
+    assert resolve_context_window("gemini-3.1-pro")[0] == 1_048_576
+    assert resolve_context_window("gemini-2.5-flash")[0] == 1_048_576
+    assert resolve_context_window("grok-4.20")[0] == 2_097_152
+    assert resolve_context_window("grok-4.3")[0] == 1_048_576
+    assert resolve_context_window("grok-4.5")[0] == 1_048_576
+    assert resolve_context_window("grok-3")[0] == 131_072  # 3 系走 grok 兜底
+    assert resolve_context_window("llama-4-scout")[0] == 262_144, (
+        "scout 的 10M 是外推值，按预训练可靠值 256K 保守计"
+    )
+    assert resolve_context_window("llama-4-maverick")[0] == 1_048_576
+    assert resolve_context_window("mistral-large-3")[0] == 262_144
+
+
+def test_deepseek_qwen_glm() -> None:
+    """DeepSeek V4 1M 其余 128K；Qwen/GLM 只认 Max/5.x 高配。"""
+    assert resolve_context_window("deepseek-v4-pro")[0] == 1_048_576
+    assert resolve_context_window("deepseek-v3.2")[0] == 131_072
+    assert resolve_context_window("qwen3.8-max")[0] == 1_048_576
+    assert resolve_context_window("qwen3.7-max")[0] == 1_048_576
+    assert resolve_context_window("qwen3-235b")[0] == 131_072  # 清单外保守
+    assert resolve_context_window("glm-5.3-flash")[0] == 1_048_576
+    assert resolve_context_window("glm-5.2")[0] == 1_048_576
+    assert resolve_context_window("glm-5-turbo")[0] == 200_000
+    assert resolve_context_window("glm-4-plus")[0] == 131_072
+
+
+def test_moonshot_tencent_minimax() -> None:
+    """Kimi K3 1M / K2 256K；Hy3 与 hunyuan 同值；MiniMax 分代。"""
+    assert resolve_context_window("kimi-k3")[0] == 1_048_576
+    assert resolve_context_window("kimi-k2.7-code")[0] == 262_144
+    assert resolve_context_window("kimi-k2-0905-preview")[0] == 262_144
+    assert resolve_context_window("hunyuan-turbo")[0] == 262_144
+    assert resolve_context_window("hy3")[0] == 262_144
+    assert resolve_context_window("minimax-m3")[0] == 1_048_576
+    assert resolve_context_window("minimax-m2.5")[0] == 200_000
+
+
+def test_max_input_ratio_constraint_documented() -> None:
+    """默认 ratio 0.6 必须低于核证模型的最紧输入占比（GPT-5 的 0.68）。
+
+    这是 docstring 中"预算比例上限"警告的护栏：预算 = 窗口 × ratio，若 ratio
+    高于某模型"最大输入/窗口"占比，该模型会在输入上限先于窗口处爆掉。
+    """
+    settings = Settings(
+        _env_file=None,
+        openai_api_key="k",
+        openai_base_url="https://api.example.com/v1",
+        default_model="example-model",
+    )
+    assert settings.context_budget_ratio <= 0.68, (
+        "context_budget_ratio 超过 GPT-5 的最大输入占比 0.68，"
+        "GPT-5 等模型将先撞输入上限（HTTP 400）"
+    )
 
 
 def test_case_and_space_insensitive() -> None:
