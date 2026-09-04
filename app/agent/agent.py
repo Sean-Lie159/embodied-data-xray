@@ -18,6 +18,23 @@ from app.agent.context import RunContext
 # MaxTurnsExceeded 分支 result 为 None（此时 final_output 已由本函数生成友好提示）。
 RunTurnResult = tuple[str, list[TResponseInputItem], RunResult | None]
 
+# 历史压缩阈值与保留轮数（由服务层按配置注入）。
+# 默认 0 = 不自动压缩（未注入配置时保持既有行为，不引入意外副作用）。
+_history_budget_tokens: int = 0
+_history_keep_recent_turns: int = 3
+
+
+def configure_history_compaction(*, budget_tokens: int, keep_recent_turns: int) -> None:
+    """注入历史压缩参数（由服务层按配置调用一次）。
+
+    Args:
+        budget_tokens: 历史 token 阈值，超过即自动压缩；<=0 表示关闭自动压缩。
+        keep_recent_turns: 压缩时保留最近若干轮的完整工具返回。
+    """
+    global _history_budget_tokens, _history_keep_recent_turns
+    _history_budget_tokens = max(0, int(budget_tokens))
+    _history_keep_recent_turns = max(1, int(keep_recent_turns))
+
 # 主 Agent 的中文系统提示词。
 SYSTEM_PROMPT: str = """\
 你是一名具身智能数据分析助手，服务于机器人数据集（LeRobot、HDF5、Parquet、CSV 等）的分析场景。\
@@ -170,6 +187,20 @@ async def run_turn(
     Raises:
         ConfigError: 工具或模型配置异常。
     """
+    # 第 3 层防御：历史压缩。**在送给模型之前**拦截（不是爆了再压）——
+    # 历史超阈值即把旧轮次的工具返回原文压缩为结论摘要。
+    if history_input is not None and _history_budget_tokens > 0:
+        from app.agent.history_compaction import (
+            compact_history,
+            estimate_history_tokens,
+        )
+
+        if estimate_history_tokens(history_input) > _history_budget_tokens:
+            history_input, _stats = compact_history(
+                history_input, keep_recent_turns=_history_keep_recent_turns
+            )
+            context.last_compaction = _stats
+
     # 组装本轮输入：有历史时，把历史与用户本轮消息拼接；否则仅用用户消息。
     if history_input is not None:
         user_msg: TResponseInputItem = {"role": "user", "content": user_input}

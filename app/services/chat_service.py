@@ -19,7 +19,18 @@ from typing import Any
 from agents import RunResult
 from agents.usage import Usage
 
-from app.agent.agent import build_agent, format_tool_activity, guard_tools, run_turn
+from app.agent.agent import (
+    build_agent,
+    configure_history_compaction,
+    format_tool_activity,
+    guard_tools,
+    run_turn,
+)
+from app.agent.history_compaction import (
+    _split_turns,
+    compact_history,
+    estimate_history_tokens,
+)
 from app.agent.context import RunContext
 from app.config import get_settings
 from app.llm import build_model
@@ -90,6 +101,11 @@ def extract_usage(result: RunResult | None) -> dict[str, int] | None:
         return None
 
 
+def _count_turns(history: list[Any]) -> int:
+    """统计历史中的轮数（按 user 消息切分）。"""
+    return len(_split_turns(history)) if history else 0
+
+
 class ChatService:
     """管理 agent、RunContext 与对话历史的对话服务。
 
@@ -103,6 +119,8 @@ class ChatService:
         self.agent = self._build_agent()
         self.context = RunContext()
         self.history_input: list[Any] | None = None
+        # 注入历史压缩参数（自动压缩开关在配置中控制）。
+        self._configure_compaction()
 
     def _build_agent(self):
         settings = get_settings()
@@ -118,6 +136,57 @@ class ChatService:
         return build_agent(
             model, guard_tools(_ALL_TOOLS, budget_tokens=budget.tool_output_budget)
         )
+
+    def _configure_compaction(self) -> None:
+        """按配置注入历史压缩参数（自动压缩开关在此生效）。"""
+        settings = get_settings()
+        budget = derive_budget(
+            settings.default_model,
+            configured_window=settings.context_window_tokens,
+            budget_ratio=settings.context_budget_ratio,
+            history_ratio=settings.history_budget_ratio,
+            tool_output_ratio=settings.tool_output_budget_ratio,
+        )
+        configure_history_compaction(
+            budget_tokens=(
+                budget.history_budget if settings.history_compaction_enabled else 0
+            ),
+            keep_recent_turns=settings.history_keep_recent_turns,
+        )
+        self._compaction_settings = settings
+
+    def history_stats(self) -> dict[str, Any]:
+        """返回当前历史的体积统计（供 UI/CLI 展示）。
+
+        Returns:
+            dict，含 turns（轮数）、estimated_tokens（估算 token）、
+            last_compaction（最近一次压缩统计或 None）。
+        """
+        history = self.history_input or []
+        return {
+            "turns": _count_turns(history),
+            "estimated_tokens": estimate_history_tokens(history),
+            "last_compaction": self.context.last_compaction,
+        }
+
+    def compact_now(self) -> dict[str, Any]:
+        """手动压缩历史（不经过阈值判断，立即执行）。
+
+        Returns:
+            压缩统计（compact_history 的 stats；无历史时返回零值统计）。
+        """
+        if not self.history_input:
+            return {
+                "compacted_outputs": 0, "before_tokens": 0, "after_tokens": 0,
+                "saved_tokens": 0, "total_turns": 0, "kept_turns": 0,
+            }
+        settings = getattr(self, "_compaction_settings", None)
+        keep = settings.history_keep_recent_turns if settings else 3
+        self.history_input, stats = compact_history(
+            self.history_input, keep_recent_turns=keep
+        )
+        self.context.last_compaction = stats
+        return stats
 
     def reply(self, user_input: str) -> ChatTurn:
         """同步执行单轮对话（内部用 asyncio.run 启动事件循环）。

@@ -37,6 +37,9 @@ class RunContext:
     meta: dict = field(default_factory=dict)
     output_dir: str = "outputs"
     findings: list = field(default_factory=list)
+    # 最近一次历史压缩的统计（未压缩过为 None）；由 run_turn 在自动压缩时写入，
+    # 供 UI/CLI 展示"已压缩 N 条、节省约 X token"。
+    last_compaction: dict | None = None
 
     def output_path(self) -> Path:
         """返回输出目录的绝对路径，目录不存在时自动创建。"""
