@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     sync_baseline_min_coverage: float = Field(default=0.95, ge=0.0, le=1.0)
     # gap 定位（locate_gaps=True）每流最多返回的缺口条数（控制上下文体积）。
     sync_gap_report_limit: int = Field(default=20, ge=1)
+    # 突发型流判定：平均间隔 ≥ 中位间隔 × 该倍数即判 burst（突发间静默拉高均值；
+    # 真实案例：IMU 突发内 1.79µs、均值 1.26ms，比值约 700）。判定依据见
+    # docs/时间对齐能力改造设计.md 4.5 节（实现时修正为 mean/med 比值判据）。
+    sync_burst_interval_ratio: float = Field(default=3.0, gt=1.0)
 
     # --- 传感器合理性（check_sensor_sanity）阈值 -----------------------------
     # 静止段判定：滑动窗口内加速度计模长的方差低于该值视为静止（g² 或 (m/s²)² 量级）。

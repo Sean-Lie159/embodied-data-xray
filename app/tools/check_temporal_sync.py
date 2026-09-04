@@ -295,9 +295,12 @@ def _recommend_baseline(
 
 
 def _single_stream_checks(
-    ts: np.ndarray, nominal: float | None, unit_known: bool = True
+    ts: np.ndarray,
+    nominal: float | None,
+    unit_known: bool = True,
+    settings: Any = None,
 ) -> dict[str, Any]:
-    """单流时间戳检查：单调性、重复、丢帧率、实际采样率、时长。
+    """单流时间戳检查：单调性、重复、丢帧率、实际采样率、时长、形态分类。
 
     Args:
         ts: 原始顺序时间戳数组（**纳秒**基准；单位未知时为原值）。
@@ -305,9 +308,11 @@ def _single_stream_checks(
         unit_known: 时间戳是否已归一化到纳秒基准。False 时绝对量（时长 / 中位
             间隔 / 采样率）一律置 None 并在 absolute_note 注明不可用，仅保留
             单位无关的检查项（乱序 / 重复 / 丢帧率——丢帧率是比值，与单位无关）。
+        settings: 应用配置（形态分类阈值）；缺省时读取 get_settings()。
 
     Returns:
-        dict，含各项测量值与判定标记。
+        dict，含各项测量值与判定标记（含 stream_shape；burst 流的
+        frame_loss_ratio 为 None 并附 frame_loss_status="not_applicable"）。
     """
     ts_sorted = np.sort(ts)
     diffs = np.diff(ts_sorted)
@@ -370,7 +375,12 @@ def _single_stream_checks(
     else:
         nominal_check = {"status": "skipped", "reason": "无法实测采样率"}
 
-    return {
+    # 流形态分类与突发型流指标改报（2026-09-04 Commit D）。
+    # 突发型流（MCAP 录制的 tf / IMU：突发内 1–2µs、突发间毫秒级静默）的
+    # "丢帧率"没有物理意义——突发间静默全部超过 5×中位间隔，被系统性误报为
+    # 丢帧（真实案例 0.9986）。对 burst 流改报有效速率与突发统计。
+    shape = _classify_stream_shape(ts, settings or get_settings())
+    result: dict[str, Any] = {
         "n_samples": int(len(ts)),
         "disorder_count": disorder,
         "duplicate_count": duplicates,
@@ -381,10 +391,62 @@ def _single_stream_checks(
         "median_interval_ns": median_interval_ns,
         "duration_ns": duration_ns,
         "absolute_note": absolute_note,  # 仅单位未知时非 None
+        "stream_shape": shape,
         "nominal_rate_hz": nominal,
         "rate_deviation": rate_deviation,
         "nominal_check": nominal_check,
     }
+    if shape == "burst":
+        result["frame_loss_ratio"] = None
+        result["frame_loss_status"] = "not_applicable"
+        result["burst_note"] = (
+            "突发型流：丢帧率与常规采样率口径不适用（突发间静默会被误报为丢帧），"
+            "改用有效速率与突发次数刻画"
+        )
+        # 突发统计：大间隔（> 2×中位）的数量即突发段切换数，段数 = 大间隔数 + 1。
+        big_gaps = int(np.sum(diffs > 2.0 * med)) if len(diffs) else 0
+        result["n_bursts"] = big_gaps + 1 if len(diffs) else 0
+        if unit_known:
+            result["intra_burst_median_interval_ns"] = median_interval_ns
+            if span and span > 0:
+                # 有效速率 = 样本数 / 时长（对突发流唯一有意义的速率口径）。
+                result["effective_rate_hz"] = round(len(ts) / (span / 1e9), 3)
+    return result
+
+
+def _classify_stream_shape(
+    ts: np.ndarray, settings: Any
+) -> str:
+    """按差分分布对流做时间形态分类：periodic / burst / static。
+
+    判据（确定性，见 docs/时间对齐能力改造设计.md 4.5；实现时修正）：
+    - static：样本数 < sync_static_min_samples，或中位间隔 > 流自身跨度/10
+      （点太稀，"平均多久一条"没有意义）；
+    - burst：平均间隔 ≥ 中位间隔 × sync_burst_interval_ratio——突发型流
+      （如 MCAP 录制的 tf / IMU）在突发内间隔极小、突发间静默，均值被静默
+      段拉高而中位数不变（真实数据：IMU 均值 1.26ms / 中位 1.79µs ≈ 700）；
+    - 其余为 periodic（周期型）。
+
+    Args:
+        ts: 纳秒基准时间戳数组。
+        settings: 应用配置（sync_static_min_samples / sync_burst_interval_ratio）。
+
+    Returns:
+        形态名："periodic" / "burst" / "static"。
+    """
+    ts_sorted = np.sort(np.asarray(ts, dtype=float))
+    if len(ts_sorted) < 2:
+        return "static"
+    diffs = np.diff(ts_sorted)
+    med = float(np.median(diffs)) if len(diffs) else 0.0
+    span = float(ts_sorted[-1] - ts_sorted[0])
+    if len(ts_sorted) < settings.sync_static_min_samples:
+        return "static"
+    if med > 0 and span > 0 and med > span / 10:
+        return "static"
+    if med > 0 and float(diffs.mean()) >= settings.sync_burst_interval_ratio * med:
+        return "burst"
+    return "periodic"
 
 
 def _locate_gaps(ts: np.ndarray, max_report: int) -> dict[str, Any]:
@@ -429,35 +491,51 @@ def _locate_gaps(ts: np.ndarray, max_report: int) -> dict[str, Any]:
 
 
 def _align_residuals(base_ts: np.ndarray, other_ts: np.ndarray) -> dict[str, Any]:
-    """以 base_ts 为基准，对 other_ts 做最近邻匹配，统计残差分布。
+    """以 base_ts 为基准，对 other_ts 做最近邻匹配，统计残差分布（向量化）。
+
+    对 other 的每个时间戳，在 base 中找最近点（searchsorted 定位后取左右候选），
+    残差 = 最近 base 时间戳 − 该 other 时间戳（带符号）。除绝对值统计外，输出
+    带符号中位数与分位数——带符号中位数即"目标流相对基线的固定时延"估计量
+    （正值 = 目标流比基线晚），此前只有绝对值口径，回答不了"A 比 B 晚多少"。
 
     Args:
-        base_ts: 基准流时间戳（排序后）。
-        other_ts: 待对齐流时间戳（排序后）。
+        base_ts: 基准流时间戳（任意顺序，内部排序）。
+        other_ts: 待对齐流时间戳（任意顺序，内部排序）。
 
     Returns:
-        dict，含 n_match、residual_mean_ms、residual_max_ms、residual_p95_ms。
+        dict，含 n_match、residual_mean_ms、residual_max_ms、residual_p95_ms
+        （绝对值口径）与 residual_median_signed_ms / residual_p05_ms /
+        residual_p95_signed_ms（带符号口径）。
     """
     base_sorted = np.sort(base_ts)
     other_sorted = np.sort(other_ts)
     if len(base_sorted) == 0 or len(other_sorted) == 0:
-        return {"n_match": 0, "residual_mean_ms": None,
-                "residual_max_ms": None, "residual_p95_ms": None}
-    # 最近邻：对每个 other 时间戳找 base 中最近点。
-    residuals = []
-    for t in other_sorted:
-        idx = np.searchsorted(base_sorted, t)
-        best = np.inf
-        for j in (idx - 1, idx, min(idx, len(base_sorted) - 1)):
-            if 0 <= j < len(base_sorted):
-                best = min(best, abs(base_sorted[j] - t))
-        residuals.append(best)
-    res = np.asarray(residuals) / 1e6  # 纳秒 → 毫秒
+        return {
+            "n_match": 0, "residual_mean_ms": None, "residual_max_ms": None,
+            "residual_p95_ms": None, "residual_median_signed_ms": None,
+            "residual_p05_ms": None, "residual_p95_signed_ms": None,
+        }
+    # 向量化最近邻：searchsorted 一次定位全部 other 时间戳，取左右两个候选，
+    # 保留绝对差更小的（等价于原逐点三候选逻辑，且修掉了 idx=0 时负索引的歧义）。
+    # 带符号残差约定：other − nearest_base，正值 = 目标流比基线晚。
+    n_base = len(base_sorted)
+    idx = np.searchsorted(base_sorted, other_sorted)
+    idx_r = np.clip(idx, 0, n_base - 1)
+    idx_l = np.clip(idx - 1, 0, n_base - 1)
+    d_r = other_sorted - base_sorted[idx_r]
+    d_l = other_sorted - base_sorted[idx_l]
+    signed = np.where(np.abs(d_r) <= np.abs(d_l), d_r, d_l)  # 纳秒，带符号
+    res = signed / 1e6  # 纳秒 → 毫秒
+    abs_res = np.abs(res)
     return {
         "n_match": int(len(res)),
-        "residual_mean_ms": round(float(np.mean(res)), 3),
-        "residual_max_ms": round(float(np.max(res)), 3),
-        "residual_p95_ms": round(float(np.percentile(res, 95)), 3),
+        "residual_mean_ms": round(float(abs_res.mean()), 3),
+        "residual_max_ms": round(float(abs_res.max()), 3),
+        "residual_p95_ms": round(float(np.percentile(abs_res, 95)), 3),
+        # 带符号口径：中位数 = 固定时延估计；p05/p95 给出方向与离散度。
+        "residual_median_signed_ms": round(float(np.percentile(res, 50)), 3),
+        "residual_p05_ms": round(float(np.percentile(res, 5)), 3),
+        "residual_p95_signed_ms": round(float(np.percentile(res, 95)), 3),
     }
 
 
@@ -484,22 +562,20 @@ def _detect_drift(
     base_sorted = np.sort(base_ts)
     other_sorted = np.sort(other_ts)
 
-    # 对基准流每个时间戳，找待测流最近邻，得带符号偏移（ms）。
+    # 对基准流每个时间戳，找待测流最近邻，得带符号偏移（ms）。向量化：
+    # searchsorted 一次定位全部基准时间戳，取左右候选中绝对差更小者。
     # 最近邻只吸收采样离散误差（≤半采样间隔），只要漂移大于采样间隔，
     # 偏移随绝对时间单调增大，能被线性回归捕捉。
-    base_times: list[float] = []
-    offsets: list[float] = []
-    for b in base_sorted:
-        idx = int(np.searchsorted(other_sorted, b))
-        best: tuple[float, float] | None = None  # (abs_diff, signed_diff)
-        for j in (idx - 1, idx, min(idx, len(other_sorted) - 1)):
-            if 0 <= j < len(other_sorted):
-                d = other_sorted[j] - b
-                if best is None or abs(d) < best[0]:
-                    best = (abs(d), d)
-        if best is not None:
-            base_times.append(float(b) / 1e9)      # 纳秒 → 秒
-            offsets.append(best[1] / 1e6)          # 纳秒 → 毫秒
+    n_other = len(other_sorted)
+    idx = np.searchsorted(other_sorted, base_sorted)
+    idx_r = np.clip(idx, 0, n_other - 1)
+    idx_l = np.clip(idx - 1, 0, n_other - 1)
+    d_r = other_sorted[idx_r] - base_sorted
+    d_l = other_sorted[idx_l] - base_sorted
+    signed_ns = np.where(np.abs(d_r) <= np.abs(d_l), d_r, d_l)
+
+    base_times = base_sorted / 1e9          # 纳秒 → 秒
+    offsets = signed_ns / 1e6               # 纳秒 → 毫秒
 
     if len(offsets) < 3:
         return {"drift_detected": False, "drift_slope_ms_per_s": None,
@@ -752,7 +828,7 @@ def check_temporal_sync_impl(
             continue
         # 单流检查直接用纳秒基准数组；单位未知时绝对量由函数内置 None。
         unit_known = p.get("unit_known", is_unit_known(p.get("unit_info")))
-        checks = _single_stream_checks(p["ts"], p.get("nominal"), unit_known)
+        checks = _single_stream_checks(p["ts"], p.get("nominal"), unit_known, settings)
         checks["present"] = True
         # 透出该流时间戳的原始单位与换算说明（供核对归一化是否正确）。
         if p.get("unit_info"):
@@ -762,8 +838,14 @@ def check_temporal_sync_impl(
         checks["timestamp_column"] = p.get("timestamp_column")
         stream_checks[key] = checks
         # gap 定位（locate_gaps=True）：缺口位置是相对量，与单位无关，对单位
-        # 未知的流同样可用（但注明时间口径未知）。
-        if locate_gaps:
+        # 未知的流同样可用（但注明时间口径未知）。burst 流的突发间静默不视为
+        # 缺口，不输出 gap 定位。
+        if locate_gaps and checks.get("stream_shape") == "burst":
+            checks["gaps"] = {
+                "gaps": [], "total": 0, "truncated": False,
+                "note": "突发型流：突发间静默不视为缺口，不输出 gap 定位",
+            }
+        elif locate_gaps:
             gap_info = _locate_gaps(p["ts"], settings.sync_gap_report_limit)
             if not unit_known:
                 gap_info["note"] = "时间戳单位未知：缺口位置为原值口径的相对量，非物理时刻"
@@ -836,6 +918,15 @@ def check_temporal_sync_impl(
                 align["residuals"][key] = {"n_match": len(ts),
                                            "is_baseline": True}
             else:
+                # 突发型流不参与漂移检测：跨突发的最近邻偏移是纯噪声（突发间
+                # 静默的相位差），线性回归会误报漂移。残差仍输出（供参考）。
+                if stream_checks.get(key, {}).get("stream_shape") == "burst":
+                    drift["detail"][key] = {
+                        "drift_detected": False,
+                        "drift_slope_ms_per_s": None,
+                        "note": "突发型流：不参与漂移检测（最近邻跨突发，偏移噪声无意义）",
+                    }
+                    continue
                 res = _align_residuals(base_ts, ts)
                 align["residuals"][key] = {**res, "is_baseline": False}
                 d = _detect_drift(
@@ -846,9 +937,9 @@ def check_temporal_sync_impl(
                 if d.get("drift_detected"):
                     drift["detected"] = True
 
-    # 三档判定。
+    # 三档判定。burst 流的 frame_loss_ratio 为 None（口径不适用），不计入。
     frame_loss_bad = any(
-        c.get("frame_loss_ratio", 0) > settings.sync_frame_loss_ratio
+        (c.get("frame_loss_ratio") or 0) > settings.sync_frame_loss_ratio
         for c in stream_checks.values() if c.get("present")
     )
     drift_flag = drift["detected"]
