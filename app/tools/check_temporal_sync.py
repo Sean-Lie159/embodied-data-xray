@@ -32,12 +32,13 @@ from app.tools.timestamp_units import (
 
 
 def _read_stream_timestamps(
-    stream: dict[str, Any],
+    stream: dict[str, Any], column_hint: str | None = None
 ) -> tuple[np.ndarray | None, str]:
     """按需读取单条流的原始时间戳序列（文件顺序，不排序）。
 
     Args:
         stream: 流登记项（含 path / format / kind）。
+        column_hint: 可选，指定时间戳列（列名或子串，如 "log_time"）。
 
     Returns:
         (原始时间戳 numpy 数组, 时间戳列名)。数组为数值化、去 NaN 结果；
@@ -52,7 +53,7 @@ def _read_stream_timestamps(
     if not path or not Path(path).exists():
         return None, ""
     try:
-        ts = _read_timestamp_only(path, fmt)
+        ts = _read_timestamp_only(path, fmt, column_hint)
         if ts is None:
             return None, ""
         col_name = str(ts.name) if ts.name is not None else ""
@@ -386,6 +387,47 @@ def _single_stream_checks(
     }
 
 
+def _locate_gaps(ts: np.ndarray, max_report: int) -> dict[str, Any]:
+    """定位时间戳序列中的数据缺口（与丢帧判定同口径：间隔 > 5×中位差分）。
+
+    Args:
+        ts: 纳秒基准时间戳数组（单位未知时为原值——缺口位置是相对量，
+            仍可用，但注明时间口径未知）。
+        max_report: 最多返回的缺口条数（超出时返回前 N 条并注明总数）。
+
+    Returns:
+        dict，含 gaps（[{start_ns, end_ns, duration_ns, missing_frames_est}]）、
+        total（缺口总数）、truncated（是否因上限截断）。
+    """
+    ts_sorted = np.sort(np.asarray(ts, dtype=float))
+    if len(ts_sorted) < 2:
+        return {"gaps": [], "total": 0, "truncated": False}
+    diffs = np.diff(ts_sorted)
+    med = float(np.median(diffs)) if len(diffs) else 0.0
+    if med <= 0:
+        return {"gaps": [], "total": 0, "truncated": False}
+    K = 5.0
+    gap_idx = np.where(diffs > K * med)[0]
+    total = int(len(gap_idx))
+    gaps: list[dict[str, Any]] = []
+    for i in gap_idx[:max_report]:
+        start = float(ts_sorted[i])
+        end = float(ts_sorted[i + 1])
+        duration = end - start
+        gaps.append({
+            "start_ns": start,
+            "end_ns": end,
+            "duration_ns": round(duration, 3),
+            # 估算缺失帧数：缺口时长 / 中位间隔，向下取整。
+            "missing_frames_est": int(duration / med) - 1 if med > 0 else None,
+        })
+    return {
+        "gaps": gaps,
+        "total": total,
+        "truncated": total > len(gaps),
+    }
+
+
 def _align_residuals(base_ts: np.ndarray, other_ts: np.ndarray) -> dict[str, Any]:
     """以 base_ts 为基准，对 other_ts 做最近邻匹配，统计残差分布。
 
@@ -486,23 +528,66 @@ def _detect_drift(
     }
 
 
-def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, Any]:
+def check_temporal_sync_impl(
+    context: RunContext,
+    settings=None,
+    baseline_stream: str | None = None,
+    streams: list[str] | None = None,
+    time_column: str | None = None,
+    locate_gaps: bool = False,
+) -> dict[str, Any]:
     """执行时间同步检查（v1，仅时间戳一致性）。
 
     Args:
         context: 运行时上下文（复用 meta.streams）。
         settings: 应用配置（阈值）；缺省时读取 get_settings()。
+        baseline_stream: 可选，指定对齐基线流（路径/文件名子串）。省略时自动
+            推荐（排除静态/标定/元数据流后按覆盖×稳定×规模打分）。指定且无法
+            匹配任何可对齐流时返回结构化错误并列出候选，不静默回退。
+        streams: 可选，只检查这些流（文件名子串列表）。省略时检查全部流。
+            指定且无任何流匹配时返回结构化错误并列出可用流名。
+        time_column: 可选，指定时间戳列（列名或子串，如 "log_time"）。省略时
+            自动识别（词表 + 指纹回退；多时间列时物理时间优先）。
+        locate_gaps: 默认 False；置 True 时逐流定位数据缺口的起止时刻、持续
+            时长与估算缺失帧数（条数受 sync_gap_report_limit 限制）。
 
     Returns:
         统一质检返回格式：success、verification_level、result（pass/warn/fail）、
-        measurements、thresholds、affected_episodes、user_message。
+        measurements、thresholds、affected_episodes、user_message、
+        baseline_recommendation、unit_warnings。
 
     Raises:
         不直接抛出异常；错误以结构化 dict 返回。
     """
     settings = settings or get_settings()
-    streams = context.meta.get("streams", [])
+    all_streams = context.meta.get("streams", [])
     capabilities = context.meta.get("capabilities", {})
+
+    # 流子集过滤：按文件名子串匹配（大小写不敏感）。指定且无匹配时返回结构化
+    # 错误并列出可用流名，不静默检查全部——静默会令模型误以为子集过滤生效。
+    stream_filter = streams
+    streams = all_streams
+    if stream_filter:
+        available_names = [Path(s.get("path") or "").name or str(s.get("kind") or "")
+                           for s in all_streams]
+        matched = [
+            s for s in all_streams
+            if any(p.lower() in Path(s.get("path") or "").name.lower()
+                   for p in stream_filter)
+        ]
+        if not matched:
+            return {
+                "success": False,
+                "error": "streams_no_match",
+                "reason": f"streams 过滤条件 {stream_filter} 未匹配到任何流",
+                "user_message": (
+                    f"streams 过滤条件 {stream_filter} 未匹配到任何流。"
+                    f"当前数据集共 {len(available_names)} 条流，可用流名示例："
+                    f"{available_names[:10]}{' …' if len(available_names) > 10 else ''}。"
+                    "请用文件名的子串（如 'left_glove'、'imu'）重新指定。"
+                ),
+            }
+        streams = matched
 
     # 视频 ↔ metainfo 配对映射（type=media_metainfo），用于视频流时间戳级对齐。
     # 值为 (metainfo 路径, 格式)，格式来自配对登记（不再硬编码 csv）。
@@ -581,7 +666,7 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                                    "source": s.get("path")}
                 streams_status[key] = "未参与：v1 不做视频帧级对齐（容器时间戳不可靠，内容级对齐属 v2）"
         else:
-            ts, col_name = _read_stream_timestamps(s)
+            ts, col_name = _read_stream_timestamps(s, time_column)
             unit = s.get("timestamp_unit", "unknown")
             # 交叉校验：登记表的 timestamp_unit 可能判为 unknown（列名未命中词表
             # 时），用实际读到的时间戳列名重推断一次，纠正这类漏判（真实案例：
@@ -619,7 +704,13 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                 "unit_known": unit_known,
             }
             if ts is None:
-                streams_status[key] = "未参与：无法读取时间戳列"
+                if time_column:
+                    streams_status[key] = (
+                        f"未参与：指定时间列 {time_column!r} 无法匹配（读取失败或"
+                        "该列不存在）"
+                    )
+                else:
+                    streams_status[key] = "未参与：无法读取时间戳列"
             elif frame_indexed:
                 streams_status[key] = "仅单流检查：帧序号时间戳（不参与跨流对齐残差判定）"
             elif not unit_known:
@@ -667,7 +758,16 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
         if p.get("unit_info"):
             checks["timestamp_unit"] = p.get("timestamp_unit")
             checks["timestamp_unit_basis"] = p["unit_info"].get("basis")
+        # 实际采用的时间戳列名（time_column 参数指定或自动识别的结果）。
+        checks["timestamp_column"] = p.get("timestamp_column")
         stream_checks[key] = checks
+        # gap 定位（locate_gaps=True）：缺口位置是相对量，与单位无关，对单位
+        # 未知的流同样可用（但注明时间口径未知）。
+        if locate_gaps:
+            gap_info = _locate_gaps(p["ts"], settings.sync_gap_report_limit)
+            if not unit_known:
+                gap_info["note"] = "时间戳单位未知：缺口位置为原值口径的相对量，非物理时刻"
+            checks["gaps"] = gap_info
         # 仅"已归一化到纳秒"的真实时间流进入跨流对齐残差 / 漂移判定
         # （帧序号流与单位未知流均已在上方排除）。
         if not p.get("frame_indexed", False) and unit_known:
@@ -696,6 +796,37 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
                 max_interval_hz = 1e9 / med  # 纳秒间隔 → Hz
 
     baseline_key, baseline_rec = _recommend_baseline(valid_ts, per_stream, streams, settings)
+
+    # 用户指定基线：按文件名子串匹配可对齐流。指定且无法匹配时返回结构化错误
+    # 并列出候选，不静默回退到自动推荐——静默回退会令模型误以为指定已生效。
+    if baseline_stream:
+        hint = baseline_stream.lower()
+        matched = [(k, ts) for k, ts in valid_ts if hint in Path(k).name.lower()]
+        if not matched:
+            return {
+                "success": False,
+                "error": "baseline_no_match",
+                "reason": f"baseline_stream={baseline_stream!r} 未匹配到任何可对齐流",
+                "user_message": (
+                    f"指定的基线流 {baseline_stream!r} 未匹配到任何可对齐流。"
+                    f"当前可对齐流（已读到纳秒基准时间戳）共 {len(valid_ts)} 条："
+                    f"{[Path(k).name for k, _ in valid_ts][:10]}。"
+                    "请用文件名子串重新指定，或省略该参数改用自动推荐。"
+                ),
+            }
+        baseline_key = matched[0][0]
+        baseline_rec = {
+            "stream": baseline_key,
+            "reason": f"由用户指定（参数 baseline_stream={baseline_stream!r}，"
+                      f"匹配到 {Path(baseline_key).name}）",
+            "score": None,
+            "excluded": [],
+        }
+        if len(matched) > 1:
+            baseline_rec["note"] = (
+                f"子串匹配到 {len(matched)} 条流，取第一条 "
+                f"{Path(baseline_key).name}；如需精确指定请提供更完整的文件名"
+            )
 
     if baseline_key is not None:
         base_ts = per_stream[baseline_key]["ts"]
@@ -843,18 +974,42 @@ def check_temporal_sync_impl(context: RunContext, settings=None) -> dict[str, An
 @tool
 def check_temporal_sync(
     wrapper: RunContextWrapper[RunContext],
+    baseline_stream: str | None = None,
+    streams: list[str] | None = None,
+    time_column: str | None = None,
+    locate_gaps: bool = False,
 ) -> dict:
     """检查各流之间的时间同步与漂移（v1，仅时间戳一致性）。
 
-    基于流登记表逐流读取时间戳，检查单调性、重复、丢帧率、采样率、时长，并做
-    流间最近邻对齐残差与窗口漂移检测。verification_level=timestamp_consistency，
-    物理级对齐需互相关实测（未来 v2）。
+    逐流读取时间戳，检查单调性、重复、丢帧率、采样率、时长，并做流间最近邻
+    对齐残差与窗口漂移检测。默认自动推荐基线并对全部可对齐流检查；可用参数
+    收窄范围（如只比对左右手套、指定基线流、定位数据缺口）。
 
     Args:
-        无（基于 RunContext.meta）。
+        baseline_stream: 可选，指定对齐基线流（路径或文件名的子串，如
+            "left_glove_emf_poses"）。省略时自动推荐（排除静态/标定/元数据流，
+            按"覆盖全时长 + 间隔稳定 + 帧数充足"打分）。指定值无法匹配任何
+            可对齐流时返回结构化错误并列出可用候选，不静默回退。
+        streams: 可选，只检查这些流（文件名子串列表，如 ["left_glove",
+            "right_glove"] 表示只比对左右手套）。省略时检查全部流；指定且无
+            匹配时返回结构化错误并列出可用流名。
+        time_column: 可选，指定用哪一列作为时间戳（列名或子串，如
+            "log_time"）。数据集含多个时间列（如 MCAP 的 log_time 与
+            publish_time）时用它明确指定；省略时自动识别。
+        locate_gaps: 默认 False。置 True 时额外定位每条流的数据缺口（起止
+            时刻、持续时长、估算缺失帧数），用于回答"缺口发生在什么时刻"。
 
     Returns:
-        统一质检返回格式：result（pass/warn/fail）、measurements、thresholds、
-        affected_episodes、user_message；流数不足时返回 not_applicable。
+        统一质检返回格式：result（pass/warn/fail）、measurements（stream_checks
+        逐流指标，时长/间隔字段带 _ns 单位后缀；residuals 相对基线的最近邻
+        残差）、thresholds、affected_episodes、user_message、
+        baseline_recommendation（基线推荐理由与排除清单）、unit_warnings
+        （单位未知的流清单）。流数不足时返回 not_applicable。
     """
-    return check_temporal_sync_impl(wrapper.context)
+    return check_temporal_sync_impl(
+        wrapper.context,
+        baseline_stream=baseline_stream,
+        streams=streams,
+        time_column=time_column,
+        locate_gaps=locate_gaps,
+    )

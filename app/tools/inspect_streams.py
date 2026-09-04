@@ -28,15 +28,46 @@ from app.tools import _sniffing
 _TIMESTAMP_COLS = _sniffing._TIMESTAMP_COLS
 
 
-def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
+def _resolve_timestamp_column(
+    columns: list[str], main: str | None, column_hint: str | None
+) -> str | None:
+    """按 column_hint 解析时间戳列名（无 hint 时用自动识别主列）。
+
+    Args:
+        columns: 全部列名。
+        main: find_timestamp_columns 自动识别的主列（可 None）。
+        column_hint: 用户指定的时间列（列名或子串，大小写不敏感）。
+
+    Returns:
+        实际采用的时间戳列名；hint 指定了但无列可匹配时返回 None（调用方
+        应向模型明确报"指定列不存在"，不得静默回退到主列）。
+    """
+    if not column_hint:
+        return main
+    hint = column_hint.lower()
+    exact = [c for c in columns if str(c).lower() == hint]
+    if exact:
+        return exact[0]
+    partial = [c for c in columns if hint in str(c).lower()]
+    if partial:
+        return partial[0]
+    return None  # hint 明确但匹配不到：让调用方报错，不静默回退
+
+
+def _read_timestamp_only(
+    path: str, fmt: str, column_hint: str | None = None
+) -> pd.Series | None:
     """按需读取文件的时间戳列（不读全量，立即释放）。
 
     列识别经 find_timestamp_columns：词表命中优先，未命中则内容指纹回退
     （单调递增 + 量级符合时间单位）；主列选择物理时间 > 帧序号。
+    column_hint 指定时优先用该列（精确或子串匹配）；指定且匹配不到任何列时
+    返回 None，由调用方在 streams_status 中注明"指定时间列不存在"。
 
     Args:
         path: 文件路径。
         fmt: 格式（csv / parquet / json / jsonl）。
+        column_hint: 可选，指定时间戳列（列名或子串）。
 
     Returns:
         时间戳列 Series（其 name 为列名）；无时间戳列或读取失败返回 None。
@@ -51,19 +82,25 @@ def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
             df_head = pd.read_csv(path, encoding=encoding, nrows=0, engine="python")
             sample = pd.read_csv(path, encoding=encoding, nrows=sample_rows, engine="python")
             ts_info = find_timestamp_columns(list(df_head.columns), sample)
-            if ts_info["main"] is None:
+            col = _resolve_timestamp_column(
+                list(df_head.columns), ts_info["main"], column_hint
+            )
+            if col is None:
                 return None
-            return pd.read_csv(path, encoding=encoding, usecols=[ts_info["main"]], engine="python")[ts_info["main"]]
+            return pd.read_csv(path, encoding=encoding, usecols=[col], engine="python")[col]
         if fmt == "parquet":
             import pyarrow.parquet as pq
 
             pf = pq.ParquetFile(path)
             sample = pf.read().slice(0, sample_rows).to_pandas()
             ts_info = find_timestamp_columns(list(pf.schema.names), sample)
-            if ts_info["main"] is None:
+            col = _resolve_timestamp_column(
+                list(pf.schema.names), ts_info["main"], column_hint
+            )
+            if col is None:
                 return None
-            table = pf.read(columns=[ts_info["main"]])
-            return pd.Series(table.column(ts_info["main"]).to_pylist(), name=ts_info["main"])
+            table = pf.read(columns=[col])
+            return pd.Series(table.column(col).to_pylist(), name=col)
         if fmt == "json":
             # 经统一 reader 读取（JSON 顶层 dict 按行列表键 frames/data 展开，
             # 避免把标量键如 fps 当数据列）。
@@ -73,7 +110,10 @@ def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
             if df is None:
                 return None
             ts_info = find_timestamp_columns(list(df.columns), df.head(sample_rows))
-            return df[ts_info["main"]] if ts_info["main"] else None
+            col = _resolve_timestamp_column(
+                list(df.columns), ts_info["main"], column_hint
+            )
+            return df[col] if col else None
         if fmt == "jsonl":
             # JSONL：经统一 reader 逐行解析（lines=True），与 .json 严格区分。
             from app.tools import _data_access
@@ -82,7 +122,10 @@ def _read_timestamp_only(path: str, fmt: str) -> pd.Series | None:
             if df is None:
                 return None
             ts_info = find_timestamp_columns(list(df.columns), df.head(sample_rows))
-            return df[ts_info["main"]] if ts_info["main"] else None
+            col = _resolve_timestamp_column(
+                list(df.columns), ts_info["main"], column_hint
+            )
+            return df[col] if col else None
         return None
     except Exception:  # noqa: BLE001
         return None

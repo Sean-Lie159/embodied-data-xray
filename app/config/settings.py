@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     sync_static_min_samples: int = Field(default=100, ge=2)
     # 基线推荐：时间覆盖率（该流跨度 / 最大跨度）低于该值不作为候选。
     sync_baseline_min_coverage: float = Field(default=0.95, ge=0.0, le=1.0)
+    # gap 定位（locate_gaps=True）每流最多返回的缺口条数（控制上下文体积）。
+    sync_gap_report_limit: int = Field(default=20, ge=1)
 
     # --- 传感器合理性（check_sensor_sanity）阈值 -----------------------------
     # 静止段判定：滑动窗口内加速度计模长的方差低于该值视为静止（g² 或 (m/s²)² 量级）。
