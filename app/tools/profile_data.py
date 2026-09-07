@@ -16,7 +16,10 @@ from app.agent.context import RunContext
 from app.tools import _data_access
 
 
-def profile_data_impl(context: RunContext, max_unique: int = 20, table: str | None = None) -> dict:
+def profile_data_impl(
+    context: RunContext, max_unique: int = 20, table: str | None = None,
+    expand: bool = False,
+) -> dict:
     """分析当前已加载的数据集并返回概况。
 
     支持多表：缺省 table=None 分析主表；显式传 table 按流登记表按名惰性读取指定
@@ -37,7 +40,7 @@ def profile_data_impl(context: RunContext, max_unique: int = 20, table: str | No
     Raises:
         不直接抛出异常；错误以结构化 dict 的 error 字段返回，便于 Agent 恢复。
     """
-    resolved = _data_access.resolve_table_name(context, table)
+    resolved = _data_access.resolve_table_name(context, table, expand=expand)
     if not resolved["success"]:
         if resolved.get("error") == "table_not_found" or resolved.get("error") == "table_read_failed":
             return {
@@ -239,6 +242,7 @@ def profile_data(
     wrapper: RunContextWrapper[RunContext],
     max_unique: int = 20,
     table: str | None = None,
+    expand: bool = False,
 ) -> dict:
     """分析当前已加载数据集并返回概况。
 

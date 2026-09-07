@@ -87,7 +87,8 @@ def _split_imu_channels(
     """
     lower_name = filename.lower()
     accel = [c for c in channels if "accel" in c]
-    gyro = [c for c in channels if ("gyro" in c or "gyr" in c)]
+    # "angular"：ROS Imu 的 angular_velocity.*（展开视图列名）→ 陀螺仪惯例。
+    gyro = [c for c in channels if ("gyro" in c or "gyr" in c or "angular" in c)]
     # 通用列（x/y/z）按文件名归属。
     generic = [c for c in channels if str(c).lower().strip() in ("x", "y", "z")]
     if not accel and not gyro and generic:
@@ -325,6 +326,7 @@ def _imu_check_units(
     context: RunContext,
     imu_streams: list[dict[str, Any]],
     table: str | None,
+    expand: bool = False,
 ) -> list[dict[str, Any]]:
     """构建 IMU 检查单元（单流或 accel+gyro 配对组），按流登记表惰性读数据。
 
@@ -349,7 +351,7 @@ def _imu_check_units(
 
     # 显式指定表：按名解析，不要求 kind=imu（如直接检查 accel.csv）。
     if table is not None:
-        resolved = _data_access.resolve_table_name(context, table)
+        resolved = _data_access.resolve_table_name(context, table, expand=expand)
         if resolved["success"]:
             s = next((x for x in streams if Path(x.get("path", "")).name.lower() == table.lower()), None)
             channels = (s or {}).get("channels", []) or list(resolved["df"].columns)
@@ -414,10 +416,28 @@ def _imu_check_units(
         if imu.get("path") in used:
             continue
         key = imu.get("path") or "imu"
-        accel_cols, gyro_cols = _split_imu_channels(imu.get("channels", []), key)
         path = imu.get("path", "")
         fmt = imu.get("format", "")
-        data = _read_columns(path, fmt, accel_cols + gyro_cols) if path else {}
+        if expand and fmt in ("jsonl", "json"):
+            # 展开模式：读全表 → 展开信封 → 从展开列拆 accel/gyro
+            # （data.linear_acceleration.* / data.angular_velocity.*）。
+            from app.tools._data_access import expand_envelope, read_stream_full
+
+            df_full = read_stream_full(path, fmt) if path else None
+            if df_full is not None:
+                df_exp, _ = expand_envelope(df_full)
+                accel_cols, gyro_cols = _split_imu_channels(
+                    list(df_exp.columns), key
+                )
+                data = {
+                    c: df_exp[c].to_numpy(dtype=float)
+                    for c in accel_cols + gyro_cols if c in df_exp.columns
+                }
+            else:
+                accel_cols, gyro_cols, data = [], [], {}
+        else:
+            accel_cols, gyro_cols = _split_imu_channels(imu.get("channels", []), key)
+            data = _read_columns(path, fmt, accel_cols + gyro_cols) if path else {}
         rate = (imu.get("measured_rate") or {}).get("sample_rate_hz") if isinstance(imu.get("measured_rate"), dict) else None
         units.append({
             "key": key,
@@ -431,7 +451,10 @@ def _imu_check_units(
     return units
 
 
-def check_sensor_sanity_impl(context: RunContext, settings=None, table: str | None = None) -> dict[str, Any]:
+def check_sensor_sanity_impl(
+    context: RunContext, settings=None, table: str | None = None,
+    expand: bool = False,
+) -> dict[str, Any]:
     """执行传感器数据合理性检查。
 
     Args:
@@ -448,7 +471,26 @@ def check_sensor_sanity_impl(context: RunContext, settings=None, table: str | No
     streams = context.meta.get("streams", [])
     dataset_id = context.dataset_id
 
-    imu_streams = [s for s in streams if s.get("kind") == "imu"]
+    if expand:
+        # 展开模式：IMU 候选放宽——信封流（jsonl/json）虽 kind=unknown，但
+        # 嵌套发现（signal_fields）含 accel/gyro 特征向量时即为确定性 IMU 证据
+        # （真实案例：MCAP 信封流的 data.linear_acceleration / angular_velocity）。
+        def _is_imu_candidate(s: dict[str, Any]) -> bool:
+            if s.get("kind") == "imu":
+                return True
+            if str(s.get("format", "")).lower() not in ("jsonl", "json"):
+                return False
+            names = [
+                str(x.get("path", "")).lower()
+                for x in (s.get("signal_fields") or []) if isinstance(x, dict)
+            ]
+            return any(
+                "accel" in n or "angular" in n or "gyr" in n for n in names
+            )
+
+        imu_streams = [s for s in streams if _is_imu_candidate(s)]
+    else:
+        imu_streams = [s for s in streams if s.get("kind") == "imu"]
     force_streams = [s for s in streams if s.get("kind") == "force"]
     has_episodes = bool(capabilities.get("has_episodes")) or bool(
         context.meta.get("episode_ids")
@@ -471,7 +513,7 @@ def check_sensor_sanity_impl(context: RunContext, settings=None, table: str | No
     warns: list[str] = []
 
     # ---- IMU 检查单元（含配对与单流；指定 table 时仅该表）----
-    imu_units = _imu_check_units(context, imu_streams, table)
+    imu_units = _imu_check_units(context, imu_streams, table, expand=expand)
     for imu in imu_units:
         key = imu["key"]
         accel_cols = imu["accel_cols"]
@@ -789,4 +831,4 @@ def check_sensor_sanity(
         统一质检返回格式：result、checks、skipped_checks、dataset、user_message；
         无可检查流时返回 not_applicable。
     """
-    return check_sensor_sanity_impl(wrapper.context, table=table)
+    return check_sensor_sanity_impl(wrapper.context, table=table, expand=expand)

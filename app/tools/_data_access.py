@@ -289,7 +289,138 @@ def read_table_nrows(path: str, fmt: str) -> int | None:
         return None
 
 
-def resolve_table_name(context: RunContext, table: str | None) -> dict[str, Any]:
+def expand_envelope(
+    df: "pd.DataFrame",
+    max_depth: int = 6,
+    max_cols: int = 64,
+) -> tuple["pd.DataFrame", "str | None"]:
+    """把信封型 DataFrame 的 object 列（dict/list）展开为扁平列（只读视图）。
+
+    规则：
+    - dict 递归展开为 ``data.orientation.x`` 等点分列名（键并集取自前 50 行样本）；
+    - 数值 list 展开为 ``col.0..col.N``（N 为模态长度，上限 32；短行补 None）；
+    - list_of_dict 按下标展开为 ``fingers.0.angles.4``（与嵌套发现的路径一致）；
+    - 达到 max_cols 即停止并在 note 标注"部分展开"；
+    - 返回**新 DataFrame**（原 object 列被展开列取代），不修改入参——主表
+      ``context.df`` 语义不受影响。
+
+    Args:
+        df: 输入 DataFrame（含 object 信封列）。
+        max_depth: 最大展开深度。
+        max_cols: 展开列数上限。
+
+    Returns:
+        (展开后的 DataFrame, 展开说明 note)；无可展开列时返回 (原 df 副本, None)。
+    """
+    new_cols: dict[str, list] = {}
+    expanded_origins: set[str] = set()
+    holder = {"truncated": False}
+
+    def _room() -> bool:
+        if len(new_cols) < max_cols:
+            return True
+        holder["truncated"] = True
+        return False
+
+    def _emit(sub: "pd.Series", name: str, depth: int) -> None:
+        sample = None
+        for v in sub:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            sample = v
+            break
+        if sample is None:
+            return
+        if depth < max_depth and isinstance(sample, dict):
+            _expand_dict(sub, name, depth + 1)
+        elif isinstance(sample, list):
+            _expand_list(sub, name, depth + 1)
+        else:
+            if name in new_cols:
+                return
+            if _room():
+                new_cols[name] = list(sub)
+
+    def _expand_dict(series: "pd.Series", prefix: str, depth: int) -> None:
+        keys: list[str] = []
+        seen: set[str] = set()
+        for v in series.head(50):
+            if isinstance(v, dict):
+                for k in v:
+                    kl = str(k)
+                    if kl not in seen:
+                        seen.add(kl)
+                        keys.append(kl)
+        for k in keys:
+            if not _room():
+                return
+            vals = []
+            for v in series:
+                vals.append(v.get(k) if isinstance(v, dict) else None)
+            expanded_origins.add(series.name)
+            _emit(pd.Series(vals, index=series.index), f"{prefix}.{k}", depth)
+
+    def _expand_list(series: "pd.Series", prefix: str, depth: int) -> None:
+        first = next((v for v in series if isinstance(v, list)), None)
+        if first is None:
+            return
+        if first and isinstance(first[0], dict):
+            length = min(len(first), 32)
+            if len(first) > 32:
+                holder["truncated"] = True
+            for i in range(length):
+                if not _room():
+                    return
+                vals = [
+                    v[i] if isinstance(v, list) and len(v) > i else None
+                    for v in series
+                ]
+                expanded_origins.add(series.name)
+                _emit(pd.Series(vals, index=series.index), f"{prefix}.{i}", depth)
+        else:
+            length = min(len(first), 32)
+            if len(first) > 32:
+                holder["truncated"] = True
+            for i in range(length):
+                if not _room():
+                    return
+                vals = [
+                    v[i] if isinstance(v, list) and len(v) > i else None
+                    for v in series
+                ]
+                expanded_origins.add(series.name)
+                if f"{prefix}.{i}" not in new_cols:
+                    new_cols[f"{prefix}.{i}"] = vals
+
+    for col in list(df.columns):
+        series = df[col]
+        sample = None
+        for v in series:
+            if isinstance(v, (dict, list)):
+                sample = v
+                break
+        if sample is None:
+            continue
+        expanded_origins.add(col)
+        if isinstance(sample, dict):
+            _expand_dict(series, str(col), 1)
+        else:
+            _expand_list(series, str(col), 1)
+
+    keep = [c for c in df.columns if c not in expanded_origins]
+    out = df[keep].copy()
+    for name, vals in new_cols.items():
+        out[name] = vals
+    note = (
+        "部分展开：达到最大列数上限（max_cols={max_cols}），更深的嵌套字段未展开"
+        if holder["truncated"] else None
+    )
+    return out, note
+
+
+def resolve_table_name(
+    context: RunContext, table: str | None, expand: bool = False
+) -> dict[str, Any]:
     """解析表名对应的 DataFrame 与来源，统一多表入口（惰性读取，不替换主表）。
 
     缺省（table=None）→ 主表（context.df）；显式给表名 → 按流登记表按文件名查找，
@@ -300,6 +431,9 @@ def resolve_table_name(context: RunContext, table: str | None) -> dict[str, Any]
     Args:
         context: 运行时上下文。
         table: 可选，目标表名（文件名，如 "accel.csv"）。缺省=主表。
+        expand: 可选，展开信封型 object 列（dict/list → 点分扁平列）。展开
+        生成**新 DataFrame**，不修改 context.df 主表；结果含 expanded=True 与
+        expand_note（部分展开说明）。
 
     Returns:
         dict，含 success、df、table_name、dataset、source；表不存在时
@@ -321,13 +455,21 @@ def resolve_table_name(context: RunContext, table: str | None) -> dict[str, Any]
 
     # 缺省 → 主表。
     if table is None:
-        return {
-            "success": context.df is not None,
-            "df": context.df,
+        df = context.df
+        note = None
+        if expand and df is not None:
+            df, note = expand_envelope(df)
+        result = {
+            "success": df is not None,
+            "df": df,
             "table_name": context.meta.get("main_table", {}).get("name"),
             "dataset": dataset_id,
             "source": "main",
         }
+        if expand:
+            result["expanded"] = True
+            result["expand_note"] = note
+        return result
 
     # 显式表名 → 按流登记表查找（文件名精确匹配，忽略大小写）。
     name_lower = table.strip().lower()
@@ -336,13 +478,20 @@ def resolve_table_name(context: RunContext, table: str | None) -> dict[str, Any]
         if Path(p).name.lower() == name_lower:
             df = read_stream_full(p, s.get("format", ""))
             if df is not None:
-                return {
+                note = None
+                if expand:
+                    df, note = expand_envelope(df)
+                result = {
                     "success": True,
                     "df": df,
                     "table_name": Path(p).name,
                     "dataset": dataset_id,
                     "source": "stream_lazy",
                 }
+                if expand:
+                    result["expanded"] = True
+                    result["expand_note"] = note
+                return result
             return {
                 "success": False,
                 "error": "table_read_failed",
