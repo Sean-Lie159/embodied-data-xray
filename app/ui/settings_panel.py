@@ -56,7 +56,15 @@ def _config_error_text() -> str | None:
 
 
 def render_model_settings() -> None:
-    """渲染侧栏"模型设置"折叠面板（调用方置于 st.sidebar 内）。"""
+    """渲染侧栏"模型设置"折叠面板（调用方置于 st.sidebar 内）。
+
+    实例模式（INSTANCE_MODE=1）下整体不渲染：模型配置由部署者预设，
+    访问者不可见不可改（连 base_url/model 掩码也不出现）。
+    """
+    from app.config.settings import get_instance_mode
+
+    if get_instance_mode():
+        return
     configured = is_configured()
     error_text = _config_error_text() if configured else None
 
