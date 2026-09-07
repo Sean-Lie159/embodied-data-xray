@@ -145,5 +145,25 @@ def get_settings() -> Settings:
     """返回缓存的 :class:`Settings` 实例。
 
     ``lru_cache`` 保证整个进程内配置只解析一次，避免重复读取文件。
+    注意：通过 ``env_io.update_env_file`` 回写 .env 后，必须调用
+    ``get_settings.cache_clear()`` 再取新配置（UI 模型设置面板已处理）。
     """
     return Settings()
+
+
+def is_configured() -> bool:
+    """判断模型配置是否齐全（不抛异常，供 UI 引导页判定使用）。
+
+    缺 key 时 ``get_settings()`` 抛 :class:`ConfigError`，本函数将其转为
+    False，使 UI 能"未配置时渲染引导页"而非崩溃。同时缓存清除后的重新
+    解析也在这里发生（保存配置后 UI 调 cache_clear，下一次 is_configured
+    / get_settings 即读新值）。
+
+    Returns:
+        True 表示 get_settings() 可用（配置齐全）。
+    """
+    try:
+        get_settings()
+        return True
+    except ConfigError:
+        return False

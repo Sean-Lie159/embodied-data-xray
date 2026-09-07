@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from app.config.settings import is_configured
 from app.services.chat_service import ChatService
 from app.ui.components import (
     render_charts,
@@ -17,6 +18,8 @@ from app.ui.components import (
     render_token_stats,
     render_tool_activity,
 )
+from app.ui.onboarding import render_onboarding
+from app.ui.settings_panel import render_model_settings
 
 st.set_page_config(page_title="具身智能数据分析 Agent", layout="wide")
 
@@ -72,14 +75,24 @@ def _get_cumulative_usage() -> dict:
 
 
 def _main() -> None:
-    service = _get_service()
-    messages = _get_messages()
-    cumulative = _get_cumulative_usage()
-
     _inject_scroll_css()
 
     st.title("具身智能数据分析 Agent")
     st.caption("全链路：加载 → 质检 → 统计 → 绘图 → 报告")
+
+    # 未配置模型：渲染引导页（配置表单 + 说明），不构造 ChatService——
+    # 修复此前"缺 key 时 UI 直接 traceback"的问题（设计文档 3.2）。
+    if not is_configured():
+        render_onboarding()
+        return
+
+    service = _get_service()
+    messages = _get_messages()
+    cumulative = _get_cumulative_usage()
+
+    # 侧栏：模型设置（expander，随时改；保存后自动重建 service）。
+    with st.sidebar:
+        render_model_settings()
 
     # 侧栏：Token 统计（本轮 + 会话累计；刷新页面重置属正常，不持久化）。
     with st.sidebar:
