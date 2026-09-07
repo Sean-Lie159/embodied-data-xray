@@ -77,6 +77,14 @@ confirm_stream_semantic 路径落盘。**假设不得伪装成结论**——不�
 同理，若历史中出现"[上下文管理]"开头的说明，表明较早轮次的工具返回明细已被\
 压缩为摘要——此时引用旧数字仍须标注来源；若具体细节已不可考，明确说\
 "该细节已随历史压缩省略，如需请重新调用工具"，不得凭印象补数字。
+12. 多时钟与语义假设（闸门）：工具返回含多个时间候选（time_candidates）或
+clock_artifact_suspected/clock_conflicts 时，**必须并列呈现各时间口径的指标
+与矛盾**，不得只引用其中之一下结论；可提出"传感器时间列应为 X"的假设，但须以
+time_column=X 重算验证后再表述。流清单 unknown 占比高且你能从样本结构推断
+分组时，应**主动**用 propose_stream_semantics 批量提交假设并转述验证结果；
+向用户转述并获明确同意后，以 confirm=True 落盘（一次确认，永久生效）。
+**判定变更必须经工具验证与用户确认**——未经确认不得断言"某流就是某类"，
+也不得在对话里宣称已落盘。
 
 【表述】
 1. 全程用中文回答。
@@ -115,6 +123,7 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "compute_stats": ("per_episode", "episodes"),
     "plot_chart": (),
     "generate_report": ("report_markdown", "content"),
+    "propose_stream_semantics": ("results", "confirmed"),
 }
 
 

@@ -101,6 +101,7 @@ streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 - **骨骼位姿块**：数据集声明 `names=xxx_NxM` 且 N×M==shape → 按块分解统计位姿范围与四元数范数
 - **时间戳列**：词表命中优先，未命中回退内容指纹（单调递增 + 量级符合时间单位）；单位推断带自我纠正（采样率超物理区间自动换单位重算）
 - **JSONL vs JSON**：`.jsonl` 每行一个 JSON 对象（`lines=True`），`.json` 整体一个 JSON 值——两者分别读取、不混用；JSONL 的嵌套列表/对象值保留为 object 列，可被概况统计（非空计数/样例值）与合理性检查（全零/恒定）覆盖
+- **多时钟与嵌套信封**：MCAP 导出的信封流（顶层容器时间 + `data` 内嵌数值与传感器时间）会自动发现嵌套时间候选与信号字段（`data.header.timestamp_us`、四元数/加速度向量等）；同一流多个时间口径的形态矛盾（容器时间判"突发"、传感器时间判"周期"）会显式告警（`clock_artifact_suspected`），可用 `time_column=嵌套路径` 重算。`profile_data` / `check_sensor_sanity` 传 `expand=True` 可把嵌套数值展开为扁平列后分析（只读视图，不改主表）。流的语义分组可由 agent 批量提交假设（`propose_stream_semantics`：先工具验证 → 用户确认 → 持久生效）
 
 ## 上下文管理（防 input length too long）
 

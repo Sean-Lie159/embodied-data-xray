@@ -38,6 +38,7 @@ from app.tools import (
     load_dataset,
     plot_chart,
     profile_data,
+    propose_stream_semantics,
 )
 
 _EXIT_COMMANDS = {"exit", "quit", "q", "退出", "再见"}
@@ -110,6 +111,7 @@ def _build_main_agent():
         compute_stats,
         plot_chart,
         generate_report,
+        propose_stream_semantics,
     ]
     # 与 chat_service 一致：套上工具返回体积护栏（第 2 层防御）。
     # CLI 自行组装工具（不经 chat_service），故此处必须补上，否则 CLI 路径

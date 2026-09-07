@@ -154,7 +154,7 @@ def apply_profile_overrides(
         new_s = dict(s)
         if ov:
             for key in ("kind", "role", "semantic_label", "label_evidence",
-                        "label_confidence", "imu_axes", "status"):
+                        "label_confidence", "imu_axes", "status", "time_column"):
                 if key in ov:
                     new_s[key] = ov[key]
             new_s["label_source"] = SOURCE_USER

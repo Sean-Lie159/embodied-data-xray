@@ -12,6 +12,10 @@ from app.tools.load_dataset import (
 )
 from app.tools.plot_chart import plot_chart, plot_chart_impl
 from app.tools.profile_data import profile_data, profile_data_impl
+from app.tools.propose_semantics import (
+    propose_stream_semantics,
+    propose_stream_semantics_impl,
+)
 
 __all__ = [
     "load_dataset",
@@ -30,4 +34,6 @@ __all__ = [
     "plot_chart_impl",
     "generate_report",
     "generate_report_impl",
+    "propose_stream_semantics",
+    "propose_stream_semantics_impl",
 ]

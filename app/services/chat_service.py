@@ -44,6 +44,7 @@ from app.tools import (
     load_dataset,
     plot_chart,
     profile_data,
+    propose_stream_semantics,
 )
 
 # 注册给 agent 的全部工具。
@@ -56,6 +57,7 @@ _ALL_TOOLS = [
     compute_stats,
     plot_chart,
     generate_report,
+    propose_stream_semantics,
 ]
 
 
