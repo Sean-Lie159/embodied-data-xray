@@ -2080,3 +2080,279 @@ def build_streams_registry(
         })
 
     return streams
+
+
+# --- 嵌套字段发现（信封型 JSONL/JSON，确定性，读前 N 行）--------------------
+#
+# 背景：MCAP 导出的 JSONL 常为"信封"结构——顶层是容器时间（mcap_log_time_ns /
+# mcap_publish_time_ns）+ data（object），数值信号与传感器时间戳全部嵌套在
+# data 内（如 data.header.timestamp_us、data.orientation.{x,y,z,w}）。第 1/2 层
+# 的列名嗅探与内容指纹只看顶层列，对这类结构全部失效（真实案例：26 路流全部
+# unknown，IMU 被容器批量写入时间误判为突发型）。
+#
+# 本函数把嵌套的"时间候选"与"信号字段"以确定性方式暴露出来，供：
+# - 双口径交叉验证（check_temporal_sync 判断容器时间 vs 传感器时间口径矛盾）；
+# - LLM 语义假设（propose_stream_semantics 的验证依据）；
+# - 用户确认（第 4 层落盘 time_column 嵌套路径）。
+#
+# 只读前 N 行样本，只做浅统计（覆盖率/单调性/中位间隔/模长），不读全量。
+
+# 时间字段名匹配 token（子串，小写）。"ts" 太宽（"status" 也含 ts）不入选；
+# 裸 "_s" 后缀同理过宽，不做后缀匹配。
+_TIME_NAME_TOKENS = ("time", "stamp", "tick")
+
+# 安全的单位后缀（边界清晰；"_s" 会误伤 "status"/"poses" 等词，不收录）。
+_UNIT_SUFFIX_HINTS = (("_ns", "ns"), ("_us", "us"), ("_ms", "ms"))
+
+# 数值量级 → 单位推断（epoch 时间戳；阈值取各量级中位的对数间隔中心）。
+_MAGNITUDE_UNIT_BANDS = (
+    (1e17, "ns"),   # ~1e18 纳秒 epoch
+    (1e14, "us"),   # ~1e15 微秒 epoch
+    (1e11, "ms"),   # ~1e12 毫秒 epoch
+    (1e8, "s"),     # ~1e9 秒 epoch
+)
+
+# 嵌套发现结果的容量上限（防极端结构撑爆流登记表）。
+_MAX_TIME_CANDIDATES = 8
+_MAX_SIGNAL_FIELDS = 32
+_MAX_LIST_ELEMENT_SCAN = 32
+
+
+def _field_unit_hint(name: str, values: list[float]) -> str:
+    """推断时间字段单位：后缀优先，量级兜底，认不出 unknown（不硬猜）。"""
+    lower = name.lower()
+    for suffix, unit in _UNIT_SUFFIX_HINTS:
+        if lower.endswith(suffix):
+            return unit
+    vmax = max(abs(v) for v in values) if values else 0.0
+    for threshold, unit in _MAGNITUDE_UNIT_BANDS:
+        if vmax >= threshold:
+            return unit
+    return "unknown"
+
+
+def _walk_sample_rows(
+    rows: list[dict], max_depth: int,
+) -> tuple[dict[str, list[float]], dict[str, str], dict[str, list[int]]]:
+    """递归展开样本行，收集数值叶字段。
+
+    Args:
+        rows: 样本行（dict 列表）。
+        max_depth: 最大递归深度。
+
+    Returns:
+        (values, kinds, list_lens)：
+        - values: {字段路径: [各行的数值]}（行内缺失不补；时间戳保留 int 原值
+          以避免 float64 精度损失，其余为原始数值类型）；
+        - kinds: {字段路径: 结构类型}（quat4/vec3/num_list/list_of_dict）；
+        - list_lens: {list 字段路径: [各行长度]}。
+    """
+    values: dict[str, list[float] | list[int]] = {}
+    kinds: dict[str, str] = {}
+    list_lens: dict[str, list[int]] = {}
+
+    def _walk(obj: Any, prefix: str, depth: int) -> None:
+        if depth > max_depth or not isinstance(obj, dict):
+            return
+        for key, val in obj.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(val, dict):
+                keys_lower = {str(k).lower() for k in val}
+                numeric_vals = [
+                    v for v in val.values()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                ]
+                if keys_lower >= {"x", "y", "z", "w"} and len(numeric_vals) >= 4:
+                    kinds.setdefault(path, "quat4")
+                elif len(keys_lower & {"x", "y", "z"}) >= 2 and len(numeric_vals) >= 3:
+                    kinds.setdefault(path, "vec3")
+                _walk(val, path, depth + 1)
+            elif isinstance(val, list):
+                list_lens.setdefault(path, []).append(len(val))
+                if val and isinstance(val[0], dict):
+                    kinds.setdefault(path, "list_of_dict")
+                    # 只展开首元素（路径带 .0 下标，与展开视图的列名一致）。
+                    _walk(val[0], f"{path}.0", depth + 1)
+                elif val and all(
+                    isinstance(x, (int, float)) and not isinstance(x, bool)
+                    for x in val
+                ):
+                    kinds.setdefault(path, "num_list")
+                    values.setdefault(path, []).extend(val)
+
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                # 保留原始 int：ns epoch（~1.8e18）超出 float64 精确整数范围
+                # （2^53≈9e15），转 float 会使中位间隔出现数百 ns 的舍入误差。
+                values.setdefault(path, []).append(val)
+
+    for row in rows:
+        _walk(row, "", 0)
+    return values, kinds, list_lens
+
+
+def _is_time_field(name: str, values: list[float]) -> bool:
+    """判断字段是否为时间候选：名字命中时间 token，或量级达到 epoch 水平。"""
+    lower = name.rsplit(".", 1)[-1].lower()
+    if any(token in lower for token in _TIME_NAME_TOKENS):
+        return True
+    if values and min(abs(v) for v in values) >= 1e11:
+        return True  # 毫秒 epoch 及以上，名字不显眼也值得列为候选
+    return False
+
+
+def discover_nested_fields(
+    path: str,
+    fmt: str,
+    sample_rows: int = 5,
+    max_depth: int = 6,
+) -> dict[str, Any]:
+    """发现信封型 JSONL/JSON 中嵌套的时间候选与信号字段（确定性，读前 N 行）。
+
+    Args:
+        path: 文件路径。
+        fmt: 格式（仅 jsonl / json 支持；其它格式返回空结果）。
+        sample_rows: 采样行数（浅统计用，不读全量）。
+        max_depth: 最大递归深度。
+
+    Returns:
+        dict：
+        - time_candidates: [{path, unit_hint, coverage, monotonic,
+          median_interval_native, is_epoch}]（按覆盖率降序，截断至
+          _MAX_TIME_CANDIDATES）；
+        - signal_fields: [{path, kind, ...特征}]（截断至 _MAX_SIGNAL_FIELDS）；
+        - sampled_rows: 实际采样行数。
+        无嵌套字段（如纯容器时间的数据）时两组为空列表——如实返回，不硬猜。
+    """
+    empty: dict[str, Any] = {
+        "time_candidates": [], "signal_fields": [], "sampled_rows": 0,
+    }
+    fmt = (fmt or "").lower()
+    if fmt not in ("jsonl", "json"):
+        return empty
+    try:
+        if fmt == "jsonl":
+            from app.tools._data_access import read_jsonl_rows
+
+            rows = read_jsonl_rows(str(path), limit=sample_rows, encoding="utf-8")
+        else:
+            import json as _json
+
+            from app.tools._data_access import _json_row_list
+            from app.tools.load_dataset import _detect_encoding
+
+            obj = _json.loads(
+                Path(path).read_text(
+                    encoding=_detect_encoding(Path(path).read_bytes())
+                )
+            )
+            rows = _json_row_list(obj) or []
+            rows = rows[:sample_rows]
+    except Exception:  # noqa: BLE001
+        return empty
+    if not rows:
+        return empty
+
+    values, kinds, list_lens = _walk_sample_rows(rows, max_depth)
+
+    # 时间候选：名字/量级命中 + 全样本行覆盖 + 单调性/中位间隔特征。
+    time_candidates: list[dict[str, Any]] = []
+    for path_str, vals in values.items():
+        if not _is_time_field(path_str, vals):
+            continue
+        coverage = len(vals) / len(rows)
+        srt = sorted(vals)
+        monotonic = all(
+            srt[i] <= srt[i + 1] for i in range(len(srt) - 1)
+        )
+        median_interval = None
+        if coverage >= 1.0 and len(vals) >= 3:
+            diffs = sorted(b - a for a, b in zip(srt, srt[1:]))
+            positive = [d for d in diffs if d > 0]
+            if positive:
+                median_interval = positive[len(positive) // 2]
+        time_candidates.append({
+            "path": path_str,
+            "unit_hint": _field_unit_hint(path_str, vals),
+            "coverage": round(coverage, 3),
+            "monotonic": bool(monotonic),
+            "median_interval_native": median_interval,
+            "is_epoch": _field_unit_hint(path_str, vals) in ("ns", "us", "ms", "s")
+                        and (max(abs(v) for v in vals) >= 1e8),
+        })
+    time_candidates.sort(key=lambda c: (-c["coverage"], c["path"]))
+    time_candidates = time_candidates[:_MAX_TIME_CANDIDATES]
+
+    # 信号字段：结构特征（浅统计，基于样本行）。
+    signal_fields: list[dict[str, Any]] = []
+    for path_str, kind in kinds.items():
+        entry: dict[str, Any] = {"path": path_str, "kind": kind}
+        if kind == "quat4":
+            norms = []
+            for row in rows:
+                vals = _pluck_quat(row, path_str)
+                if vals is not None:
+                    norms.append(float(np_sqrt(sum(v * v for v in vals))))
+            if norms:
+                entry["norm_mean"] = round(sum(norms) / len(norms), 4)
+        elif kind == "vec3":
+            mags = []
+            for row in rows:
+                vals = _pluck_vec3(row, path_str)
+                if vals is not None:
+                    mags.append(float(np_sqrt(sum(v * v for v in vals))))
+            if mags:
+                entry["mag_mean"] = round(sum(mags) / len(mags), 4)
+        elif kind == "num_list":
+            lens = list_lens.get(path_str, [])
+            if lens:
+                entry["len_mode"] = max(set(lens), key=lens.count)
+        elif kind == "list_of_dict":
+            lens = list_lens.get(path_str, [])
+            if lens:
+                entry["len_mode"] = max(set(lens), key=lens.count)
+        signal_fields.append(entry)
+    signal_fields = signal_fields[:_MAX_SIGNAL_FIELDS]
+
+    return {
+        "time_candidates": time_candidates,
+        "signal_fields": signal_fields,
+        "sampled_rows": len(rows),
+    }
+
+
+def _pluck_quat(row: dict, dotted: str) -> list[float] | None:
+    """按点分路径取四元数 4 分量（全为数值才返回）。"""
+    node: Any = row
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    if not isinstance(node, dict):
+        return None
+    vals = [node.get(k) for k in ("x", "y", "z", "w")]
+    if any(not isinstance(v, (int, float)) or isinstance(v, bool) for v in vals):
+        return None
+    return [float(v) for v in vals]
+
+
+def _pluck_vec3(row: dict, dotted: str) -> list[float] | None:
+    """按点分路径取 3 维数值向量（x/y/z 任意键序，全为数值才返回）。"""
+    node: Any = row
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    if not isinstance(node, dict):
+        return None
+    vals = [
+        v for k, v in node.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
+    return [float(v) for v in vals] if len(vals) == 3 else None
+
+
+def np_sqrt(x: float) -> float:
+    """平方根（避免在模块顶部引入 numpy——本段仅需算术）。"""
+    import math
+
+    return math.sqrt(x)

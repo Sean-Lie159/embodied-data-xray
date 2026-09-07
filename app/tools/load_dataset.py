@@ -346,6 +346,28 @@ def _parse_calibration(path: Path) -> Any:
         return None
 
 
+def _attach_nested_discovery(streams: list[dict[str, Any]]) -> None:
+    """为信封型流（jsonl/json）附加嵌套时间候选与信号字段（就地修改）。
+
+    单文件失败静默降级为空结果——发现是增强信息，不得阻塞加载主流程。
+
+    Args:
+        streams: 流登记表（meta["streams"]，就地修改）。
+    """
+    for s in streams:
+        fmt = str(s.get("format", "")).lower()
+        if fmt not in ("jsonl", "json"):
+            continue
+        path = s.get("path", "")
+        try:
+            found = _sniffing.discover_nested_fields(path, fmt)
+        except Exception:  # noqa: BLE001
+            found = {"time_candidates": [], "signal_fields": [],
+                     "sampled_rows": 0}
+        s["time_candidates"] = found.get("time_candidates", [])
+        s["signal_fields"] = found.get("signal_fields", [])
+
+
 def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     """目录加载：文件普查 + 能力嗅探，返回精简摘要。
 
@@ -659,6 +681,10 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             "truncated": truncated,
         },
     }
+
+    # 嵌套字段发现（信封型 JSONL/JSON）：把 data 内嵌的时间候选与信号字段
+    # 附加到流登记表（确定性，读前 5 行；单文件失败静默降级不阻塞加载）。
+    _attach_nested_discovery(meta["streams"])
 
     # 第 4 层：用户确认持久化覆盖。加载时优先读取 outputs/.dataset_profile.json
     # 中该 dataset_id 的已确认映射（来源 user_confirmed），覆盖第 1-3 层自动识别。
