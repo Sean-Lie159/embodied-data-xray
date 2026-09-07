@@ -102,4 +102,24 @@ def render_data_loader(service, messages: list[dict]) -> None:
                 else:
                     st.error("加载失败，详见对话区说明。")
 
-        # 示例数据集按钮由 Commit 4（app/ui/sample_dataset.py）加入本面板底部。
+        st.divider()
+        # 可选：示例数据集（决策 5——常驻可选项，非引导必经步骤）。
+        st.caption(
+            "示例数据集（可选）：小型 IMU 流（含约 207 帧数据缺口）+ 任务表，"
+            "用于 30 秒看到全链路效果。"
+        )
+        if st.button("加载示例数据集", key="btn_load_sample"):
+            from app.ui.sample_dataset import ensure_sample_dataset
+
+            with st.spinner("生成/加载示例数据集……"):
+                sample_dir = ensure_sample_dataset()
+                ok = _load_path(service, messages, str(sample_dir))
+            if ok:
+                st.success(
+                    "示例数据集已加载。试试问："
+                    "「这个数据集概况如何？」「时间同步检查一下，缺口发生在哪？」"
+                    "「成功率多少，哪些 episode 离群？」"
+                )
+                st.rerun()
+            else:
+                st.error("示例数据集加载失败，详见对话区说明。")
