@@ -158,6 +158,59 @@ def read_jsonl_rows(
     return rows
 
 
+def read_nested_time_column(
+    path: str, fmt: str, nested_path: str
+) -> "pd.Series | None":
+    """读取 JSONL/JSON 内嵌时间字段（点分路径，如 data.header.timestamp_us）。
+
+    仅 jsonl / json 支持（csv/parquet 无嵌套概念，返回 None）。逐行提取、
+    缺失行跳过；数值保留 int 原值（ns epoch 超 float64 精确范围）。
+
+    Args:
+        path: 文件路径。
+        fmt: 格式（jsonl / json）。
+        nested_path: 点分嵌套路径。
+
+    Returns:
+        时间戳 Series（name 为 nested_path）；不足 2 个有效值或格式不支持
+        返回 None。
+    """
+    import json as _json
+
+    if (fmt or "").lower() not in ("jsonl", "json"):
+        return None
+    parts = nested_path.split(".")
+
+    def _pluck(row: dict) -> "int | float | None":
+        node: Any = row
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                return None
+            node = node[part]
+        if isinstance(node, bool) or not isinstance(node, (int, float)):
+            return None
+        return node
+
+    try:
+        if (fmt or "").lower() == "jsonl":
+            rows = read_jsonl_rows(path, limit=None, encoding="utf-8")
+        else:
+            from app.tools.load_dataset import _detect_encoding
+
+            obj = _json.loads(
+                Path(path).read_text(
+                    encoding=_detect_encoding(Path(path).read_bytes())
+                )
+            )
+            rows = _json_row_list(obj) or []
+        vals = [v for r in rows if (v := _pluck(r)) is not None]
+    except Exception:  # noqa: BLE001
+        return None
+    if len(vals) < 2:
+        return None
+    return pd.Series(vals, name=nested_path)
+
+
 def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
     """按需读取流文件的全表。
 

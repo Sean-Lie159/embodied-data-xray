@@ -52,6 +52,17 @@ def _read_stream_timestamps(
     fmt = stream.get("format", "")
     if not path or not Path(path).exists():
         return None, ""
+    # 嵌套时间路径（含 "."，如 data.header.timestamp_us）：经点分路径逐行
+    # 提取（仅 jsonl/json）。读取失败返回 None，由调用方注明"指定时间列不存在"。
+    if column_hint and "." in column_hint:
+        from app.tools._data_access import read_nested_time_column
+
+        ts = read_nested_time_column(path, fmt, column_hint)
+        if ts is None:
+            return None, ""
+        arr = np.asarray(pd_to_numeric(ts), dtype=float)
+        arr = arr[~np.isnan(arr)]
+        return (arr, column_hint) if len(arr) > 0 else (None, "")
     try:
         ts = _read_timestamp_only(path, fmt, column_hint)
         if ts is None:
@@ -281,7 +292,10 @@ def _recommend_baseline(
             "excluded": excluded,
         }
 
-    best_key, best_score, cov, cv, n = max(candidates, key=lambda x: x[1])
+    # 确定性 tie-break：分数并列时按路径字母序取最小（不同会话/运行得到
+    # 同一基线；真实案例：两轮对话分别推荐了不同的基线流）。
+    candidates.sort(key=lambda x: (-x[1], x[0]))
+    best_key, best_score, cov, cv, n = candidates[0]
     recommendation: dict[str, Any] = {
         "stream": best_key,
         "reason": (
@@ -289,6 +303,11 @@ def _recommend_baseline(
             f"样本 {n}，为覆盖完整且间隔稳定的周期型流"
         ),
         "score": round(best_score, 4),
+        # 前 3 名候选（含分数）：并列或接近时供用户判断/改用 baseline_stream 指定。
+        "top_candidates": [
+            {"stream": Path(k).name, "score": round(s, 4)}
+            for k, s, *_ in candidates[:3]
+        ],
         "excluded": excluded,
     }
     return best_key, recommendation
@@ -747,7 +766,12 @@ def check_temporal_sync_impl(
             # 交叉校验：登记表的 timestamp_unit 可能判为 unknown（列名未命中词表
             # 时），用实际读到的时间戳列名重推断一次，纠正这类漏判（真实案例：
             # mcap_log_time_ns 不在 _TIMESTAMP_COLS 内，单位被判 unknown）。
-            if ts is not None and col_name and unit not in TIME_UNITS:
+            # hint 命中了与登记表不同的列（如嵌套的传感器时间列）时同样重推断：
+            # 登记表的单位属于旧列，对新列不再适用（真实案例：信封流的
+            # data.header.timestamp_us 为 µs，登记表单位 ns 属 mcap_log_time_ns）。
+            if ts is not None and col_name and (
+                unit not in TIME_UNITS or col_name != s.get("timestamp_column")
+            ):
                 name_unit = infer_unit(ts, col_name)["unit"]
                 if name_unit in TIME_UNITS:
                     unit = name_unit
@@ -860,6 +884,75 @@ def check_temporal_sync_impl(
                 f"{p.get('timestamp_column') or '未识别'} 未推断出时间单位），"
                 "未归一化，不参与跨流对齐，其时长/采样率不可计算"
             )
+
+    # 双口径交叉验证（多时钟共存）：流登记表存在 ≥2 个时间候选、且主口径判为
+    # burst 时，用其余候选重算流形态。容器批量写入时间判 burst、传感器时间判
+    # periodic 的组合是典型的写入伪影（真实案例：IMU 的 log_ns 口径 1.7 万个
+    # 假 gap，header.timestamp_us 口径 0 gap 且规整周期）。矛盾必须透出，
+    # 不静默选边——主判定保留，但可信度降级并给出重算建议。
+    clock_conflicts: list[dict[str, Any]] = []
+    registry_by_path = {s.get("path") or "": s for s in streams}
+    for key, checks in stream_checks.items():
+        if checks.get("stream_shape") != "burst":
+            continue  # 只核主口径为 burst 的流（成本与误报双收敛）
+        reg = registry_by_path.get(key) or {}
+        candidates = reg.get("time_candidates") or []
+        main_col = checks.get("timestamp_column")
+        alternates = [
+            c for c in candidates
+            if c.get("path") != main_col and c.get("coverage", 0) >= 0.99
+        ]
+        if not alternates:
+            continue
+        clock_candidates: dict[str, Any] = {
+            str(main_col): {
+                "shape": checks.get("stream_shape"),
+                "actual_rate_hz": checks.get("actual_rate_hz"),
+            }
+        }
+        alt_notes: list[str] = []
+        suspected = False
+        for alt in alternates[:2]:
+            alt_col = str(alt.get("path"))
+            ts_alt, _ = _read_stream_timestamps(reg, alt_col)
+            if ts_alt is None or len(ts_alt) < 3:
+                continue
+            alt_unit = alt.get("unit_hint")
+            if alt_unit not in TIME_UNITS:
+                alt_unit = infer_unit(ts_alt, alt_col)["unit"]
+            if alt_unit not in TIME_UNITS:
+                continue
+            alt_ns, alt_info = _normalize_to_ns(ts_alt, alt_unit)
+            if not is_unit_known(alt_info):
+                continue
+            shape = _classify_stream_shape(alt_ns, settings)
+            n = len(alt_ns)
+            span = float(alt_ns[-1] - alt_ns[0])
+            rate = (n - 1) / span * 1e9 if span > 0 else None
+            clock_candidates[alt_col] = {
+                "shape": shape,
+                "rate_hz": round(rate, 3) if rate else None,
+            }
+            if shape != checks.get("stream_shape"):
+                suspected = True
+                alt_notes.append(
+                    f"{alt_col} 口径为 {shape}"
+                    + (f"（约 {rate:.1f} Hz）" if rate else "")
+                )
+        if suspected:
+            checks["clock_candidates"] = clock_candidates
+            checks["clock_artifact_suspected"] = True
+            checks["clock_note"] = (
+                "多时间口径形态矛盾："
+                + "；".join(alt_notes)
+                + f"。主口径 {main_col} 疑似容器批量写入时间而非传感器采样节拍；"
+                "建议用 time_column 指定传感器时间列重算后再下结论。"
+            )
+            clock_conflicts.append({
+                "stream": Path(key).name,
+                "main_column": main_col,
+                "note": checks["clock_note"],
+            })
 
     # episode 口径：无 episode 划分时整段视为一个 episode。
     has_episodes = bool(capabilities.get("has_episodes")) or bool(
@@ -1014,6 +1107,7 @@ def check_temporal_sync_impl(
                 for k, v in stream_checks.items()
             },
             "unit_warnings": unit_warnings,
+            "clock_conflicts": clock_conflicts,
             "residuals": {
                 k: {"residual_max_ms": v.get("residual_max_ms"),
                     "residual_mean_ms": v.get("residual_mean_ms")}
@@ -1032,6 +1126,15 @@ def check_temporal_sync_impl(
         },
     }
 
+    if clock_conflicts:
+        user_message = (
+            str(user_message)
+            + f" 另有 {len(clock_conflicts)} 条流存在多时间口径形态矛盾"
+            "（容器时间口径与传感器时间口径的流形态判定不一致，疑似批量写入"
+            "伪影）：详见 measurements.stream_checks 各流的 clock_note，"
+            "建议用 time_column 指定传感器时间列重算后再下结论。"
+        )
+
     return {
         "success": True,
         "verification_level": "timestamp_consistency",
@@ -1045,6 +1148,8 @@ def check_temporal_sync_impl(
         "skipped_checks": skipped_checks,
         # 单位未知/不可用的流显式列出，避免模型把"未参与"误读为"已检查通过"。
         "unit_warnings": unit_warnings,
+        # 多时间口径形态矛盾的流清单（容器 vs 传感器时间判定不一致）。
+        "clock_conflicts": clock_conflicts,
         "measurements": {
             "stream_checks": stream_checks,
             "residuals": align["residuals"],
