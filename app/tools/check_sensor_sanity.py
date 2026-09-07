@@ -815,6 +815,7 @@ def check_sensor_sanity(
     wrapper: RunContextWrapper[RunContext],
     sensor: str | None = None,
     table: str | None = None,
+    expand: bool = False,
 ) -> dict:
     """检查传感器数据合理性（单位、重力、零漂、饱和、NaN、恒定通道）。
 
@@ -826,6 +827,8 @@ def check_sensor_sanity(
     Args:
         sensor: 可选，指定要检查的传感器；省略时检查所有可用传感器。
         table: 可选，指定检查对象表名（如 "accel.csv"）；缺省自动定位/全查。
+        expand: 可选，展开信封型 object 列（嵌套数值 → 扁平列）后再检查；
+            信封流（如 MCAP 导出的 JSONL）数值嵌套在 data 内时需要。
 
     Returns:
         统一质检返回格式：result、checks、skipped_checks、dataset、user_message；
