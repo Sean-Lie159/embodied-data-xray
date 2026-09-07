@@ -77,6 +77,12 @@ def _read_timestamp_only(
 
     try:
         sample_rows = 20  # 仅读前若干行用于内容指纹回退
+        # 嵌套时间路径（含 "."，如 data.header.timestamp_us）：经点分路径逐行
+        # 提取（仅 jsonl/json）。用户确认的传感器时间列即此类嵌套路径。
+        if column_hint and "." in column_hint:
+            from app.tools._data_access import read_nested_time_column
+
+            return read_nested_time_column(path, fmt, column_hint)
         if fmt == "csv":
             encoding = _detect_encoding(Path(path).read_bytes())
             df_head = pd.read_csv(path, encoding=encoding, nrows=0, engine="python")
@@ -137,6 +143,7 @@ def _measure_rate_from_file(
     channels: list[str],
     timestamp_unit: str | None = None,
     stream: dict[str, Any] | None = None,
+    column_hint: str | None = None,
 ) -> dict[str, Any]:
     """从文件实测采样率（均值 + 抖动），先把时间戳归一化到纳秒基准。
 
@@ -165,15 +172,23 @@ def _measure_rate_from_file(
 
     if not Path(path).exists():
         return {"present": False, "reason": f"文件不存在：{path}"}
-    ts = _read_timestamp_only(path, fmt)
+    ts = _read_timestamp_only(path, fmt, column_hint)
     if ts is None:
-        return {"present": False, "reason": "未找到时间戳列或读取失败"}
+        hint_note = f"（指定时间列 {column_hint} 不存在或读取失败）" if column_hint else ""
+        return {"present": False, "reason": f"未找到时间戳列或读取失败{hint_note}"}
     try:
         ts = pd.to_numeric(ts, errors="coerce").dropna().sort_values()
         if len(ts) < 2:
             return {"present": False, "reason": "时间戳样本不足"}
         # 单位自我纠正：初始单位算出的采样率超物理区间时自动换候选单位重算。
         init_unit = timestamp_unit if timestamp_unit in ("s", "ms", "us", "ns") else "unknown"
+        # 确认列（column_hint）与登记表单位所属列不同 → 旧单位不再适用，按
+        # 新列名重推断（真实案例：确认 data.header.timestamp_us（µs）后仍按
+        # 登记表 ns 算 → 1e6 Hz 千倍失真；与 check_temporal_sync 同款处理）。
+        if column_hint and column_hint != (stream or {}).get("timestamp_column"):
+            name_unit = infer_unit(ts.to_numpy(), column_hint)["unit"]
+            if name_unit in ("s", "ms", "us", "ns"):
+                init_unit = name_unit
         correction = self_correct_unit(ts.to_numpy(), init_unit)
         unit = correction["unit"] if correction["unit"] in ("s", "ms", "us", "ns") else None
         corrected = correction.get("corrected", False)
@@ -322,8 +337,13 @@ def _measure_stream_rate(
         dict，含 present、sample_rate_hz、jitter_ms、n_samples 或 reason。
     """
     cached = stream.get("measured_rate")
+    confirmed_col = stream.get("time_column")  # 用户确认的传感器时间列（可嵌套）
     if isinstance(cached, dict) and cached.get("present") is not None:
-        return cached  # 缓存命中，不重复读盘
+        # 缓存失效：确认的时间列与缓存所用的列不同（确认前测的是旧口径，
+        # 如容器批量写入时间算出的 ~58 万 Hz 荒谬采样率）→ 重测。
+        cached_col = cached.get("timestamp_column")
+        if not confirmed_col or cached_col == confirmed_col:
+            return cached
 
     if stream.get("kind") == "video":
         result = {"present": False, "reason": "视频流采样率由 ffprobe 提供（见视频元数据）"}
@@ -334,6 +354,7 @@ def _measure_stream_rate(
             stream.get("channels", []),
             stream.get("timestamp_unit"),
             stream=stream,
+            column_hint=confirmed_col,
         )
 
     stream["measured_rate"] = result  # 回写缓存

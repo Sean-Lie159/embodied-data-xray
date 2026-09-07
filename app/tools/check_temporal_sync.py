@@ -761,7 +761,12 @@ def check_temporal_sync_impl(
                                    "source": s.get("path")}
                 streams_status[key] = "未参与：v1 不做视频帧级对齐（容器时间戳不可靠，内容级对齐属 v2）"
         else:
-            ts, col_name = _read_stream_timestamps(s, time_column)
+            # 每流 hint 优先级：用户确认的 time_column（登记表，可嵌套）>
+            # 全局 time_column 参数 > None（词表自动）。确认列来自
+            # propose_stream_semantics 落盘（真实案例：IMU 传感器时间
+            # data.header.timestamp_us 优先于容器批量写入时间）。
+            per_stream_hint = s.get("time_column") or time_column
+            ts, col_name = _read_stream_timestamps(s, per_stream_hint)
             unit = s.get("timestamp_unit", "unknown")
             # 交叉校验：登记表的 timestamp_unit 可能判为 unknown（列名未命中词表
             # 时），用实际读到的时间戳列名重推断一次，纠正这类漏判（真实案例：

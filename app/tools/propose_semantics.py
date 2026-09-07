@@ -279,6 +279,18 @@ def propose_stream_semantics_impl(
                 context.output_dir, context.dataset_id,
                 stream_overrides=overrides, pair_overrides=None,
             )
+            # 立即应用覆盖到当前会话的流登记表（不用等重载），并清掉受影响流
+            # 的采样率缓存——确认的 time_column 可能与缓存所用列不同（如容器
+            # 批量写入时间的 ~58 万 Hz 荒谬采样率），重测后 UI/对话即用新口径。
+            streams = context.meta.get("streams", [])
+            for s in streams:
+                fname = Path(s.get("path", "")).name
+                if fname in overrides:
+                    s["measured_rate"] = None
+            context.meta["streams"] = profile_store.apply_profile_overrides(
+                streams, profile_store.load_dataset_profile(
+                    context.output_dir, context.dataset_id)
+            )
         out["user_message"] = (
             f"已把 {len(confirmed)} 条通过验证的假设落盘为用户确认"
             f"（strong {summary['strong']} / weak {summary['weak']}，"
