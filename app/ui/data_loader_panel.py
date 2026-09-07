@@ -26,7 +26,12 @@ def _append_message(messages: list[dict], content: str) -> None:
 
 
 def _load_path(service, messages: list[dict], path: str) -> bool:
-    """按路径加载数据集并写对话说明；返回是否成功。"""
+    """按路径加载数据集并写对话说明；返回是否成功。
+
+    成功时做两件事：UI 对话流追加说明（用户可见），并投递面板事件便签
+    （模型可见——下一轮 reply 时拼入其输入；此前只做前者，导致模型凭
+    对话历史判断"没有已加载数据集"而反向索要路径，2026-09-07 修复）。
+    """
     try:
         result = load_dataset_impl(service.context, path)
     except Exception as exc:  # noqa: BLE001  # 工具层已尽量结构化，这里兜底转达
@@ -40,6 +45,13 @@ def _load_path(service, messages: list[dict], path: str) -> bool:
             f"已通过侧栏『数据加载』面板加载数据集 **{name}**"
             + (f"（{n_files} 条流）" if n_files else "")
             + "。你可以直接提问，例如：这个数据集概况如何？成功率多少？",
+        )
+        # 面板事件便签：把"已加载"投进模型输入流（修复模型反向索要路径）。
+        service.add_context_note(
+            f"用户刚通过侧栏『数据加载』面板加载数据集成功：{name}"
+            f"（路径：{path}，load_dataset 工具返回 success"
+            + (f"，共 {n_files} 条流" if n_files else "")
+            + "）。"
         )
         return True
     _append_message(
