@@ -132,9 +132,19 @@ def _read_timestamp_only(
 
 
 def _measure_rate_from_file(
-    path: str, fmt: str, channels: list[str], timestamp_unit: str | None = None
+    path: str,
+    fmt: str,
+    channels: list[str],
+    timestamp_unit: str | None = None,
+    stream: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """从文件实测采样率（均值 + 抖动），先把时间戳归一化到纳秒基准。
+
+    多时钟交叉验证：主口径判 burst 且流登记表存在其它时间候选时，用候选
+    （传感器时间列）重算形态——形态矛盾（burst vs periodic）即透出
+    clock_artifact_suspected + clock_note + clock_candidates（真实案例：
+    MCAP 信封流的容器批量写入时间把 IMU 算成 ~58 万 Hz 荒谬采样率，
+    传感器时间口径下是规整 ~796 Hz 周期）。
 
     Args:
         path: 文件路径。
@@ -144,13 +154,14 @@ def _measure_rate_from_file(
             时，先把差分换算到纳秒再算采样率，避免"微秒被当成秒"之类导致采样率
             误算成 10^-9；无法确定单位（None/unknown/frame_index）时按原值计算，
             并注明单位未知。
+        stream: 流登记项（含 time_candidates），用于多时钟交叉验证。
 
     Returns:
         dict，含 present、sample_rate_hz、jitter_ms、n_samples、timestamp_unit、
         timestamp_unit_basis；文件缺失、格式损坏、无时间戳列或通道缺失时
         present=False 并注明原因。
     """
-    from app.tools.timestamp_units import self_correct_unit, to_ns
+    from app.tools.timestamp_units import infer_unit, self_correct_unit, to_ns
 
     if not Path(path).exists():
         return {"present": False, "reason": f"文件不存在：{path}"}
@@ -204,7 +215,18 @@ def _measure_rate_from_file(
             )
         else:
             unit_note = f"（原始单位 {unit}，已归一化到纳秒）"
-        return {
+
+        # 主口径形态判定：间隔分布与 burst 判据同 check_temporal_sync 口径
+        #（mean ≥ 3×median，容忍不同实现的阈值常量）。
+        diffs_all = np.diff(ts_arr)
+        med_all = float(np.median(diffs_all)) if len(diffs_all) else 0.0
+        shape = "periodic"
+        if len(ts_arr) < 3 or med_all <= 0:
+            shape = "static"
+        elif float(diffs_all.mean()) >= 3.0 * med_all:
+            shape = "burst"
+
+        result = {
             "present": True,
             "sample_rate_hz": round(sample_rate, 3),
             "jitter_ms": round(jitter_ms, 3),
@@ -213,7 +235,68 @@ def _measure_rate_from_file(
             "timestamp_unit": unit or init_unit,
             "timestamp_unit_basis": unit_note,
             "unit_corrected": corrected,
+            "stream_shape": shape,
         }
+
+        # 双口径交叉验证：主口径 burst 且登记表有其它时间候选 → 用候选重算。
+        # 矛盾（候选为 periodic）→ 疑似容器批量写入伪影，透出但不静默换列。
+        cands = (stream or {}).get("time_candidates") or []
+        main_col = str(ts.name) if ts.name else None
+        alternates = [
+            c for c in cands
+            if c.get("path") != main_col and c.get("coverage", 0) >= 0.99
+            and c.get("monotonic")
+        ]
+        if shape == "burst" and alternates:
+            clock_candidates: dict[str, Any] = {
+                str(main_col): {"shape": shape,
+                                "sample_rate_hz": round(sample_rate, 3)}
+            }
+            for alt in alternates[:2]:
+                alt_col = str(alt.get("path"))
+                from app.tools._data_access import read_nested_time_column
+
+                alt_series = read_nested_time_column(path, fmt, alt_col)
+                if alt_series is None:
+                    continue
+                alt_ts = pd.to_numeric(alt_series, errors="coerce")\
+                    .dropna().sort_values()
+                if len(alt_ts) < 3:
+                    continue
+                alt_arr = alt_ts.to_numpy(dtype=float)
+                alt_unit = alt.get("unit_hint")
+                if alt_unit not in ("s", "ms", "us", "ns"):
+                    alt_unit = infer_unit(alt_arr, alt_col)["unit"]
+                if alt_unit not in ("s", "ms", "us", "ns"):
+                    continue
+                alt_ns = to_ns(alt_arr, alt_unit)
+                alt_diffs = np.diff(alt_ns)
+                alt_med = float(np.median(alt_diffs)) if len(alt_diffs) else 0.0
+                alt_span = float(alt_ns[-1] - alt_ns[0])
+                if alt_span <= 0 or alt_med <= 0:
+                    continue
+                alt_shape = (
+                    "burst" if float(alt_diffs.mean()) >= 3.0 * alt_med
+                    else "periodic"
+                )
+                alt_rate = (len(alt_ns) - 1) / alt_span * 1e9
+                clock_candidates[alt_col] = {
+                    "shape": alt_shape,
+                    "sample_rate_hz": round(alt_rate, 3),
+                }
+                if alt_shape != "burst":
+                    result["clock_artifact_suspected"] = True
+                    result["clock_note"] = (
+                        f"多时间口径形态矛盾：主口径 {main_col} 为 burst，"
+                        f"而 {alt_col} 口径为 periodic（约 {alt_rate:.1f} Hz，"
+                        "间隔规整）——主口径疑似容器批量写入时间而非传感器"
+                        f"采样节拍；传感器时间口径的真实采样率约 {alt_rate:.1f} Hz。"
+                        "check_temporal_sync 可用 time_column="
+                        f"{alt_col} 重算对齐。"
+                    )
+            if len(clock_candidates) > 1:
+                result["clock_candidates"] = clock_candidates
+        return result
     except Exception:  # noqa: BLE001
         return {"present": False, "reason": "时间戳解析失败"}
 
@@ -250,6 +333,7 @@ def _measure_stream_rate(
             stream.get("format", ""),
             stream.get("channels", []),
             stream.get("timestamp_unit"),
+            stream=stream,
         )
 
     stream["measured_rate"] = result  # 回写缓存
