@@ -18,6 +18,7 @@ from app.ui.components import (
     render_token_stats,
     render_tool_activity,
 )
+from app.ui.data_loader_panel import render_data_loader
 from app.ui.onboarding import render_onboarding
 from app.ui.settings_panel import render_model_settings
 
@@ -93,6 +94,10 @@ def _main() -> None:
     # 侧栏：模型设置（expander，随时改；保存后自动重建 service）。
     with st.sidebar:
         render_model_settings()
+        st.divider()
+        # 数据加载：路径（主）+ 单文件上传（辅）+ 示例数据集（可选）；
+        # 加载结果进对话流（决策 3），故需传入 messages。
+        render_data_loader(service, messages)
 
     # 侧栏：Token 统计（本轮 + 会话累计；刷新页面重置属正常，不持久化）。
     with st.sidebar:
