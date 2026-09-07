@@ -11,11 +11,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import streamlit as st
-import zipfile
 
 from app.config.settings import get_settings
 from app.tools.load_dataset import load_dataset_impl
-from app.ui.upload_store import ALLOWED_SUFFIXES, extract_zip, save_upload
+from app.ui.upload_store import ALLOWED_SUFFIXES, save_upload
 
 # 单文件上传大小上限（MB）：仅辅助通道，目录型数据集请走路径输入。
 _MAX_UPLOAD_MB = 200
@@ -85,10 +84,10 @@ def render_data_loader(service, messages: list[dict]) -> None:
                     st.error("加载失败，详见对话区说明。")
 
         st.divider()
-        # 辅路径一：单文件上传（目录型数据集不适用）。
+        # 辅路径：单文件上传（目录型数据集不适用）。
         st.caption(
             f"单文件上传（≤{_MAX_UPLOAD_MB}MB，{'/'.join(sorted(ALLOWED_SUFFIXES))}）；"
-            "多文件数据集请打包为 .zip 上传（下方）。"
+            "多文件数据集请用上方路径输入。"
         )
         upload = st.file_uploader(
             "上传单个数据文件",
@@ -114,32 +113,6 @@ def render_data_loader(service, messages: list[dict]) -> None:
                     st.rerun()
                 else:
                     st.error("加载失败，详见对话区说明。")
-
-        st.divider()
-        # 辅路径二（阶段 B）：压缩包整目录上传（同事数据集进部署机的通道）。
-        st.caption(
-            "压缩包上传（.zip，≤1GB 解压后）：适合多文件数据集；"
-            "自动解压后按目录加载。"
-        )
-        zip_upload = st.file_uploader(
-            "上传压缩包数据集", type=["zip"], key="dataset_zip_uploader"
-        )
-        if zip_upload is not None and st.button("解压并加载", key="btn_load_zip"):
-            try:
-                uploads_dir = Path(get_settings().output_path()) / "uploads"
-                extracted = extract_zip(
-                    zip_upload.getvalue(), zip_upload.name, uploads_dir
-                )
-            except (ValueError, zipfile.BadZipFile) as exc:
-                st.error(f"压缩包无法解压：{exc}")
-                return
-            with st.spinner("加载中……"):
-                ok = _load_path(service, messages, str(extracted))
-            if ok:
-                st.success(f"已解压并加载：{extracted.name}")
-                st.rerun()
-            else:
-                st.error("加载失败，详见对话区说明。")
 
         st.divider()
         # 可选：示例数据集（决策 5——常驻可选项，非引导必经步骤）。

@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -109,13 +108,6 @@ class Settings(BaseSettings):
     # 离群 episode 检测（IQR 法）的 k 值：Q1 - k*IQR / Q3 + k*IQR 之外视为离群。
     stats_outlier_k: float = Field(default=1.5, ge=0.0)
 
-    # --- 实例部署模式（局域网共享给同事，docs/实例部署模式设计.md）------------
-    # 实例模式：模型配置由部署者预设（部署机本地 .env），UI 隐藏模型设置入口，
-    # 访问者不可见不可改（key 仅 owner 持有）。克隆用户默认 False（阶段 A 形态）。
-    instance_mode: bool = False
-    # 可选访问口令：非空时局域网访问者需先输入口令（简单门禁，非强鉴权）。
-    access_password: str = ""
-
     # --- 可选：Token 成本估算（美元/百万 token）------------------------------
     # 两项都 >0 时才启用成本估算；默认 0 = 未配置，不显示成本。价格是易变信息，
     # 不硬编码，由用户在 .env 按当前服务商定价填写。
@@ -175,31 +167,3 @@ def is_configured() -> bool:
         return True
     except ConfigError:
         return False
-
-
-def get_instance_mode() -> bool:
-    """读取实例模式开关（不抛异常，供 UI 渲染前判定）。
-
-    实例标志必须**独立于模型配置完整性**生效：部署实例在 key 尚未配置时
-    （get_settings 抛 ConfigError），同事同样不能看到配置表单——因此
-    ConfigError 时回退读原始环境变量（与 pydantic-settings 同源）。
-
-    Returns:
-        INSTANCE_MODE 是否开启。
-    """
-    try:
-        return bool(get_settings().instance_mode)
-    except ConfigError:
-        return os.getenv("INSTANCE_MODE", "").strip().lower() in ("1", "true", "yes", "on")
-
-
-def get_access_password_lenient() -> str:
-    """读取访问口令（不抛异常；key 缺失时回退环境变量，理由同上）。
-
-    Returns:
-        ACCESS_PASSWORD 值（空串 = 门禁未启用）。
-    """
-    try:
-        return get_settings().access_password
-    except ConfigError:
-        return os.getenv("ACCESS_PASSWORD", "")
