@@ -591,12 +591,15 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
     )
     n_streams = len(streams)
     unclassified_hint = None
-    if n_streams >= 5 and classified / n_streams < 0.5:
+    # 有未分类即提示（边界教训：恰半数确认时 13/26 < 0.5 为 False，恰好漏报
+    # 用户实测场景）。比例措辞：全部未分类（强引导）vs 部分未分类（温和）。
+    if n_streams >= 5 and classified < n_streams:
+        unclassified = n_streams - classified
         unclassified_hint = (
-            f"{n_streams - classified}/{n_streams} 条流语义未分类"
-            "（unknown/低置信）。回答涉及这些流的类别或分组时，请先"
-            "用 propose_stream_semantics 批量提交假设（工具会确定性验证），"
-            "转述验证结果并请用户确认后落盘——一次确认，跨会话生效。"
+            f"{unclassified}/{n_streams} 条流语义未分类（unknown/低置信）。"
+            "回答涉及这些流的类别或分组时，请先用 propose_stream_semantics "
+            "批量提交假设（工具会确定性验证），转述验证结果并请用户确认后"
+            "落盘——一次确认，跨会话生效。"
         )
 
     summary = {

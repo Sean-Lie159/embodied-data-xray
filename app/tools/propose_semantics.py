@@ -173,6 +173,16 @@ def _verify_kind(
         return "failed", "未发现模长≈1 的四元数组"
 
     if kind_l == "tf":
+        # 展开视图（expand_envelope）把 list[dict] 消化为扁平列
+        # （data.transforms.0.parent_frame_id）——原始 list 结构不复存在，
+        # 因此**主要依据展开列名**找 TF 特征（frame_id 键 + transforms 前缀）。
+        tf_cols = [
+            c for c in columns
+            if "transforms" in c.lower() and "frame_id" in c.lower()
+        ]
+        if tf_cols:
+            return "strong", f"展开列含坐标变换特征键（如 {tf_cols[0]}）"
+        # 兜底：未展开时值本身是 list[dict] 且含 frame 键。
         for col in columns:
             series = df[col]
             for v in series:
@@ -181,7 +191,7 @@ def _verify_kind(
                     if any("frame" in k for k in keys):
                         return "strong", f"{col} 为 frame 变换记录列表"
                     return "weak", f"{col} 为 dict 列表但无 frame 键"
-        return "failed", "未发现 transforms 类列表结构"
+        return "failed", "未发现 transforms 类结构（展开列或原始值中均无 frame_id 特征）"
 
     # 自定义/未知 kind：仅结构存在性检查（evidence 路径在展开列中存在）。
     # 设计约定：自定义语义永远 weak（结构对不等于语义对，交用户裁决）。
