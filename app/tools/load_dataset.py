@@ -80,11 +80,48 @@ def _load_csv(path: str) -> pd.DataFrame:
     )
 
 
+class MissingDependencyError(RuntimeError):
+    """运行环境缺少读某格式所需的可选依赖（如读 HDF5 需 pytables）。
+
+    与"文件损坏/格式不对"严格区分：缺依赖时工具根本没读到文件内容，
+    不得给出"可能损坏"之类误导性兜底措辞（诚实降级纪律）。
+    """
+
+    def __init__(self, package: str, import_name: str, fmt: str) -> None:
+        self.package = package
+        self.import_name = import_name
+        self.fmt = fmt
+        super().__init__(
+            f"读取 {fmt} 需要 {package} 包（import {import_name}），当前环境未安装"
+        )
+
+    def user_hint(self) -> str:
+        """可直接转达给用户的中文修复指引（不含"文件损坏"类误导措辞）。"""
+        return (
+            f"读取 {self.fmt} 需要环境安装 {self.package} 依赖（pip 包名 "
+            f"{self.import_name}），当前环境未安装——文件未被读取，"
+            "并非文件损坏。请在运行环境执行 `pip install "
+            f"{self.import_name}` 后重新加载。"
+        )
+
+
 def _load_hdf5(path: str) -> pd.DataFrame:
-    """读取 HDF5 表；存在多个 key 时尝试逐个定位 DataFrame。"""
+    """读取 HDF5 表；存在多个 key 时尝试逐个定位 DataFrame。
+
+    Raises:
+        MissingDependencyError: 环境缺少 pytables（pandas 读 HDF5 的可选依赖，
+            pip 包名 tables）——此时文件内容完全未被读取，不得按"文件损坏"
+            处理。
+        ValueError: 文件确实无法解析（损坏/非 HDF5/无可读 DataFrame 表）。
+    """
     try:
         with pd.HDFStore(path, mode="r") as store:
             keys = store.keys()
+    except ImportError as exc:
+        # pandas 的可选依赖缺失（Missing optional dependency 'pytables'）。
+        # 实测：用户环境装了 h5py（另一个 HDF5 库）但没装 tables，读 .h5 必踩。
+        raise MissingDependencyError("pytables", "tables", "HDF5 (.h5)") from exc
+    try:
         for key in keys:
             try:
                 df = pd.read_hdf(path, key=key)
@@ -876,6 +913,16 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
             df = _load_hdf5(path)
         else:  # pragma: no cover - 防御性分支
             raise ValueError(f"未实现格式：{ext}")
+    except MissingDependencyError as exc:
+        # 缺可选依赖 ≠ 文件损坏：文件内容完全未被读取，user_message 不得使用
+        # "可能损坏"兜底措辞（真实事故：用户被误导怀疑文件损坏，实际只是环境
+        # 缺 pytables）。给出可执行的修复指令。
+        return _error(
+            "missing_dependency",
+            f"读取 {path} 失败：环境缺少依赖（{exc}）",
+            exc.user_hint(),
+            supported_formats=supported,
+        )
     except Exception as exc:  # noqa: BLE001
         return _error(
             "parse_failed",
