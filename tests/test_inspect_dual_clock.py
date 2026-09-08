@@ -57,14 +57,17 @@ def test_burst_main_with_periodic_alternate_flags_artifact(tmp_path: Path) -> No
     assert mr["present"] is True
     assert mr["stream_shape"] == "burst"
     assert mr.get("clock_artifact_suspected") is True
-    cands = mr["clock_candidates"]
-    assert cands["mcap_log_time_ns"]["shape"] == "burst"
-    nested_key = next(k for k in cands if k.startswith("data."))
-    assert cands[nested_key]["shape"] == "periodic"
-    # 传感器口径的速率（≈1000Hz）远小于容器口径的荒谬值。
-    assert cands[nested_key]["sample_rate_hz"] < cands["mcap_log_time_ns"]["sample_rate_hz"]
+    # 主值已替换为传感器口径真值（UI 渲染主值字段——用户要求显示正确数字）。
+    nested_key = next(k for k in mr["clock_candidates"] if k.startswith("data."))
+    assert mr["sample_rate_hz"] == mr["clock_candidates"][nested_key]["sample_rate_hz"], (
+        "主值应为传感器口径真值"
+    )
+    assert 900 <= mr["sample_rate_hz"] <= 1100
+    # 容器失真值保留在 clock_candidates 供审计。
+    assert mr["clock_candidates"]["mcap_log_time_ns"]["shape"] == "burst"
     assert "批量写入" in mr["clock_note"]
     assert "time_column=" in mr["clock_note"]
+    assert "传感器时间口径" in mr.get("sample_rate_note", "")
 
 
 def test_periodic_main_not_flagged(tmp_path: Path) -> None:

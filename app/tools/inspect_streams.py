@@ -253,8 +253,19 @@ def _measure_rate_from_file(
             "stream_shape": shape,
         }
 
+        # burst 形态：常规采样率口径失真（批量写入间隔 → ~58 万 Hz 荒谬值）。
+        # 主值置空、另给有效速率（n/span 写盘平均口径），note 说明原因。
+        if shape == "burst":
+            span_s = float(ts_arr[-1] - ts_arr[0]) / 1e9 if len(ts_arr) > 1 else 0.0
+            result["sample_rate_hz"] = None
+            result["sample_rate_note"] = "突发型流：常规采样率口径不适用（批量写入间隔）"
+            if span_s > 0:
+                result["effective_rate_hz"] = round((len(ts_arr) - 1) / span_s, 3)
+
         # 双口径交叉验证：主口径 burst 且登记表有其它时间候选 → 用候选重算。
-        # 矛盾（候选为 periodic）→ 疑似容器批量写入伪影，透出但不静默换列。
+        # 候选为 periodic → 主值**替换为传感器口径真值**（用户明确要求 UI 显示
+        # 正确数字；容器失真值保留在 clock_candidates 供审计），矛盾经
+        # clock_note 透出，不静默。
         cands = (stream or {}).get("time_candidates") or []
         main_col = str(ts.name) if ts.name else None
         alternates = [
@@ -301,6 +312,13 @@ def _measure_rate_from_file(
                 }
                 if alt_shape != "burst":
                     result["clock_artifact_suspected"] = True
+                    # 主值替换为传感器口径真值（UI 渲染主值字段——用户明确
+                    # 要求显示正确数字）；容器失真值保留在 clock_candidates。
+                    result["sample_rate_hz"] = round(alt_rate, 3)
+                    result["sample_rate_note"] = (
+                        f"传感器时间口径（{alt_col}）；容器批量写入口径曾算出 "
+                        f"{round(sample_rate, 3)} Hz（失真，见 clock_candidates）"
+                    )
                     result["clock_note"] = (
                         f"多时间口径形态矛盾：主口径 {main_col} 为 burst，"
                         f"而 {alt_col} 口径为 periodic（约 {alt_rate:.1f} Hz，"
@@ -563,6 +581,24 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         for fname, mapping in user_profile.get("streams", {}).items()
     ]
 
+    # 未分类流占比：unknown 为主时引导 agent 走 propose 确认（语义假设的
+    # 结构化出口——绑定在工具返回上，任何对话路径都触达，不依赖 agent 自觉）。
+    classified = sum(
+        1 for s in streams
+        if s.get("label_source") == "user_confirmed"
+        or (s.get("semantic_label") or "").find("未知") < 0
+        and s.get("kind") not in (None, "unknown")
+    )
+    n_streams = len(streams)
+    unclassified_hint = None
+    if n_streams >= 5 and classified / n_streams < 0.5:
+        unclassified_hint = (
+            f"{n_streams - classified}/{n_streams} 条流语义未分类"
+            "（unknown/低置信）。回答涉及这些流的类别或分组时，请先"
+            "用 propose_stream_semantics 批量提交假设（工具会确定性验证），"
+            "转述验证结果并请用户确认后落盘——一次确认，跨会话生效。"
+        )
+
     summary = {
         "n_video_streams": len(video_streams),
         "n_imus": len(imus),
@@ -591,10 +627,12 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "stream_pairs": context.meta.get("stream_pairs", []),
         "user_confirmed_overrides": user_confirmed_overrides,
         "summary": summary,
+        "unclassified_hint": unclassified_hint,
         "user_message": (
             f"已生成设备清单：{len(video_streams)} 路视频、{len(imus)} 个 IMU、"
             f"力通道 {'有' if force['present'] else '无'}、标定{'有' if has_calib else '无'}；"
             f"空流 {len(empty_streams)} 条（已标记未使用）；时钟来源 {clock_source}。"
+            + (f" {unclassified_hint}" if unclassified_hint else "")
         ),
     }
 
