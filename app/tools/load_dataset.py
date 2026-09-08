@@ -105,6 +105,64 @@ class MissingDependencyError(RuntimeError):
         )
 
 
+def _load_hdf5_native(path: str) -> pd.DataFrame | None:
+    """用 h5py 读取原生层级结构的 HDF5（非 pandas HDFStore 格式）。
+
+    真实形态（具身智能采集）：root 下 action/observation/pose/meta 等组，
+    数据节点是 compound dtype 的结构化数组（字段如 value/timestamp/file_path，
+    可能含子数组字段如 value <f4 (7,)），另有标定矩阵（2D float）与
+    object 标量节点。
+
+    选择策略：在全部候选节点（compound 或 2D 数值）中选**信息量最大**者
+    （行数×列数）转为主 DataFrame；compound 含子数组字段时保持 object 列
+    （每行一个 ndarray，与嵌套向量处理路径一致）。
+
+    Args:
+        path: 文件路径。
+
+    Returns:
+        主 DataFrame；文件非 HDF5 / 无候选节点 / h5py 不可用返回 None
+        （调用方按原路径兜底）。
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+    try:
+        with h5py.File(path, "r") as f:
+            candidates: list[tuple[str, int, int, Any]] = []  # (路径, 行, 列, 数据)
+            def _visit(name: str, node: Any) -> None:
+                if not isinstance(node, h5py.Dataset):
+                    return
+                dtype = node.dtype
+                if node.dtype == object and node.shape == (1,):
+                    return  # object 标量（extra_info / camera_model 等）
+                if dtype.names:  # compound：字段名即列名
+                    ncols = len(dtype.names)
+                elif node.ndim == 2:
+                    ncols = int(node.shape[1])
+                else:
+                    return  # 1D 标量数组（distortion (4,) 等）不构成表
+                candidates.append((name, int(node.shape[0]), ncols, node[()]))
+            f.visititems(_visit)
+            if not candidates:
+                return None
+            # 信息量最大者为主表；并列时路径字母序（确定性）。
+            candidates.sort(key=lambda c: (-(c[1] * c[2]), c[0]))
+            best_path, _rows, _cols, data = candidates[0]
+            df = pd.DataFrame(data)
+            df.attrs["h5_source_node"] = best_path
+            df.attrs["h5_structure"] = [
+                {"node": c[0], "rows": c[1], "cols": c[2]}
+                for c in candidates[:20]
+            ]
+            return df
+    except OSError:
+        return None  # 非 HDF5 签名 → 调用方按"可能损坏"兜底（文件确实读过）
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _load_hdf5(path: str) -> pd.DataFrame:
     """读取 HDF5 表；存在多个 key 时尝试逐个定位 DataFrame。
 
@@ -114,6 +172,7 @@ def _load_hdf5(path: str) -> pd.DataFrame:
             处理。
         ValueError: 文件确实无法解析（损坏/非 HDF5/无可读 DataFrame 表）。
     """
+    keys: list[str] | None
     try:
         with pd.HDFStore(path, mode="r") as store:
             keys = store.keys()
@@ -121,7 +180,11 @@ def _load_hdf5(path: str) -> pd.DataFrame:
         # pandas 的可选依赖缺失（Missing optional dependency 'pytables'）。
         # 实测：用户环境装了 h5py（另一个 HDF5 库）但没装 tables，读 .h5 必踩。
         raise MissingDependencyError("pytables", "tables", "HDF5 (.h5)") from exc
-    try:
+    except (OSError, ValueError):
+        keys = None  # 非 pandas HDFStore 格式（如 h5py 原生层级）→ 直接走回退。
+
+    # 路径 1：pandas HDFStore 格式 → 逐 key 尝试 read_hdf。
+    if keys:
         for key in keys:
             try:
                 df = pd.read_hdf(path, key=key)
@@ -129,9 +192,20 @@ def _load_hdf5(path: str) -> pd.DataFrame:
                     return df
             except (KeyError, TypeError, ValueError):
                 continue
-        raise ValueError(f"HDF5 文件 {path} 中未找到可读取的 DataFrame 表。")
-    except OSError as exc:
-        raise ValueError(f"无法读取 HDF5 文件：{path}（{exc}）") from exc
+
+    # 路径 2：h5py 原生层级回退。触发条件包括：非 HDFStore 格式；或 PyTables
+    # 能打开、keys 非空但 read_hdf 全败（真实案例：具身智能采集用 h5py 直接
+    # 写层级结构——action/observation/pose/meta 各组下是 compound dtype 的
+    # 结构化数组，pandas read_hdf 不认，但数据完好且信息量大，实测 46.8MB、
+    # 69 个数据节点）。
+    native = _load_hdf5_native(path)
+    if native is not None:
+        return native
+
+    if keys is None:
+        # HDFStore 与 h5py 都打不开 → 确实不是有效 HDF5（"可能损坏"措辞恰当）。
+        raise ValueError(f"无法读取 HDF5 文件：{path}（非 pandas HDFStore 格式且非 HDF5 层级结构）")
+    raise ValueError(f"HDF5 文件 {path} 中未找到可读取的 DataFrame 表。")
 
 
 def _error(
@@ -937,6 +1011,11 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
 
     context.df = df
     context.dataset_id = dataset_id
+    # h5 原生层级文件：结构摘要（全部数据节点清单）随主表透出——用户可知
+    # 该文件内还有哪些表（主表为信息量最大节点）。
+    h5_structure = (
+        df.attrs.get("h5_structure") if ext == ".h5" and hasattr(df, "attrs") else None
+    )
     meta: dict[str, Any] = {
         "source": path,
         "format": ext.lstrip("."),
@@ -945,6 +1024,9 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         "columns": [str(c) for c in df.columns],
         "dtypes": {str(c): str(t) for c, t in df.dtypes.items()},
     }
+    if h5_structure:
+        meta["h5_structure"] = h5_structure
+        meta["h5_source_node"] = df.attrs.get("h5_source_node")
     context.meta = meta
 
     result: dict[str, Any] = {
@@ -961,6 +1043,11 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         )
     else:
         result["user_message"] = f"已加载数据集 {dataset_id}，当前可对其进行分析。"
+    if h5_structure:
+        result["user_message"] += (
+            f" 该文件为 HDF5 原生层级结构，主表为节点 {meta['h5_source_node']}，"
+            f"共含 {len(h5_structure)} 个数据节点（其余节点清单见 h5_structure 字段）。"
+        )
     return result
 
 
