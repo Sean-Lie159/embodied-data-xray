@@ -150,7 +150,21 @@ def _load_hdf5_native(path: str) -> pd.DataFrame | None:
             # 信息量最大者为主表；并列时路径字母序（确定性）。
             candidates.sort(key=lambda c: (-(c[1] * c[2]), c[0]))
             best_path, _rows, _cols, data = candidates[0]
-            df = pd.DataFrame(data)
+            try:
+                df = pd.DataFrame(data)
+            except ValueError:
+                # compound 含子数组字段（如 value <f4 (7,)）→ 逐字段转，
+                # 子数组字段保持 object 列（与 _read_hdf5_node 同款防护）。
+                names = getattr(data.dtype, "names", None)
+                if not names:
+                    return None
+                cols: dict[str, Any] = {}
+                for name in names:
+                    col = data[name]
+                    cols[name] = (
+                        list(col) if col.ndim > 1 else col
+                    )  # 子数组字段 → object 列
+                df = pd.DataFrame(cols)
             df.attrs["h5_source_node"] = best_path
             df.attrs["h5_structure"] = [
                 {"node": c[0], "rows": c[1], "cols": c[2]}
@@ -159,6 +173,110 @@ def _load_hdf5_native(path: str) -> pd.DataFrame | None:
             return df
     except OSError:
         return None  # 非 HDF5 签名 → 调用方按"可能损坏"兜底（文件确实读过）
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _list_hdf5_native_nodes(path: str) -> list[dict[str, Any]]:
+    """列出 h5py 原生层级文件的全部候选数据节点（供流登记）。
+
+    候选与 _load_hdf5_native 同口径：compound dtype（字段名即列名）或
+    2D 数值数组；object 标量与 1D 标量数组不算表。
+
+    Args:
+        path: 文件路径。
+
+    Returns:
+        节点清单 [{node, rows, cols, fields}]，按 行×列 降序（主表在首）；
+        非 HDF5/h5py 不可用返回 []。
+    """
+    try:
+        import h5py
+    except ImportError:
+        return []
+    try:
+        out: list[dict[str, Any]] = []
+        with h5py.File(path, "r") as f:
+            def _visit(name: str, node: Any) -> None:
+                if not isinstance(node, h5py.Dataset):
+                    return
+                dtype = node.dtype
+                if node.dtype == object and node.shape == (1,):
+                    return
+                if dtype.names:
+                    ncols = len(dtype.names)
+                    fields = list(dtype.names)
+                elif node.ndim == 2:
+                    ncols = int(node.shape[1])
+                    fields = []
+                else:
+                    return
+                out.append({
+                    "node": name,
+                    "rows": int(node.shape[0]),
+                    "cols": ncols,
+                    "fields": fields,
+                })
+            f.visititems(_visit)
+        out.sort(key=lambda c: (-(c["rows"] * c["cols"]), c["node"]))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _classify_h5_node(fields: list[str], node_path: str) -> tuple[str, str]:
+    """按节点字段特征判定 kind 与语义标签（确定性，不硬猜语义之外的）。
+
+    Args:
+        fields: compound 字段名清单（2D 数值节点为空）。
+        node_path: 节点路径（如 action/left_eef/feedback/motor_command）。
+
+    Returns:
+        (kind, semantic_label)。
+    """
+    path_l = node_path.lower()
+    fl = [f.lower() for f in fields]
+    if any("motor_command" in f or "command" in f for f in fl) or "action" in path_l:
+        return "actions", "动作/指令流"
+    if any(f in ("timestamp", "file_path", "frame_index") for f in fl) and "camera" in path_l:
+        return "frame_index", "相机帧索引"
+    if any("orientation" in f or "accel" in f for f in fl) or "imu" in path_l:
+        return "imu", "IMU 传感器"
+    if "pose" in path_l or any("quat" in f for f in fl):
+        return "pose", "位姿流"
+    if "calibration" in path_l:
+        return "calibration", "标定数据"
+    return "unknown", "未知（无法分类）"
+
+
+def _read_hdf5_node(path: str, node: str) -> pd.DataFrame | None:
+    """按节点路径读取 h5py 层级文件的单个数据节点为 DataFrame。"""
+    try:
+        import h5py
+    except ImportError:
+        return None
+    try:
+        with h5py.File(path, "r") as f:
+            node_obj = f.get(node)
+            if node_obj is None or not isinstance(node_obj, h5py.Dataset):
+                return None
+            data = node_obj[()]
+            try:
+                return pd.DataFrame(data)
+            except ValueError:
+                # compound 含子数组字段（如 value <f4 (7,)）时整体转 DataFrame
+                # 会抛 "must be 1-dimensional"——逐字段转，子数组字段保持
+                # object 列（每行一个 ndarray，与嵌套向量处理路径一致）。
+                names = getattr(data.dtype, "names", None)
+                if not names:
+                    return None
+                cols: dict[str, Any] = {}
+                for name in names:
+                    col = data[name]
+                    cols[name] = (
+                        list(col) if col.ndim > 1 else col
+                    )  # 子数组字段 → object 列（每行一个 ndarray）
+                return pd.DataFrame(cols)
     except Exception:  # noqa: BLE001
         return None
 
@@ -1027,7 +1145,38 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
     if h5_structure:
         meta["h5_structure"] = h5_structure
         meta["h5_source_node"] = df.attrs.get("h5_source_node")
+        # h5 原生层级：把全部候选节点登记为流（复用目录多流机制），节点
+        # 流名 = "<文件stem>::<node path>"，resolve_table_name 按名惰性读取。
+        # 主表节点仍装在 context.df（信息量最大节点），其余节点按需读取。
+        nodes = _list_hdf5_native_nodes(path)
+        stream_entries: list[dict[str, Any]] = []
+        for nd in nodes:
+            node_name = nd["node"]
+            kind, label = _classify_h5_node(nd.get("fields", []), node_name)
+            stream_entries.append({
+                "path": f"{source}::{node_name}",
+                "format": "h5",
+                "kind": kind,
+                "semantic_label": label,
+                "label_evidence": f"HDF5 节点字段特征（{nd['cols']} 列）",
+                "label_confidence": "low" if kind == "unknown" else "medium",
+                "label_source": "h5_node_scan",
+                "role": {"role": label, "confidence": "medium",
+                         "evidence": "HDF5 节点字段特征"},
+                "channels": nd.get("fields", []),
+                "n_rows": nd["rows"],
+                "n_cols": nd["cols"],
+                "is_main": node_name == df.attrs.get("h5_source_node"),
+            })
+        if stream_entries:
+            meta["h5_node_streams"] = stream_entries
+            meta["h5_node_pending"] = True  # 登记延后到 context.meta 赋值后
     context.meta = meta
+    if meta.pop("h5_node_pending", None):
+        # 登记进 streams（必须在 context.meta = meta 之后——meta 与 context.meta
+        # 同引用，此处 streams 追加才会落到真正的会话 meta 上）。
+        existing = context.meta.get("streams", [])
+        context.meta["streams"] = existing + meta["h5_node_streams"]
 
     result: dict[str, Any] = {
         "success": True,

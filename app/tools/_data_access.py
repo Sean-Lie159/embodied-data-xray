@@ -418,6 +418,16 @@ def expand_envelope(
     return out, note
 
 
+def _read_h5_node_stream(path_spec: str) -> pd.DataFrame | None:
+    """读取 h5 节点流（path_spec 形如 "<file>::<node path>"）。"""
+    file_part, _, node = path_spec.partition("::")
+    if not node:
+        return None
+    from app.tools.load_dataset import _read_hdf5_node
+
+    return _read_hdf5_node(file_part, node)
+
+
 def resolve_table_name(
     context: RunContext, table: str | None, expand: bool = False
 ) -> dict[str, Any]:
@@ -472,9 +482,37 @@ def resolve_table_name(
         return result
 
     # 显式表名 → 按流登记表查找（文件名精确匹配，忽略大小写）。
+    # h5 节点流的表名 = "<文件stem>::<node>"（或仅 node 路径）。
     name_lower = table.strip().lower()
     for s in context.meta.get("streams", []):
         p = s.get("path", "")
+        if s.get("format") == "h5" and "::" in p:
+            node_name = p.partition("::")[2]
+            display = f"{Path(p.split('::')[0]).stem}::{node_name}".lower()
+            if name_lower in (display, node_name.lower()):
+                df = _read_h5_node_stream(p)
+                if df is not None:
+                    result = {
+                        "success": True,
+                        "df": df,
+                        "table_name": f"{Path(p.split('::')[0]).stem}::{node_name}",
+                        "dataset": context.dataset_id,
+                        "source": "h5_node",
+                    }
+                    if expand:
+                        df2, note2 = expand_envelope(df)
+                        result["df"] = df2
+                        result["expand_note"] = note2
+                    return result
+                return {
+                    "success": False,
+                    "error": "table_read_failed",
+                    "reason": f"h5 节点 {node_name} 读取失败",
+                    "df": None,
+                    "table_name": table,
+                    "dataset": context.dataset_id,
+                    "source": "h5_node",
+                }
         if Path(p).name.lower() == name_lower:
             df = read_stream_full(p, s.get("format", ""))
             if df is not None:
