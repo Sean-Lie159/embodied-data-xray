@@ -170,9 +170,28 @@ def _measure_rate_from_file(
     """
     from app.tools.timestamp_units import infer_unit, self_correct_unit, to_ns
 
-    if not Path(path).exists():
+    if not Path(path.split("::")[0]).exists():
         return {"present": False, "reason": f"文件不存在：{path}"}
-    ts = _read_timestamp_only(path, fmt, column_hint)
+    # h5 节点流（format="h5"，path 带 ::node）：时间戳为 compound 字段列。
+    if fmt == "h5" and "::" in path:
+        from app.tools._data_access import read_h5_node_field
+        from app.tools.timestamp_units import infer_unit
+
+        field = column_hint or "timestamp"
+        ts = read_h5_node_field(path, field)
+        if ts is None and field != "timestamp":
+            field = "timestamp"
+            ts = read_h5_node_field(path, field)
+        if ts is None:
+            return {"present": False,
+                    "reason": f"h5 节点无时间戳字段（{field}）"}
+        # 单位强制量级推断（登记表单位属别的节点/列；真实案例 ms 被当 s →
+        # 0.1 Hz 千倍失真）。timestamp_unit 参数改为推断结果。
+        timestamp_unit = infer_unit(
+            pd.to_numeric(ts, errors="coerce").dropna().to_numpy(), field
+        )["unit"]
+    else:
+        ts = _read_timestamp_only(path, fmt, column_hint)
     if ts is None:
         hint_note = f"（指定时间列 {column_hint} 不存在或读取失败）" if column_hint else ""
         return {"present": False, "reason": f"未找到时间戳列或读取失败{hint_note}"}

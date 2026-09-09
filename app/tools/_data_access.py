@@ -216,14 +216,18 @@ def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
 
     JSON 顶层 dict 时按行列表键（frames/data）展开为 DataFrame，避免把标量键
     （如 fps）当数据列。JSONL 按行解析（lines=True），与 JSON 严格区分。
+    h5 节点流（path 带 ::node）按节点读取。
 
     Args:
-        path: 文件路径。
-        fmt: 格式（csv/parquet/json/jsonl）。
+        path: 文件路径（h5 节点流形如 "<file>::<node>"）。
+        fmt: 格式（csv/parquet/json/jsonl/h5）。
 
     Returns:
         DataFrame；读取失败返回 None。
     """
+    if fmt == "h5" and "::" in path:
+        return _read_h5_node_stream(path)
+
     import json as _json
 
     from app.tools.load_dataset import _detect_encoding
@@ -423,9 +427,24 @@ def _read_h5_node_stream(path_spec: str) -> pd.DataFrame | None:
     file_part, _, node = path_spec.partition("::")
     if not node:
         return None
-    from app.tools.load_dataset import _read_hdf5_node
+    from app.tools.load_dataset import read_hdf5_node
 
-    return _read_hdf5_node(file_part, node)
+    return read_hdf5_node(file_part, node)
+
+
+def read_h5_node_field(path_spec: str, field: str) -> "pd.Series | None":
+    """读取 h5 节点流指定字段（compound 的 timestamp 等），返回 Series。"""
+    file_part, _, node = path_spec.partition("::")
+    if not node:
+        return None
+    from app.tools.load_dataset import read_hdf5_node
+
+    df = read_hdf5_node(file_part, node)
+    if df is None or field not in df.columns:
+        return None
+    series = df[field]
+    series.name = field
+    return series
 
 
 def resolve_table_name(

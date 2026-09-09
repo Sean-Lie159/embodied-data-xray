@@ -84,8 +84,20 @@ def _unit_from_name(col_name: str) -> str | None:
         return "us"
     if lower.endswith("_ms") or lower.endswith("ms"):
         return "ms"
-    if lower.endswith("_s") or lower.endswith("s") and not lower.endswith("index"):
+    # "s" 后缀：要求前缀含实质词干（time_s/log_time_s 可信；timestamp 本身
+    # 以 s 结尾但无单位含义——真实案例：h5 节点字段 timestamp（Unix 毫秒
+    # 1.788e12）被 endswith("s") 判为秒 → 采样率千倍失真）。返回 None 走
+    # 差分/量级推断（ms epoch 会被正确判为 ms）。
+    if lower.endswith("_s"):
         return "s"
+    if lower.endswith("s") and len(lower) > 1:
+        stem = lower[:-1]
+        # 常见以 s 结尾的"非单位"字段名（复数/动词），不视为秒单位。
+        if stem in ("timestamp", "time_stamp", "millisecond", "microsecond",
+                    "nanosecond", "second"):
+            return None
+        if stem.isalpha() and len(stem) >= 3:
+            return "s"
     return None
 
 
@@ -139,6 +151,27 @@ def infer_unit(
             "unit_basis": f"绝对值中位≈{abs_med:.3g}（纳秒 epoch 量级），列应为纳秒时间戳",
             "med_diff": med,
             "med_diff_ns": med,
+        }
+
+    # ①b 毫秒 epoch（Unix 毫秒，2026 年 ≈1.78e12）：真实案例——h5 节点字段
+    # timestamp（值 1.788e12、差分 10ms）差分恰好落 ns 区间 [0,1e3)，被误判
+    # ns 后自我纠正到 s（0.1 Hz，也在"合理区间"）→ 千倍失真。epoch 绝对值
+    # 对墙钟时刻是唯一的，比差分启发式可靠。
+    if 1e11 <= abs_med < 1e15 and med is not None and 1e-3 <= med <= 1e8:
+        return {
+            "unit": "ms",
+            "unit_basis": f"绝对值中位≈{abs_med:.3g}（毫秒 epoch 量级，差分 "
+                          f"{med:.3g} 对应物理合理采样间隔），列应为毫秒时间戳",
+            "med_diff": med,
+            "med_diff_ns": med * 1e6,
+        }
+    # ①c 秒 epoch（Unix 秒，2026 年 ≈1.78e9）。
+    if 1e8 <= abs_med < 1e11 and med is not None and 1e-6 <= med <= 1e5:
+        return {
+            "unit": "s",
+            "unit_basis": f"绝对值中位≈{abs_med:.3g}（秒 epoch 量级），列应为秒时间戳",
+            "med_diff": med,
+            "med_diff_ns": med * 1e9,
         }
 
     # ② 差分判定：中位正差分落在某单位量级区间。

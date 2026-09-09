@@ -249,8 +249,9 @@ def _classify_h5_node(fields: list[str], node_path: str) -> tuple[str, str]:
     return "unknown", "未知（无法分类）"
 
 
-def _read_hdf5_node(path: str, node: str) -> pd.DataFrame | None:
-    """按节点路径读取 h5py 层级文件的单个数据节点为 DataFrame。"""
+def read_hdf5_node(path: str, node: str) -> pd.DataFrame | None:
+    """按节点路径读取 h5py 层级文件的单个数据节点为 DataFrame（公开接口，
+    供 _data_access / sync / propose 等工具按流登记表读取 h5 节点流）。"""
     try:
         import h5py
     except ImportError:

@@ -51,16 +51,35 @@ _VERIFY_MAX_COLS = 128
 
 
 def _locate_stream(context: RunContext, filename: str) -> dict[str, Any] | None:
-    """按文件名（大小写不敏感）在流登记表定位流。"""
+    """按文件名（大小写不敏感）在流登记表定位流。
+
+    h5 节点流（path 带 ::node）额外支持按**节点路径**匹配（如
+    "meta/index_map/observation/camera/lf_chest_fisheye"）——Path().name
+    对这类 path 只会取到末段，产生歧义（多个 meta/index_map 节点末段相同）。
+    """
     name = filename.strip().lower()
-    for s in context.meta.get("streams", []):
+    streams = context.meta.get("streams", [])
+    for s in streams:
         if Path(s.get("path", "")).name.lower() == name:
+            return s
+    # h5 节点流：按节点路径（:: 之后部分）匹配。
+    for s in streams:
+        p = s.get("path", "")
+        if "::" in p and p.partition("::")[2].lower() == name:
             return s
     return None
 
 
 def _load_expanded(path: str, fmt: str) -> tuple[pd.DataFrame | None, str | None]:
-    """读取并展开信封流，返回 (df, note)；格式不支持/读取失败返回 (None, None)。"""
+    """读取并展开流内容，返回 (df, note)；格式不支持/读取失败返回 (None, None)。
+
+    h5 节点流（format="h5"，path 带 ::node）按节点读取——验证器得以核验
+    h5 流的结构特征（真实案例：tf/相机帧索引节点此前验证 failed）。
+    """
+    if fmt == "h5" and "::" in path:
+        from app.tools._data_access import _read_h5_node_stream
+
+        return _read_h5_node_stream(path), None
     if fmt not in ("jsonl", "json"):
         return None, None
     from app.tools._data_access import expand_envelope, read_stream_full
