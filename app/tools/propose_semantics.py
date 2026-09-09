@@ -80,14 +80,17 @@ def _load_expanded(path: str, fmt: str) -> tuple[pd.DataFrame | None, str | None
         from app.tools._data_access import _read_h5_node_stream
 
         return _read_h5_node_stream(path), None
-    if fmt not in ("jsonl", "json"):
-        return None, None
-    from app.tools._data_access import expand_envelope, read_stream_full
+    # 表格/信封格式（csv/parquet/json/jsonl）经统一 reader 后**展开信封**
+    # （验证器在扁平列上找特征——jsonl 信封流的 IMU 向量嵌套在 data 内，
+    # 不展开则 imu 验证退化为 failed）。
+    if fmt in ("csv", "parquet", "json", "jsonl"):
+        from app.tools._data_access import expand_envelope, read_stream_full
 
-    df = read_stream_full(path, fmt)
-    if df is None:
-        return None, None
-    return expand_envelope(df, max_cols=_VERIFY_MAX_COLS)
+        df = read_stream_full(path, fmt)
+        if df is None:
+            return None, None
+        return expand_envelope(df, max_cols=_VERIFY_MAX_COLS)
+    return None, None
 
 
 def _quat_bases(columns: list[str]) -> dict[str, list[str]]:
@@ -263,6 +266,22 @@ def propose_stream_semantics_impl(
             results.append({
                 "file": fname, "kind": kind, "verified": "failed",
                 "evidence": "流登记表中不存在该文件名（未加载或拼写不符）",
+            })
+            continue
+
+        # 媒体流（视频/音频）：无表格结构可核验——如实区分"媒体流无法结构
+        # 验证"与"读取失败"（此前一律 failed + "格式不支持或读取失败"，
+        # 对正常视频流是误导性证据）。
+        if stream.get("format") in ("video", "mp4", "mov", "avi", "mkv",
+                                    "webm", "audio", "m4a", "wav", "mp3"):
+            results.append({
+                "file": fname, "kind": kind, "semantic_label": str(
+                    a.get("semantic_label") or kind),
+                "verified": "weak",
+                "evidence": (
+                    "媒体流：无表格结构可核验（语义假设已登记，"
+                    "待用户确认落盘；时间轴佐证见配对的索引表/metainfo）"
+                ),
             })
             continue
 

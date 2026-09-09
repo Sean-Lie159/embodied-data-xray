@@ -23,6 +23,7 @@ from agents.decorators import tool
 
 from app.agent.context import RunContext
 from app.tools import _data_access, _sniffing
+from app.tools._sniffing import probe_full_paths
 from app.tools import profile_store
 
 # 本工具支持的扩展名 → 说明。
@@ -280,6 +281,46 @@ def read_hdf5_node(path: str, node: str) -> pd.DataFrame | None:
                 return pd.DataFrame(cols)
     except Exception:  # noqa: BLE001
         return None
+
+
+def register_h5_node_streams(
+    context: RunContext, h5_path: Path
+) -> list[dict[str, Any]]:
+    """把 h5 文件的全部候选数据节点登记为流（目录多流机制复用）。
+
+    目录加载遇到 .h5 时调用：节点流 path 为 "<h5 绝对路径>::<node>"，
+    format="h5"，kind 按字段/路径特征判定，主表节点标 is_main（目录语境
+    不设 context.df 主表——h5 节点经 resolve_table_name 按需读取）。
+
+    Args:
+        context: 运行时上下文（streams 追加到 meta["streams"]）。
+        h5_path: h5 文件路径。
+
+    Returns:
+        登记的流条目列表。
+    """
+    nodes = _list_hdf5_native_nodes(str(h5_path))
+    entries: list[dict[str, Any]] = []
+    for nd in nodes:
+        kind, label = _classify_h5_node(nd.get("fields", []), nd["node"])
+        entries.append({
+            "path": f"{h5_path}::{nd['node']}",
+            "format": "h5",
+            "kind": kind,
+            "semantic_label": label,
+            "label_evidence": f"HDF5 节点字段特征（{nd['cols']} 列）",
+            "label_confidence": "low" if kind == "unknown" else "medium",
+            "label_source": "h5_node_scan",
+            "role": {"role": label, "confidence": "medium",
+                     "evidence": "HDF5 节点字段特征"},
+            "channels": nd.get("fields", []),
+            "n_rows": nd["rows"],
+            "n_cols": nd["cols"],
+            "is_main": nd is nodes[0] if nodes else False,
+        })
+    if entries:
+        context.meta.setdefault("streams", []).extend(entries)
+    return entries
 
 
 def _load_hdf5(path: str) -> pd.DataFrame:
@@ -930,6 +971,16 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     context.dataset_id = dataset_id
     context.df = main_table
 
+    # 目录内含 .h5（此前被普查归入 others 丢弃——真实事故：wujiGlove 同期
+    # 采集目录的 dataset.h5 45.8MB 完全不可见）：把其数据节点登记为流，
+    # 复用 h5 节点流机制（按节点名切换分析）。
+    for other in probe_full_paths(probe, "others"):
+        if Path(other).suffix.lower() in (".h5", ".hdf5"):
+            try:
+                register_h5_node_streams(context, Path(other))
+            except Exception:  # noqa: BLE001 - 单个 h5 登记失败不阻塞目录加载
+                pass
+
     file_survey: dict[str, Any] = {
         "total_files": probe["total_files"],
         "ext_dist": probe["ext_dist"],
@@ -1146,38 +1197,12 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
     if h5_structure:
         meta["h5_structure"] = h5_structure
         meta["h5_source_node"] = df.attrs.get("h5_source_node")
-        # h5 原生层级：把全部候选节点登记为流（复用目录多流机制），节点
-        # 流名 = "<文件stem>::<node path>"，resolve_table_name 按名惰性读取。
-        # 主表节点仍装在 context.df（信息量最大节点），其余节点按需读取。
-        nodes = _list_hdf5_native_nodes(path)
-        stream_entries: list[dict[str, Any]] = []
-        for nd in nodes:
-            node_name = nd["node"]
-            kind, label = _classify_h5_node(nd.get("fields", []), node_name)
-            stream_entries.append({
-                "path": f"{source}::{node_name}",
-                "format": "h5",
-                "kind": kind,
-                "semantic_label": label,
-                "label_evidence": f"HDF5 节点字段特征（{nd['cols']} 列）",
-                "label_confidence": "low" if kind == "unknown" else "medium",
-                "label_source": "h5_node_scan",
-                "role": {"role": label, "confidence": "medium",
-                         "evidence": "HDF5 节点字段特征"},
-                "channels": nd.get("fields", []),
-                "n_rows": nd["rows"],
-                "n_cols": nd["cols"],
-                "is_main": node_name == df.attrs.get("h5_source_node"),
-            })
-        if stream_entries:
-            meta["h5_node_streams"] = stream_entries
-            meta["h5_node_pending"] = True  # 登记延后到 context.meta 赋值后
+        # h5 原生层级：节点登记延后到 context.meta 赋值后（meta 与
+        # context.meta 同引用，先赋值再追加才会落到会话 meta 上）。
+        meta["h5_node_pending"] = True
     context.meta = meta
     if meta.pop("h5_node_pending", None):
-        # 登记进 streams（必须在 context.meta = meta 之后——meta 与 context.meta
-        # 同引用，此处 streams 追加才会落到真正的会话 meta 上）。
-        existing = context.meta.get("streams", [])
-        context.meta["streams"] = existing + meta["h5_node_streams"]
+        register_h5_node_streams(context, source)
 
     result: dict[str, Any] = {
         "success": True,
