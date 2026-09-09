@@ -68,6 +68,11 @@ def _get_messages() -> list[dict]:
     return st.session_state.messages
 
 
+def _get_editing_index() -> int | None:
+    """当前正在编辑的用户消息下标（None=非编辑态；跨 rerun 保持）。"""
+    return st.session_state.get("editing_index")
+
+
 def _get_cumulative_usage() -> dict:
     """返回会话累计 token 用量（st.session_state 维护，刷新页面重置属正常）。"""
     if "cumulative_usage" not in st.session_state:
@@ -143,14 +148,60 @@ def _main() -> None:
         st.subheader("对话")
         # 聊天记录独立滚动容器：回顾历史时输入框不跟随滚动。
         chat_container = st.container(height=_SCROLL_HEIGHT)
+        editing_index = _get_editing_index()
         with chat_container:
             # 渲染历史消息（新消息在容器底部，配合滚动锚定自动贴底）。
-            for msg in messages:
-                with st.chat_message(msg["role"]):
-                    st.markdown(msg["content"])
-                    # 助手回复下方附工具轨迹（可折叠）。
-                    if msg["role"] == "assistant" and msg.get("turn"):
-                        render_tool_activity(msg["turn"])
+            for i, msg in enumerate(messages):
+                if msg["role"] == "user" and i == editing_index:
+                    # 编辑态：预填原文的文本框 + 保存重新生成 / 取消。
+                    with st.chat_message("user"):
+                        new_text = st.text_area(
+                            "编辑消息（保存后此消息之后的对话将被重新生成）",
+                            value=msg["content"],
+                            key=f"edit_area_{i}",
+                        )
+                        c1, c2, _c3 = st.columns([1, 1, 2])
+                        do_save = c1.button("保存并重新生成", key=f"edit_save_{i}",
+                                            type="primary")
+                        do_cancel = c2.button("取消", key=f"edit_cancel_{i}")
+                        if do_cancel:
+                            st.session_state.editing_index = None
+                            st.rerun()
+                        if do_save and new_text.strip():
+                            # 语义核心：截断 agent 历史到该轮之前（bot 上下文
+                            # 同步丢弃被编辑消息之后的一切），再重发新文本。
+                            service.truncate_history_to_turn(i)
+                            messages[:] = messages[:i] + [
+                                {"role": "user", "content": new_text.strip()}
+                            ]
+                            st.session_state.editing_index = None
+                            with st.spinner("重新生成回答……"):
+                                turn = service.reply(new_text.strip())
+                            messages.append(
+                                {"role": "assistant", "content": turn.reply,
+                                 "turn": turn})
+                            if turn.usage:
+                                cumulative["input_tokens"] += turn.usage.get(
+                                    "input_tokens", 0)
+                                cumulative["output_tokens"] += turn.usage.get(
+                                    "output_tokens", 0)
+                                cumulative["total_tokens"] += turn.usage.get(
+                                    "total_tokens", 0)
+                            cumulative["rounds"] += 1
+                            st.rerun()
+                else:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+                        # 用户消息旁的编辑入口（最近一条才显示，避免历史深处
+                        # 编辑造成大面积重生成；与主流对话 UI 一致）。
+                        if msg["role"] == "user" and i == len(messages) - 1:
+                            if st.button("✏️ 编辑", key=f"edit_btn_{i}",
+                                         help="修改并重新发送，之后的回答将重新生成"):
+                                st.session_state.editing_index = i
+                                st.rerun()
+                        # 助手回复下方附工具轨迹（可折叠）。
+                        if msg["role"] == "assistant" and msg.get("turn"):
+                            render_tool_activity(msg["turn"])
 
         # 输入框放在滚动容器**之外**：Streamlit 会把它钉在视口底部（ChatGPT 式
         # 布局），滚动聊天记录时位置不变——可同时回顾历史与输入新对话。

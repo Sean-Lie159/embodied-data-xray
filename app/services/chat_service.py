@@ -260,6 +260,30 @@ class ChatService:
             usage=extract_usage(result),
         )
 
+    def truncate_history_to_turn(self, turn_index: int) -> dict[str, Any]:
+        """把 agent 对话历史截断到第 turn_index 轮之前（编辑重发用）。
+
+        消息编辑的语义核心：编辑第 n 条用户消息后，其**之后**的一切轮次
+        （含该轮的旧回答与工具轨迹）必须从 agent 上下文中移除——否则 bot
+        会"记得"已被编辑掉的旧内容，重新回答不干净。
+
+        Args:
+            turn_index: 目标用户消息在 messages 中的下标（0-based），
+                也是 history_input 中的轮次序号（每轮由一条用户输入触发）。
+
+        Returns:
+            dict，含 before_turns / after_turns（截断前后轮数）。
+        """
+        history = self.history_input or []
+        turns = _split_turns(history)
+        if turn_index >= len(turns):
+            return {"before_turns": len(turns), "after_turns": len(turns)}
+        kept: list[Any] = []
+        for turn in turns[:turn_index]:
+            kept.extend(turn)
+        self.history_input = kept
+        return {"before_turns": len(turns), "after_turns": turn_index}
+
     def dataset_summary(self) -> dict[str, Any]:
         """返回当前数据集的能力标签与流清单摘要（供 UI 展示）。
 
