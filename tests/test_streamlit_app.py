@@ -59,3 +59,30 @@ def test_streamlit_app_user_input_renders_chat() -> None:
     assert len(assistant_msgs) >= 1
     # 助手消息有非空内容。
     assert any((m.markdown[0].value if m.markdown else "") for m in assistant_msgs)
+
+def test_chat_input_outside_scroll_container() -> None:
+    """输入框必须在滚动容器之外（钉底固定）——回归：此前在容器内会随聊天
+    记录一起滚走，无法同时回顾历史与输入。
+
+    静态断言：chat_input 调用行的缩进应为 8（left 列内层级）；若 >8 说明
+    它被放回了滚动容器内部（真实事故形态）。
+    """
+    import inspect
+
+    import streamlit_app
+
+    src = inspect.getsource(streamlit_app)
+    lines = src.splitlines()
+    input_line = next(
+        i for i, ln in enumerate(lines, 1) if "= st.chat_input(" in ln
+    )
+    indent = len(lines[input_line - 1]) - len(lines[input_line - 1].lstrip())
+    assert indent == 8, (
+        f"st.chat_input 缩进为 {indent}，若 >8 说明它被放回了滚动容器内"
+    )
+    # 输入框应在滚动容器之后（先建容器、后放输入框）。
+    container_line = next(
+        i for i, ln in enumerate(lines, 1)
+        if "st.container(height=_SCROLL_HEIGHT)" in ln
+    )
+    assert input_line > container_line

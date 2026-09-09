@@ -42,6 +42,8 @@ def _inject_scroll_css() -> None:
         <style>
         /* 页面主体不滚动：左右栏各自在固定高度容器内滚动，避免双重滚动条 */
         .block-container { overflow: hidden; }
+        /* 输入框钉底（fixed）会盖住容器底部内容：给主区底部预留输入框高度 */
+        .block-container { padding-bottom: 130px; }
         /* 滚动锚定：聊天/面板容器内新内容追加时尽量保持贴底/原位置稳定 */
         [data-testid="stVerticalBlock"] > div {
             overflow-anchor: auto;
@@ -136,11 +138,12 @@ def _main() -> None:
 
     left, right = st.columns([1, 1.2], gap="large")
 
-    # ---- 左侧：对话区（固定高度独立滚动容器）----
+    # ---- 左侧：对话区（聊天记录独立滚动 + 输入框钉底固定）----
     with left:
         st.subheader("对话")
-        # 左栏对话放入固定高度容器：内容超限时在容器内独立滚动，不带动右栏。
-        with st.container(height=_SCROLL_HEIGHT):
+        # 聊天记录独立滚动容器：回顾历史时输入框不跟随滚动。
+        chat_container = st.container(height=_SCROLL_HEIGHT)
+        with chat_container:
             # 渲染历史消息（新消息在容器底部，配合滚动锚定自动贴底）。
             for msg in messages:
                 with st.chat_message(msg["role"]):
@@ -149,11 +152,16 @@ def _main() -> None:
                     if msg["role"] == "assistant" and msg.get("turn"):
                         render_tool_activity(msg["turn"])
 
-            # 输入框：只有非空输入才触发 agent 执行。
-            prompt = st.chat_input("输入你的问题……")
-            if prompt:
-                # 追加用户消息。
-                messages.append({"role": "user", "content": prompt})
+        # 输入框放在滚动容器**之外**：Streamlit 会把它钉在视口底部（ChatGPT 式
+        # 布局），滚动聊天记录时位置不变——可同时回顾历史与输入新对话。
+        # （此前输入框在滚动容器内，会随聊天记录一起滚走——用户体验问题。）
+        prompt = st.chat_input("输入你的问题……")
+        if prompt:
+            # 追加用户消息。
+            messages.append({"role": "user", "content": prompt})
+
+            # 新消息渲染进滚动容器（末尾追加，配合滚动锚定贴底）。
+            with chat_container:
                 with st.chat_message("user"):
                     st.markdown(prompt)
 
@@ -163,13 +171,14 @@ def _main() -> None:
                         turn = service.reply(prompt)
                     st.markdown(turn.reply)
                     render_tool_activity(turn)
-                # 累计本轮 token 用量（usage 为 None 时不加，避免 0 冒充）。
-                if turn.usage:
-                    cumulative["input_tokens"] += turn.usage.get("input_tokens", 0)
-                    cumulative["output_tokens"] += turn.usage.get("output_tokens", 0)
-                    cumulative["total_tokens"] += turn.usage.get("total_tokens", 0)
-                cumulative["rounds"] += 1
-                messages.append({"role": "assistant", "content": turn.reply, "turn": turn})
+
+            # 累计本轮 token 用量（usage 为 None 时不加，避免 0 冒充）。
+            if turn.usage:
+                cumulative["input_tokens"] += turn.usage.get("input_tokens", 0)
+                cumulative["output_tokens"] += turn.usage.get("output_tokens", 0)
+                cumulative["total_tokens"] += turn.usage.get("total_tokens", 0)
+            cumulative["rounds"] += 1
+            messages.append({"role": "assistant", "content": turn.reply, "turn": turn})
 
     # ---- 右侧：展示区（固定高度独立滚动容器）----
     with right:
