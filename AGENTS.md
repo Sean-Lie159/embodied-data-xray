@@ -1,4 +1,4 @@
-# AGENTS.md — 具身智能数据分析 Agent
+# AGENTS.md — Embodied-data-Xray（具身智能数据分析 Agent）
 
 > 本文件是 AI 编程 Agent（任意编程助手/工具）在本仓库工作时的最高行为准则。
 > 每次开始工作前必须先读本文件，并严格遵守其中的硬性规则。

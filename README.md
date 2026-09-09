@@ -1,4 +1,4 @@
-# embodied-data-xray
+# 🩻 Embodied-data-Xray
 
 **X-ray your robot datasets** — structural profiling & analysis agent for embodied-AI collection data.
 

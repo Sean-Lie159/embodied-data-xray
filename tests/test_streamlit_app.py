@@ -23,7 +23,7 @@ def test_streamlit_app_runs_without_error() -> None:
     at.run()
     # 页面应渲染出标题。
     titles = [t.value for t in at.title]
-    assert any("具身智能数据分析 Agent" in t for t in titles)
+    assert any("Embodied-data-Xray" in t for t in titles)
     # 三个 tab 应存在。
     tab_labels = [t.label for t in at.tabs]
     assert "图表" in tab_labels

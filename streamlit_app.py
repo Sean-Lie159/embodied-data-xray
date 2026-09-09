@@ -22,7 +22,7 @@ from app.ui.data_loader_panel import render_data_loader
 from app.ui.onboarding import render_onboarding
 from app.ui.settings_panel import render_model_settings
 
-st.set_page_config(page_title="具身智能数据分析 Agent", layout="wide")
+st.set_page_config(page_title="Embodied-data-Xray", page_icon="🩻", layout="wide")
 
 # 左右栏可滚动容器高度（像素）。按视口合理设定，避免与页面级滚动叠成双重滚动条。
 _SCROLL_HEIGHT = 600
@@ -78,8 +78,8 @@ def _get_cumulative_usage() -> dict:
 def _main() -> None:
     _inject_scroll_css()
 
-    st.title("具身智能数据分析 Agent")
-    st.caption("全链路：加载 → 质检 → 统计 → 绘图 → 报告")
+    st.title("🩻 Embodied-data-Xray")
+    st.caption("具身智能数据结构透视 · 全链路：加载 → 质检 → 统计 → 绘图 → 报告")
 
     # 未配置模型：渲染引导页（配置表单 + 说明），不构造 ChatService——
     # 修复此前"缺 key 时 UI 直接 traceback"的问题（设计文档 3.2）。

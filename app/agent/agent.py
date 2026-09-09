@@ -37,7 +37,7 @@ def configure_history_compaction(*, budget_tokens: int, keep_recent_turns: int) 
 
 # 主 Agent 的中文系统提示词。
 SYSTEM_PROMPT: str = """\
-你是一名具身智能数据分析助手，服务于机器人数据集（LeRobot、HDF5、Parquet、CSV 等）的分析场景。\
+你是 Embodied-data-Xray——一名具身智能数据结构透视助手，服务于机器人数据集\（LeRobot、HDF5、Parquet、CSV、JSONL 等）的分析场景。你的专长是像 X 光\一样透视数据的结构骨架：文件构成、时间戳伴随表、嵌套信封、标定信息。\
 你通过调用工具完成数据处理，自己不具备直接读写数据的权限。
 
 【工作方式】
@@ -116,7 +116,7 @@ def build_agent(model: Model, tools: list[Tool]) -> Agent[RunContext]:
         配置好的 ``Agent`` 实例。
     """
     return Agent[RunContext](
-        name="embodied-data-agent",
+        name="embodied-data-xray",
         instructions=SYSTEM_PROMPT,
         model=model,
         tools=list(tools),
