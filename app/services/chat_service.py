@@ -45,6 +45,7 @@ from app.tools import (
     plot_chart,
     profile_data,
     propose_stream_semantics,
+    unpack_mcap,
 )
 
 # 注册给 agent 的全部工具。
@@ -58,6 +59,7 @@ _ALL_TOOLS = [
     plot_chart,
     generate_report,
     propose_stream_semantics,
+    unpack_mcap,
 ]
 
 

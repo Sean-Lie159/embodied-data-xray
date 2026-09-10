@@ -16,6 +16,11 @@ from app.tools.propose_semantics import (
     propose_stream_semantics,
     propose_stream_semantics_impl,
 )
+from app.tools.mcap_reader import (
+    unpack_mcap,
+    unpack_mcap_to_dir,
+    unpack_mcap_tool_impl,
+)
 
 __all__ = [
     "load_dataset",
@@ -36,4 +41,7 @@ __all__ = [
     "generate_report_impl",
     "propose_stream_semantics",
     "propose_stream_semantics_impl",
+    "unpack_mcap",
+    "unpack_mcap_to_dir",
+    "unpack_mcap_tool_impl",
 ]

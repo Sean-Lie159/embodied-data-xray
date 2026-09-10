@@ -501,10 +501,44 @@ def resolve_table_name(
         return result
 
     # 显式表名 → 按流登记表查找（文件名精确匹配，忽略大小写）。
-    # h5 节点流的表名 = "<文件stem>::<node>"（或仅 node 路径）。
+    # h5 节点流的表名 = "<文件stem>::<node>"；mcap topic 流形如
+    # "<文件stem>::<topic>"（topic 可含斜杠，如 demo::/imu）。
     name_lower = table.strip().lower()
     for s in context.meta.get("streams", []):
         p = s.get("path", "")
+        if s.get("format") == "mcap" and "::" in p:
+            file_part, _, topic = p.partition("::")
+            display = f"{Path(file_part).stem}::{topic}".lower()
+            if name_lower in (display, topic.lower()):
+                from app.tools.mcap_reader import read_mcap_topic
+
+                read = read_mcap_topic(file_part, topic)
+                if read.get("success") and read.get("df") is not None:
+                    df = read["df"]
+                    note = None
+                    if expand:
+                        df, note = expand_envelope(df)
+                    result = {
+                        "success": True,
+                        "df": df,
+                        "table_name": f"{Path(file_part).stem}::{topic}",
+                        "dataset": context.dataset_id,
+                        "source": "mcap_topic",
+                    }
+                    if expand:
+                        result["expanded"] = True
+                        result["expand_note"] = note
+                    return result
+                return {
+                    "success": False,
+                    "error": "table_read_failed",
+                    "reason": f"mcap topic {topic} 读取失败",
+                    "df": None,
+                    "table_name": table,
+                    "dataset": context.dataset_id,
+                    "source": "mcap_topic",
+                    "user_message": f"已找到 topic {topic}，但读取其消息失败，无法分析。",
+                }
         if s.get("format") == "h5" and "::" in p:
             node_name = p.partition("::")[2]
             display = f"{Path(p.split('::')[0]).stem}::{node_name}".lower()

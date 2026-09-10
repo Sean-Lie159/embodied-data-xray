@@ -135,6 +135,7 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "plot_chart": (),
     "generate_report": ("report_markdown", "content"),
     "propose_stream_semantics": ("results", "confirmed"),
+    "unpack_mcap": ("skipped_topics",),
 }
 
 

@@ -35,6 +35,7 @@ _SUPPORTED_FORMATS: dict[str, str] = {
     ".jsonl": "JSON Lines（每行一个 JSON 对象）",
     ".parquet": "Parquet 列式存储",
     ".h5": "HDF5 表",
+    ".mcap": "MCAP 容器（JSON 编码消息；单文件多 topic）",
 }
 
 # 尝试解码文本文件时使用的编码回退链。
@@ -321,6 +322,152 @@ def register_h5_node_streams(
     if entries:
         context.meta.setdefault("streams", []).extend(entries)
     return entries
+
+
+def register_mcap_topic_streams(
+    context: RunContext, mcap_path: Path, max_probe_messages: int = 200,
+) -> list[dict[str, Any]]:
+    """把 MCAP 文件的全部可解码 topic 登记为流（复用 h5 多流机制）。
+
+    设计见 docs/MCAP支持设计说明.md：MCAP「单文件多 topic」与 HDF5「单文件多
+    节点」同构，故沿用节点流范式——流登记 path 记为
+    ``"<mcap 绝对路径>::<topic>"``，format="mcap"，kind 由
+    ``classify_mcap_topic``（topic 名线索 + 展开样本指纹）判定，消息数最多的
+    topic 标 is_main（目录语境不设 context.df 主表——topic 经
+    resolve_table_name 按需读取）。
+
+    非 JSON 编码的 topic（如 ROS2 CDR）**不登记为可分析流**，但会在
+    ``meta["mcap_summary"]`` 的 topics 中如实标注 decodable=False + 原因——
+    诚实降级，不硬解（第二期能力）。
+
+    Args:
+        context: 运行时上下文（streams 追加到 meta["streams"]）。
+        mcap_path: mcap 文件路径。
+        max_probe_messages: 分类时每 topic 最多读取的消息条数（样本，非全量）。
+
+    Returns:
+        登记的流条目列表；缺依赖/解析失败返回 []（不抛异常，不阻塞目录加载）。
+    """
+    from app.tools import mcap_reader  # 局部导入：避免 mcap 未安装时的导入期硬依赖
+
+    try:
+        probe = mcap_reader.probe_mcap(str(mcap_path))
+    except mcap_reader.McapDependencyError:
+        return []
+    if not probe.get("success"):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    decodable_topics = [t for t in probe["topics"] if t["decodable"]]
+    for i, t in enumerate(decodable_topics):
+        topic = t["topic"]
+        # 读样本（受 max_probe_messages 限制）用于分类；展开样本使嵌套信号可达。
+        sample_df = None
+        nrows = t.get("message_count") or 0
+        try:
+            read = mcap_reader.read_mcap_topic(
+                str(mcap_path), topic, max_messages=max_probe_messages,
+            )
+            sample_df = read.get("df")
+        except Exception:  # noqa: BLE001 - 单 topic 读取失败不阻塞登记
+            sample_df = None
+
+        columns = list(sample_df.columns) if sample_df is not None else []
+        expanded = None
+        if sample_df is not None:
+            try:
+                expanded, _ = _data_access.expand_envelope(sample_df)
+            except Exception:  # noqa: BLE001
+                expanded = sample_df
+
+        # 伪文件名：含 topic 名的安全形式，供既有分类器的命名匹配与证据展示。
+        pseudo_name = f"{mcap_path.stem}::{topic}"
+        try:
+            klass = mcap_reader.classify_mcap_topic(
+                topic, pseudo_name, columns, expanded, int(nrows),
+            )
+        except Exception:  # noqa: BLE001
+            klass = {
+                "kind": "unknown", "semantic_label": "未分类",
+                "label_evidence": "分类失败", "label_confidence": "low",
+                "label_source": "error", "status": "active", "channels": columns,
+            }
+
+        entries.append({
+            "path": f"{mcap_path}::{topic}",
+            "format": "mcap",
+            "topic": topic,
+            "kind": klass.get("kind", "unknown"),
+            "semantic_label": klass.get("semantic_label"),
+            "label_evidence": klass.get("label_evidence"),
+            "label_confidence": klass.get("label_confidence"),
+            "label_source": klass.get("label_source"),
+            "role": {"role": klass.get("semantic_label", "未分类"),
+                     "confidence": klass.get("label_confidence", "low"),
+                     "evidence": klass.get("label_evidence", "")},
+            "channels": klass.get("channels", columns),
+            "n_rows": int(nrows),
+            "n_cols": len(columns),
+            "message_encoding": t.get("message_encoding"),
+            "status": klass.get("status", "active"),
+            "is_main": i == 0,  # probe 已按消息数降序，首个为最大 topic
+        })
+
+    if entries:
+        context.meta.setdefault("streams", []).extend(entries)
+    # 容器级概览（含非 JSON 编码 topic 的诚实标注）随 meta 透出。
+    context.meta["mcap_summary"] = {
+        "n_topics": probe.get("n_topics"),
+        "message_count": probe.get("message_count"),
+        "time_range_ns": probe.get("time_range_ns"),
+        "topics": probe.get("topics", []),
+    }
+    return entries
+
+
+def _load_mcap_main(path: str) -> pd.DataFrame:
+    """读取 MCAP 文件的消息数最多的可解码 topic 作为主表。
+
+    与 h5 的 `_load_hdf5_native` 同款策略：单文件加载时把信息量最大的 topic
+    作为主表（其余 topic 经 register_mcap_topic_streams 登记为流，按名切换）。
+
+    Args:
+        path: .mcap 文件路径。
+
+    Returns:
+        主表 DataFrame（含 mcap_*_ns 容器时间列 + data 列）。
+
+    Raises:
+        MissingDependencyError: 环境缺少 mcap 包（文件未被读取，非文件损坏）。
+        ValueError: 文件确实无法解析，或无可解码的 JSON topic。
+    """
+    from app.tools import mcap_reader
+
+    try:
+        probe = mcap_reader.probe_mcap(path)
+    except mcap_reader.McapDependencyError as exc:
+        # 缺依赖 ≠ 文件损坏：转成既有 MissingDependencyError 契约，
+        # 复用 load_dataset_impl 的统一处理分支。
+        raise MissingDependencyError("mcap", "mcap", "MCAP (.mcap)") from exc
+
+    if not probe.get("success"):
+        raise ValueError(
+            f"无法读取 MCAP 文件：{path}（{probe.get('user_message', '解析失败')}）"
+        )
+    decodable = [t for t in probe["topics"] if t["decodable"]]
+    if not decodable:
+        raise ValueError(
+            f"MCAP 文件 {path} 中没有可解码的 JSON 编码 topic"
+            "（可能全部为 ROS2 CDR 编码，属第二期能力）。"
+        )
+    best = decodable[0]  # probe 已按消息数降序
+    read = mcap_reader.read_mcap_topic(path, best["topic"])
+    if not read.get("success") or read.get("df") is None:
+        raise ValueError(f"MCAP topic {best['topic']} 读取失败或无消息。")
+    df = read["df"]
+    df.attrs["mcap_main_topic"] = best["topic"]
+    df.attrs["mcap_summary"] = probe
+    return df
 
 
 def _load_hdf5(path: str) -> pd.DataFrame:
@@ -975,10 +1122,17 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     # 采集目录的 dataset.h5 45.8MB 完全不可见）：把其数据节点登记为流，
     # 复用 h5 节点流机制（按节点名切换分析）。
     for other in probe_full_paths(probe, "others"):
-        if Path(other).suffix.lower() in (".h5", ".hdf5"):
+        suffix = Path(other).suffix.lower()
+        if suffix in (".h5", ".hdf5"):
             try:
                 register_h5_node_streams(context, Path(other))
             except Exception:  # noqa: BLE001 - 单个 h5 登记失败不阻塞目录加载
+                pass
+        elif suffix == ".mcap":
+            # 目录内含 .mcap：把其 topic 登记为流（与 h5 同款机制）。
+            try:
+                register_mcap_topic_streams(context, Path(other))
+            except Exception:  # noqa: BLE001 - 单个 mcap 登记失败不阻塞目录加载
                 pass
 
     file_survey: dict[str, Any] = {
@@ -1155,6 +1309,8 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
             df = pd.read_parquet(path)
         elif ext == ".h5":
             df = _load_hdf5(path)
+        elif ext == ".mcap":
+            df = _load_mcap_main(path)
         else:  # pragma: no cover - 防御性分支
             raise ValueError(f"未实现格式：{ext}")
     except MissingDependencyError as exc:
@@ -1200,9 +1356,20 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         # h5 原生层级：节点登记延后到 context.meta 赋值后（meta 与
         # context.meta 同引用，先赋值再追加才会落到会话 meta 上）。
         meta["h5_node_pending"] = True
+    # MCAP：单文件多 topic。主 topic 已作为主表，其余 topic 登记为流
+    # （复用 h5 节点流范式），供按名切换分析。
+    mcap_main_topic = (
+        df.attrs.get("mcap_main_topic") if ext == ".mcap" and hasattr(df, "attrs")
+        else None
+    )
+    if mcap_main_topic is not None:
+        meta["mcap_main_topic"] = mcap_main_topic
+        meta["mcap_topics_pending"] = True
     context.meta = meta
     if meta.pop("h5_node_pending", None):
         register_h5_node_streams(context, source)
+    if meta.pop("mcap_topics_pending", None):
+        register_mcap_topic_streams(context, source)
 
     result: dict[str, Any] = {
         "success": True,
@@ -1223,6 +1390,23 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
             f" 该文件为 HDF5 原生层级结构，主表为节点 {meta['h5_source_node']}，"
             f"共含 {len(h5_structure)} 个数据节点（其余节点清单见 h5_structure 字段）。"
         )
+    if mcap_main_topic is not None:
+        summary = meta.get("mcap_summary") or {}
+        topics = summary.get("topics", [])
+        n_decodable = sum(1 for t in topics if t.get("decodable"))
+        result["mcap_summary"] = summary
+        result["user_message"] += (
+            f" 该文件为 MCAP 容器，主表为消息数最多的 topic {mcap_main_topic}，"
+            f"共 {len(topics)} 个 topic（{n_decodable} 个可解码）；"
+            "其余 topic 已登记为流，可按名切换分析（表名形如 "
+            f"{source.stem}::{mcap_main_topic}）。"
+        )
+        skipped = [t for t in topics if not t.get("decodable")]
+        if skipped:
+            result["user_message"] += (
+                f" 其中 {len(skipped)} 个 topic 编码非 JSON（本期不解包），"
+                "详见 mcap_summary.topics 的 decode_note。"
+            )
     return result
 
 
