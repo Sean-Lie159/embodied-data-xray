@@ -125,11 +125,19 @@ def find_timestamp_columns(
         if typ:
             candidates.append({"name": str(c), "type": typ, "source": "dictionary"})
 
-    # 词表未命中 → 内容指纹回退（需样本）。
-    if not candidates and sample is not None:
+    # 内容指纹回退（需样本）：**词表未命中时全量扫描**；词表已有命中时也补齐
+    # 其余未命名的真时间列（真实场景：表中既有 timestamp 列，又有自研命名的
+    # 另一条时间列如 aligned_ts_epoch——只认词表会漏掉后者）。指纹候选不抢占
+    # 词表主列，只补全候选集（来源标 fingerprint，可审计）。
+    if sample is not None:
         from app.tools.timestamp_units import infer_unit
 
+        known = {str(c["name"]) for c in candidates}
         for c in columns:
+            if str(c) in known:
+                continue
+            if c not in sample.columns:
+                continue
             if not pd.api.types.is_numeric_dtype(sample[c]):
                 continue
             s = sample[c].dropna()
