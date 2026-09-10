@@ -416,9 +416,21 @@ class _JsonReader:
         return df.head(limit) if df is not None and limit is not None else df
 
     def columns(self, path: str, *, sub: str | None) -> list[str] | None:
-        from app.tools.load_dataset import _read_table_columns
+        # 底层实现（reader 不得回调 load_dataset._read_table_columns——它已
+        # 改经注册表，回调将造成无限递归）。
+        from app.tools._data_access import _json_row_list
+        from app.tools.load_dataset import _detect_encoding
 
-        return _read_table_columns(Path(path))
+        import json as _json
+
+        try:
+            obj = _json.loads(
+                Path(path).read_text(encoding=_detect_encoding(Path(path).read_bytes()))
+            )
+            rows = _json_row_list(obj)
+            return [str(k) for k in rows[0].keys()] if rows else []
+        except Exception:  # noqa: BLE001
+            return None
 
     def nrows(self, path: str, *, sub: str | None) -> int | None:
         from app.tools._data_access import _read_nrows_impl

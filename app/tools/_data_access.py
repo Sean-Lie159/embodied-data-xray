@@ -453,6 +453,13 @@ def expand_envelope(
     return out, note
 
 
+def _split(path_spec: str) -> tuple[str, str | None]:
+    """委托 _readers.split_path_spec（避免本模块重复实现解析逻辑）。"""
+    from app.tools._readers import split_path_spec
+
+    return split_path_spec(path_spec)
+
+
 def _read_h5_node_stream(path_spec: str) -> pd.DataFrame | None:
     """读取 h5 节点流（path_spec 形如 "<file>::<node path>"）。"""
     file_part, _, node = path_spec.partition("::")
@@ -537,8 +544,11 @@ def resolve_table_name(
     name_lower = table.strip().lower()
     for s in context.meta.get("streams", []):
         p = s.get("path", "")
-        if s.get("format") == "mcap" and "::" in p:
-            file_part, _, topic = p.partition("::")
+        if s.get("format") == "mcap":
+            # 复合路径解析统一经 split_path_spec（唯一解析点）。
+            file_part, topic = _split(p)
+            if not topic:
+                continue
             display = f"{Path(file_part).stem}::{topic}".lower()
             if name_lower in (display, topic.lower()):
                 from app.tools.mcap_reader import read_mcap_topic
@@ -570,16 +580,18 @@ def resolve_table_name(
                     "source": "mcap_topic",
                     "user_message": f"已找到 topic {topic}，但读取其消息失败，无法分析。",
                 }
-        if s.get("format") == "h5" and "::" in p:
-            node_name = p.partition("::")[2]
-            display = f"{Path(p.split('::')[0]).stem}::{node_name}".lower()
+        if s.get("format") == "h5":
+            file_part, node_name = _split(p)
+            if not node_name:
+                continue
+            display = f"{Path(file_part).stem}::{node_name}".lower()
             if name_lower in (display, node_name.lower()):
                 df = _read_h5_node_stream(p)
                 if df is not None:
                     result = {
                         "success": True,
                         "df": df,
-                        "table_name": f"{Path(p.split('::')[0]).stem}::{node_name}",
+                        "table_name": f"{Path(file_part).stem}::{node_name}",
                         "dataset": context.dataset_id,
                         "source": "h5_node",
                     }

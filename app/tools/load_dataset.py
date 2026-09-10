@@ -577,41 +577,19 @@ def _tb_key_frames(exc: Exception) -> list[str]:
 def _read_table_columns(path: Path) -> list[str] | None:
     """只读表格列名（不读全量数据），用于嗅探。
 
+    **经统一读取注册表**（与 _sniffing._read_table_columns_cheap 的重复实现
+    收敛为一处）；容器子流（h5 节点 / mcap topic）同样支持。
+
     Args:
         path: 表格文件路径。
 
     Returns:
         列名列表；读取失败返回 None。
     """
-    try:
-        ext = path.suffix.lower()
-        if ext == ".csv":
-            df = pd.read_csv(
-                path,
-                encoding=_detect_encoding(path.read_bytes()),
-                nrows=0,
-                engine="python",
-            )
-            return [str(c) for c in df.columns]
-        if ext == ".parquet":
-            df = pd.read_parquet(path, columns=None)
-            return [str(c) for c in df.columns[:50]]
-        if ext == ".json":
-            from app.tools import _data_access
+    from app.tools._readers import ReadRequest, read_stream
 
-            rows = _data_access._json_row_list(json.loads(path.read_text(encoding=_detect_encoding(path.read_bytes()))))
-            if rows and isinstance(rows[0], dict):
-                return [str(c) for c in rows[0].keys()]
-            return []
-        if ext == ".jsonl":
-            # JSONL：逐行解析取首个有效行的键（不读全量）。
-            from app.tools._data_access import read_jsonl_rows
-
-            rows = read_jsonl_rows(str(path), limit=1, encoding=_detect_encoding(path.read_bytes()))
-            return [str(k) for k in rows[0].keys()] if rows else []
-        return None
-    except Exception:  # noqa: BLE001
-        return None
+    result = read_stream(ReadRequest(path_spec=str(path), want="columns"))
+    return list(result.columns) if result.ok else None
 
 
 # file_survey 序列化体积上限（字符数）；超出则压缩为分组计数摘要。
@@ -702,45 +680,22 @@ def _read_table_nrows(path: Path) -> int | None:
 def _read_table_sample(path: Path) -> pd.DataFrame | None:
     """读取表格前若干行样本（用于第 2 层内容指纹），不读全量。
 
+    **经统一读取注册表**；样本行数按格式取（JSONL 5 行——需逐行解析 JSON，
+    成本高于 csv/parquet 的列裁剪；其余取 _FINGERPRINT_SAMPLE_ROWS）。
+
     Args:
         path: 表格文件路径。
 
     Returns:
-        前 `_FINGERPRINT_SAMPLE_ROWS` 行样本 DataFrame；读取失败返回 None。
+        前若干行样本 DataFrame；读取失败返回 None。
     """
+    from app.tools._readers import ReadRequest, read_stream
     from app.tools._sniffing import _FINGERPRINT_SAMPLE_ROWS
 
-    try:
-        ext = path.suffix.lower()
-        if ext == ".csv":
-            return pd.read_csv(
-                path,
-                encoding=_detect_encoding(path.read_bytes()),
-                nrows=_FINGERPRINT_SAMPLE_ROWS,
-                engine="python",
-            )
-        if ext == ".parquet":
-            return pd.read_parquet(path, columns=None).head(_FINGERPRINT_SAMPLE_ROWS)
-        if ext == ".json":
-            from app.tools import _data_access
-
-            rows = _data_access._json_row_list(json.loads(path.read_text(encoding=_detect_encoding(path.read_bytes()))))
-            if rows is not None:
-                return pd.DataFrame(rows[:_FINGERPRINT_SAMPLE_ROWS])
-            return None
-        if ext == ".jsonl":
-            # JSONL：读前 _JSONL_SNIFF_ROWS 行判列结构与 dtype（不读全量）。
-            # 嵌套列表/对象值在此保留为 object dtype，供下游指纹与统计判定。
-            from app.tools._data_access import read_jsonl_rows
-
-            rows = read_jsonl_rows(
-                str(path), limit=_JSONL_SNIFF_ROWS,
-                encoding=_detect_encoding(path.read_bytes()),
-            )
-            return pd.DataFrame(rows) if rows else None
-        return None
-    except Exception:  # noqa: BLE001
-        return None
+    is_jsonl = path.suffix.lower() == ".jsonl"
+    limit = _JSONL_SNIFF_ROWS if is_jsonl else _FINGERPRINT_SAMPLE_ROWS
+    result = read_stream(ReadRequest(path_spec=str(path), want="sample", limit=limit))
+    return result.frame if result.ok else None
 
 
 def _parse_calibration(path: Path) -> Any:

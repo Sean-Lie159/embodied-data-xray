@@ -57,15 +57,18 @@ def _locate_stream(context: RunContext, filename: str) -> dict[str, Any] | None:
     "meta/index_map/observation/camera/lf_chest_fisheye"）——Path().name
     对这类 path 只会取到末段，产生歧义（多个 meta/index_map 节点末段相同）。
     """
+    from app.tools._readers import split_path_spec
+
     name = filename.strip().lower()
     streams = context.meta.get("streams", [])
     for s in streams:
         if Path(s.get("path", "")).name.lower() == name:
             return s
-    # h5 节点流：按节点路径（:: 之后部分）匹配。
+    # 容器子流（h5 节点 / mcap topic）：按子流名匹配（复合路径解析统一经
+    # split_path_spec——本函数不再自行 partition("::")）。
     for s in streams:
-        p = s.get("path", "")
-        if "::" in p and p.partition("::")[2].lower() == name:
+        _file, sub = split_path_spec(s.get("path", ""))
+        if sub and sub.lower() == name:
             return s
     return None
 
