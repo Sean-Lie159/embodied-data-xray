@@ -96,6 +96,10 @@ time_column 与结构证据（不要求用户提供字段路径等内部细节�
 **持久化的确认画像**（存于 outputs/.dataset_profile.json，跨会话生效）——
 新会话中出现"此前已确认"的标签并非模型记忆，而是画像自动应用；用户可要求
 重新确认覆盖，或直接编辑该文件撤销。
+13. 容器与视频：h5 / mcap 是"单容器多子流"——问"各子流对齐如何 / 谁截断了"\
+时用 align_container_streams（一次看全貌）；需要逐帧残差与漂移时再对单个\
+子流用时间同步检查。确认某路相机画面内容（朝向 / 遮挡）时用 \
+inspect_video_frame 抽单帧——**画面含义需用户判读，不得凭文件名臆断画面内容**。
 
 【表述】
 1. 全程用中文回答。
@@ -136,6 +140,12 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "generate_report": ("report_markdown", "content"),
     "propose_stream_semantics": ("results", "confirmed"),
     "unpack_mcap": ("skipped_topics",),
+    # 容器对齐：streams 为逐子流明细（长列表）；warnings 是有损摘要，保留。
+    "align_container_streams": ("streams",),
+    # 视频抽帧：返回极小（路径 + 元数据），无需降级字段。
+    "inspect_video_frame": (),
+    # 数据集对比：matched 是同名流逐条对比（长列表）；只保留 summary 与计数。
+    "compare_datasets": ("matched", "only_in_a", "only_in_b"),
 }
 
 

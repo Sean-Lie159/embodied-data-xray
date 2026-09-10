@@ -36,11 +36,14 @@ from app.config import get_settings
 from app.llm import build_model
 from app.llm.context_window import derive_budget
 from app.tools import (
+    align_container_streams,
     check_sensor_sanity,
+    compare_datasets,
     check_temporal_sync,
     compute_stats,
     generate_report,
     inspect_streams,
+    inspect_video_frame,
     load_dataset,
     plot_chart,
     profile_data,
@@ -60,6 +63,9 @@ _ALL_TOOLS = [
     generate_report,
     propose_stream_semantics,
     unpack_mcap,
+    align_container_streams,
+    inspect_video_frame,
+    compare_datasets,
 ]
 
 

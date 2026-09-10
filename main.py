@@ -30,11 +30,14 @@ from app.llm import build_model
 from app.llm.context_window import derive_budget
 from app.services.chat_service import extract_usage
 from app.tools import (
+    align_container_streams,
     check_sensor_sanity,
+    compare_datasets,
     check_temporal_sync,
     compute_stats,
     generate_report,
     inspect_streams,
+    inspect_video_frame,
     load_dataset,
     plot_chart,
     profile_data,
@@ -112,6 +115,9 @@ def _build_main_agent():
         plot_chart,
         generate_report,
         propose_stream_semantics,
+        align_container_streams,
+        inspect_video_frame,
+        compare_datasets,
     ]
     # 与 chat_service 一致：套上工具返回体积护栏（第 2 层防御）。
     # CLI 自行组装工具（不经 chat_service），故此处必须补上，否则 CLI 路径
