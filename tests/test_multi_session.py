@@ -181,3 +181,86 @@ def test_chat_service_accepts_session_tag() -> None:
 
     sig = inspect.signature(ChatService.__init__)
     assert "session_tag" in sig.parameters
+
+# --- 4. profile 并发保护（多会话同时确认不丢）-------------------------------
+
+
+def test_concurrent_confirmations_do_not_lose_updates(tmp_path: Path) -> None:
+    """**并发合并**：两会话同时确认同一数据集的不同流 → 两条都在。
+
+    这是多会话引入的真实新风险（单会话不存在）：无锁 + 无重读时，
+    后写的会整体覆盖先写的。
+    """
+    import threading
+
+    from app.tools.profile_store import load_profile, save_dataset_profile
+
+    out = str(tmp_path)
+    barrier = threading.Barrier(2)
+    errors: list[Exception] = []
+
+    def _confirm(fname: str, label: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            save_dataset_profile(
+                out, "ds", stream_overrides={fname: {"kind": "x",
+                                                     "semantic_label": label}}
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    ts = [threading.Thread(target=_confirm, args=(f"a{i}.csv", f"流{i}"))
+          for i in range(2)]
+    for th in ts:
+        th.start()
+    for th in ts:
+        th.join(timeout=10)
+
+    assert not errors, errors
+    streams = load_profile(out)["datasets"]["ds"]["streams"]
+    assert "a0.csv" in streams and "a1.csv" in streams, (
+        f"并发确认丢失：{list(streams)}"
+    )
+
+
+def test_atomic_write_leaves_no_partial_file(tmp_path: Path) -> None:
+    """原子写：写完后无残留临时文件，且 JSON 完整可解析。"""
+    import json
+
+    from app.tools.profile_store import _profile_path, save_dataset_profile
+
+    save_dataset_profile(str(tmp_path), "ds",
+                         stream_overrides={"a.csv": {"kind": "k"}})
+    path = _profile_path(str(tmp_path))
+    assert path.exists()
+    json.loads(path.read_text(encoding="utf-8"))  # 完整可解析
+    leftovers = [p.name for p in tmp_path.iterdir() if ".tmp-" in p.name]
+    assert leftovers == [], f"残留临时文件：{leftovers}"
+
+
+def test_lock_released_after_write(tmp_path: Path) -> None:
+    """写入后锁文件被释放（不留残留锁阻塞后续写入）。"""
+    from app.tools.profile_store import _profile_path, save_dataset_profile
+
+    save_dataset_profile(str(tmp_path), "ds",
+                         stream_overrides={"a.csv": {"kind": "k"}})
+    lock = _profile_path(str(tmp_path)).with_name(".dataset_profile.json.lock")
+    assert not lock.exists(), "锁文件未释放"
+    # 再次写入应正常（锁未残留）。
+    save_dataset_profile(str(tmp_path), "ds",
+                         stream_overrides={"b.csv": {"kind": "k"}})
+
+
+def test_merge_preserves_other_sessions_entries(tmp_path: Path) -> None:
+    """合并语义：会话 A 确认流 X、会话 B 确认流 Y → 两次写入后都在。
+
+    （现有实现已是按文件名 update；本测试锁定该行为不被改为整体替换。）
+    """
+    from app.tools.profile_store import load_profile, save_dataset_profile
+
+    out = str(tmp_path)
+    save_dataset_profile(out, "ds", stream_overrides={"x.csv": {"kind": "kx"}})
+    save_dataset_profile(out, "ds", stream_overrides={"y.csv": {"kind": "ky"}})
+    streams = load_profile(out)["datasets"]["ds"]["streams"]
+    assert set(streams) == {"x.csv", "y.csv"}
+    assert streams["x.csv"]["source"] == "user_confirmed"
