@@ -34,7 +34,7 @@ def test_chat_service_builds_agent() -> None:
 
 def test_reply_returns_chat_turn(monkeypatch) -> None:
     """reply 应返回 ChatTurn（回复/工具轨迹/findings）。"""
-    async def fake_run_turn(agent, context, user_input, history_input=None, max_turns=15):
+    async def fake_run_turn(agent, context, user_input, history_input=None, max_turns=15, **kwargs):
         return ("已加载数据集 demo", [{"role": "user", "content": user_input}], _fake_result())
 
     # patch chat_service 模块内的 run_turn。
@@ -52,7 +52,7 @@ def test_reply_returns_chat_turn(monkeypatch) -> None:
 
 def test_areply_async_returns_chat_turn(monkeypatch) -> None:
     """异步 areply 也应返回 ChatTurn。"""
-    async def fake_run_turn(agent, context, user_input, history_input=None, max_turns=15):
+    async def fake_run_turn(agent, context, user_input, history_input=None, max_turns=15, **kwargs):
         return ("回复", [{"role": "user", "content": user_input}], _fake_result())
 
     monkeypatch.setattr(chat_service, "run_turn", fake_run_turn)
@@ -70,7 +70,7 @@ def test_areply_handles_max_turns_exceeded(monkeypatch) -> None:
     契约：run_turn 触发超限时返回 (友好提示, fallback_input, None)。调用方不得
     对 result 解引用，应判空后返回空工具轨迹与友好提示。
     """
-    async def fake_run_turn(agent, context, user_input, history_input=None, max_turns=15):
+    async def fake_run_turn(agent, context, user_input, history_input=None, max_turns=15, **kwargs):
         return (
             "本轮工具调用次数已达上限（max_turns=15），为避免死循环已停止。请尝试更明确地描述需求，或分步提问。",
             [{"role": "user", "content": user_input}],

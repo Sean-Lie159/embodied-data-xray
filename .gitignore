@@ -34,6 +34,7 @@ docs/四层语义识别架构.md
 docs/ARCHITECTURE.md
 docs/上下文超限修复设计.md
 docs/多时钟与嵌套信封支持设计.md
+docs/多会话设计.md
 
 # 临时提交信息文件
 scripts/_commit_msg_*.txt

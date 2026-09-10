@@ -68,7 +68,7 @@ def test_reply_consumes_notes(service: ChatService, monkeypatch: pytest.MonkeyPa
     """
     captured: dict = {}
 
-    async def _fake_run_turn(agent, context, user_input, history_input):  # noqa: ANN001
+    async def _fake_run_turn(agent, context, user_input, history_input, **kwargs):  # noqa: ANN001
         captured["user_input"] = user_input
         # result=None：format_tool_activity/_extract_tool_names/extract_usage 均兼容。
         return "回复", None, None
@@ -91,7 +91,7 @@ def test_reply_without_notes_passthrough(
     """无便签：模型收到原始输入（不引入多余前缀）。"""
     captured: dict = {}
 
-    async def _fake_run_turn(agent, context, user_input, history_input):  # noqa: ANN001
+    async def _fake_run_turn(agent, context, user_input, history_input, **kwargs):  # noqa: ANN001
         captured["user_input"] = user_input
         return "回复", None, None
 

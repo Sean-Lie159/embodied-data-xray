@@ -185,12 +185,11 @@ class ChatService:
             history_ratio=settings.history_budget_ratio,
             tool_output_ratio=settings.tool_output_budget_ratio,
         )
-        configure_history_compaction(
-            budget_tokens=(
-                budget.history_budget if settings.history_compaction_enabled else 0
-            ),
-            keep_recent_turns=settings.history_keep_recent_turns,
+        # **本会话**的压缩预算（不写全局——多会话各有各的预算）。
+        self._history_budget: int = (
+            budget.history_budget if settings.history_compaction_enabled else 0
         )
+        self._keep_recent_turns: int = settings.history_keep_recent_turns
         self._compaction_settings = settings
 
     def history_stats(self) -> dict[str, Any]:
@@ -256,7 +255,9 @@ class ChatService:
         composed = _compose_user_input(user_input, self._pending_notes)
         self._pending_notes.clear()
         final, self.history_input, result = await run_turn(
-            self.agent, self.context, composed, self.history_input
+            self.agent, self.context, composed, self.history_input,
+            history_budget_tokens=self._history_budget,
+            history_keep_recent_turns=self._keep_recent_turns,
         )
         tool_activity = format_tool_activity(result)
         tool_calls = _extract_tool_names(result)

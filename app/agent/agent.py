@@ -18,22 +18,28 @@ from app.agent.context import RunContext
 # MaxTurnsExceeded 分支 result 为 None（此时 final_output 已由本函数生成友好提示）。
 RunTurnResult = tuple[str, list[TResponseInputItem], RunResult | None]
 
-# 历史压缩阈值与保留轮数（由服务层按配置注入）。
-# 默认 0 = 不自动压缩（未注入配置时保持既有行为，不引入意外副作用）。
-_history_budget_tokens: int = 0
-_history_keep_recent_turns: int = 3
+# 历史压缩参数的**默认值**（供 CLI 等单会话路径使用）。
+#
+# 为什么不再用模块级可变全局：UI 多会话下每个会话应有独立的压缩预算——
+# 模块级变量会被后配置的会话覆盖（A 会话的历史按 B 会话的预算压缩）。
+# 现改为 run_turn 的显式参数，由各 ChatService 传入自己的配置。
+_DEFAULT_HISTORY_BUDGET_TOKENS: int = 0
+_DEFAULT_HISTORY_KEEP_RECENT_TURNS: int = 3
 
 
 def configure_history_compaction(*, budget_tokens: int, keep_recent_turns: int) -> None:
-    """注入历史压缩参数（由服务层按配置调用一次）。
+    """设置历史压缩的**默认值**（兼容壳：仅 CLI 等单会话路径使用）。
+
+    多会话场景请直接给 run_turn 传 history_budget_tokens / 
+    history_keep_recent_turns，不要依赖本函数的全局默认值。
 
     Args:
         budget_tokens: 历史 token 阈值，超过即自动压缩；<=0 表示关闭自动压缩。
         keep_recent_turns: 压缩时保留最近若干轮的完整工具返回。
     """
-    global _history_budget_tokens, _history_keep_recent_turns
-    _history_budget_tokens = max(0, int(budget_tokens))
-    _history_keep_recent_turns = max(1, int(keep_recent_turns))
+    global _DEFAULT_HISTORY_BUDGET_TOKENS, _DEFAULT_HISTORY_KEEP_RECENT_TURNS
+    _DEFAULT_HISTORY_BUDGET_TOKENS = max(0, int(budget_tokens))
+    _DEFAULT_HISTORY_KEEP_RECENT_TURNS = max(1, int(keep_recent_turns))
 
 # 主 Agent 的中文系统提示词。
 SYSTEM_PROMPT: str = """\
@@ -206,6 +212,9 @@ async def run_turn(
     user_input: str,
     history_input: list[TResponseInputItem] | None = None,
     max_turns: int = 15,
+    *,
+    history_budget_tokens: int | None = None,
+    history_keep_recent_turns: int | None = None,
 ) -> RunTurnResult:
     """执行单轮 Agent 运行。
 
@@ -215,6 +224,9 @@ async def run_turn(
         user_input: 用户本轮输入。
         history_input: 上一轮返回的 input 列表（用于携带对话历史），首轮为 None。
         max_turns: 单轮最大循环轮数，防死循环。
+        history_budget_tokens: 历史压缩阈值（**按会话传入**，多会话各自独立）；
+            None 时用模块默认值（CLI 单会话路径）。<=0 关闭自动压缩。
+        history_keep_recent_turns: 压缩保留的最近轮数；None 时用模块默认值。
 
     Returns:
         (final_output, next_input, result) 三元组：final_output 为最终回答文本，
@@ -227,15 +239,24 @@ async def run_turn(
     """
     # 第 3 层防御：历史压缩。**在送给模型之前**拦截（不是爆了再压）——
     # 历史超阈值即把旧轮次的工具返回原文压缩为结论摘要。
-    if history_input is not None and _history_budget_tokens > 0:
+    budget = (
+        _DEFAULT_HISTORY_BUDGET_TOKENS
+        if history_budget_tokens is None else max(0, int(history_budget_tokens))
+    )
+    keep_recent = (
+        _DEFAULT_HISTORY_KEEP_RECENT_TURNS
+        if history_keep_recent_turns is None
+        else max(1, int(history_keep_recent_turns))
+    )
+    if history_input is not None and budget > 0:
         from app.agent.history_compaction import (
             compact_history,
             estimate_history_tokens,
         )
 
-        if estimate_history_tokens(history_input) > _history_budget_tokens:
+        if estimate_history_tokens(history_input) > budget:
             history_input, _stats = compact_history(
-                history_input, keep_recent_turns=_history_keep_recent_turns
+                history_input, keep_recent_turns=keep_recent
             )
             context.last_compaction = _stats
 
