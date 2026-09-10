@@ -34,3 +34,6 @@ docs/多时钟与嵌套信封支持设计.md
 
 # 临时提交信息文件
 scripts/_commit_msg_*.txt
+
+# 便携分发包构建产物（含内嵌运行时与注入的 key，绝不入库）
+dist_portable/
