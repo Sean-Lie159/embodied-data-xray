@@ -35,6 +35,19 @@ def _read_columns(path: str, fmt: str, columns: list[str]) -> dict[str, np.ndarr
         dict {列名: numpy 数组}；读取失败返回 None。
     """
     from app.tools.load_dataset import _detect_encoding
+    from app.tools._readers import split_path_spec
+
+    # 容器子流（h5 节点 / mcap topic）：经统一注册表读全表后取列
+    # （列裁剪对容器子流不适用；"::" 解析收敛在 _readers）。
+    _file, _sub = split_path_spec(path)
+    if _sub:
+        from app.tools._readers import ReadRequest, read_stream
+
+        result = read_stream(ReadRequest(path_spec=path, want="frame", fmt=fmt))
+        if not result.ok or result.frame is None:
+            return None
+        df = result.frame
+        return {c: _column_array(df[c]) for c in columns if c in df.columns}
 
     try:
         if fmt == "csv":

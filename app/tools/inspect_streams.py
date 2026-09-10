@@ -170,25 +170,28 @@ def _measure_rate_from_file(
     """
     from app.tools.timestamp_units import infer_unit, self_correct_unit, to_ns
 
-    if not Path(path.split("::")[0]).exists():
+    from app.tools._readers import split_path_spec
+
+    file_part, sub = split_path_spec(path)
+    if not Path(file_part).exists():
         return {"present": False, "reason": f"文件不存在：{path}"}
-    # h5 节点流（format="h5"，path 带 ::node）：时间戳为 compound 字段列。
-    if fmt == "h5" and "::" in path:
-        from app.tools._data_access import read_h5_node_field
+    if sub:
+        # 容器子流（h5 节点 / mcap topic）：时间戳经统一注册表取
+        # （"::" 解析与分派收敛在 _readers；此处不再特判格式）。
+        from app.tools._readers import ReadRequest, read_stream
         from app.tools.timestamp_units import infer_unit
 
-        field = column_hint or "timestamp"
-        ts = read_h5_node_field(path, field)
-        if ts is None and field != "timestamp":
-            field = "timestamp"
-            ts = read_h5_node_field(path, field)
-        if ts is None:
+        result = read_stream(ReadRequest(
+            path_spec=path, want="timestamp", fmt=fmt, column=column_hint))
+        if not result.ok or result.timestamp is None:
             return {"present": False,
-                    "reason": f"h5 节点无时间戳字段（{field}）"}
+                    "reason": f"子流无时间戳字段（{column_hint or 'timestamp'}）"}
+        ts = pd.Series(result.timestamp, name=result.timestamp_column)
         # 单位强制量级推断（登记表单位属别的节点/列；真实案例 ms 被当 s →
-        # 0.1 Hz 千倍失真）。timestamp_unit 参数改为推断结果。
+        # 0.1 Hz 千倍失真）。
         timestamp_unit = infer_unit(
-            pd.to_numeric(ts, errors="coerce").dropna().to_numpy(), field
+            pd.to_numeric(ts, errors="coerce").dropna().to_numpy(),
+            result.timestamp_column or "timestamp",
         )["unit"]
     else:
         ts = _read_timestamp_only(path, fmt, column_hint)

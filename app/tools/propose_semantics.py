@@ -71,27 +71,21 @@ def _locate_stream(context: RunContext, filename: str) -> dict[str, Any] | None:
 
 
 def _load_expanded(path: str, fmt: str) -> tuple[pd.DataFrame | None, str | None]:
-    """读取并展开流内容，返回 (df, note)；格式不支持/读取失败返回 (None, None)。
+    """读取并展开流内容，返回 (df, note)；读取失败返回 (None, None)。
 
-    h5 节点流（format="h5"，path 带 ::node）按节点读取——验证器得以核验
-    h5 流的结构特征（真实案例：tf/相机帧索引节点此前验证 failed）。
+    **经统一读取注册表**：格式分派与 ``"<file>::<node>"`` 解析收敛在
+    ``_readers``（此前本函数自己分派 jsonl/json/h5/表格，是重复实现之一）；
+    信封展开（object 列 → 点分扁平列）在此保留——验证器在扁平列上找特征。
     """
-    if fmt == "h5" and "::" in path:
-        from app.tools._data_access import _read_h5_node_stream
+    from app.tools._readers import ReadRequest, read_stream
 
-        return _read_h5_node_stream(path), None
-    # 表格/信封格式（csv/parquet/json/jsonl）经统一 reader 后**展开信封**
-    # （验证器在扁平列上找特征——jsonl 信封流的 IMU 向量嵌套在 data 内，
-    # 不展开则 imu 验证退化为 failed）。
-    if fmt in ("csv", "parquet", "json", "jsonl"):
-        from app.tools._data_access import expand_envelope, read_stream_full
-
-        df = read_stream_full(path, fmt)
-        if df is None:
-            return None, None
-        return expand_envelope(df, max_cols=_VERIFY_MAX_COLS)
-    return None, None
-
+    result = read_stream(ReadRequest(
+        path_spec=path, want="sample", fmt=fmt,
+        limit=_VERIFY_SAMPLE_ROWS, expand=True,
+    ))
+    if not result.ok or result.frame is None:
+        return None, None
+    return result.frame, result.expand_note
 
 def _quat_bases(columns: list[str]) -> dict[str, list[str]]:
     """找出展开列中的四元数组：同前缀的 .x/.y/.z/.w 四列。"""

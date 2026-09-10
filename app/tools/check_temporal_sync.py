@@ -20,6 +20,7 @@ from agents.decorators import tool
 
 from app.agent.context import RunContext
 from app.config import get_settings
+from app.tools._readers import split_path_spec
 from app.tools.inspect_streams import _read_timestamp_only
 from app.tools.timestamp_units import (
     FRAME_UNIT,
@@ -50,31 +51,21 @@ def _read_stream_timestamps(
         return None, ""  # 视频流时间戳由 ffprobe 提供，见 _video_ideal_ts
     path = stream.get("path", "")
     fmt = stream.get("format", "")
-    if not path or not Path(path.split("::")[0]).exists():
+    file_part, sub = split_path_spec(path)
+    if not path or not Path(file_part).exists():
         return None, ""
-    # h5 节点流（format="h5"，path 带 ::node）：时间戳为 compound 的字段列。
-    # 默认取 timestamp 字段（真实采集 h5 的约定）；hint 可指定其它字段，
-    # 指定字段不存在时回退 timestamp。
-    if fmt == "h5" and "::" in path:
-        from app.tools._data_access import read_h5_node_field
-        from app.tools.timestamp_units import infer_unit
+    # 容器子流（h5 节点 / mcap topic）：时间戳列经统一读取注册表取
+    # （`"<file>::<node|topic>"` 的解析与分派收敛在 _readers，各工具不再特判）。
+    if sub:
+        from app.tools._readers import ReadRequest, read_stream
 
-        field = column_hint or "timestamp"
-        series = read_h5_node_field(path, field)
-        if series is None and field != "timestamp":
-            field = "timestamp"
-            series = read_h5_node_field(path, field)
-        if series is None:
+        result = read_stream(ReadRequest(
+            path_spec=path, want="timestamp", fmt=fmt, column=column_hint))
+        if not result.ok or result.timestamp is None:
             return None, ""
-        arr = np.asarray(pd_to_numeric(series), dtype=float)
+        arr = np.asarray(result.timestamp, dtype=float)
         arr = arr[~np.isnan(arr)]
-        if len(arr) == 0:
-            return None, ""
-        # 单位**强制量级推断**（不信登记表）：登记表的 timestamp_unit 属于别的
-        # 节点/列（真实案例：h5 节点的 timestamp 为 Unix 毫秒 1.788e12，按登记
-        # 表"秒"口径算出 0.1 Hz——千倍失真）。量级推断对 epoch 值可靠。
-        unit = infer_unit(arr, field)["unit"]
-        return (arr, field) if unit else (arr, field)
+        return (arr, result.timestamp_column or "") if len(arr) > 0 else (None, "")
     # 嵌套时间路径（含 "."，如 data.header.timestamp_us）：经点分路径逐行
     # 提取（仅 jsonl/json）。读取失败返回 None，由调用方注明"指定时间列不存在"。
     if column_hint and "." in column_hint:
