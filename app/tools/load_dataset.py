@@ -41,6 +41,136 @@ _SUPPORTED_FORMATS: dict[str, str] = {
 # 尝试解码文本文件时使用的编码回退链。
 _ENCODINGS: tuple[str, ...] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 
+# 路径规范化：需剥离的**包裹字符**（成对出现，如用户粘贴时带上的引号）。
+_PATH_WRAPPERS: tuple[tuple[str, str], ...] = (
+    ('"', '"'), ("'", "'"), ("`", "`"),
+    ("\u201c", "\u201d"),  # 中文左右双引号 “ ”
+    ("\u2018", "\u2019"),  # 中文左右单引号 ‘ ’
+    ("\uff02", "\uff02"),  # 全角双引号 ＂
+    ("\u300c", "\u300d"),  # 直角引号 「 」
+)
+
+# 路径规范化：需从**首尾**剥离的污染字符集合（引号、空白、不可见字符、中文标点）。
+# 背景（真实事故 2026-09-10）：侧栏 text_input 粘贴的路径常带引号——用户从对话
+# 记录或文档里复制 "C:\...\x.mcap"（含引号）时，引号被当作路径的一部分，
+# Path.exists() 返回 False，弹出"文件不存在，请检查路径"的误导性提示；而同样
+# 的路径在**对话里**输入却能加载成功，因为模型生成工具参数时会自动剥掉引号。
+# 两条路径入参规范不一致 → "偶发"（只在用户粘了引号时发生）。
+_PATH_POLLUTION_CHARS: str = (
+    '"\'`'                    # ASCII 引号与反引号
+    "\u201c\u201d\u2018\u2019"  # 中文左右双/单引号
+    "\uff02\uff07"            # 全角双/单引号
+    "\u300c\u300d\u300e\u300f"  # 直角引号与双直角引号
+    "\uff0c\u3002\uff1b\uff1a"  # 全角逗号、句号、分号、冒号
+    " \t\r\n\u00a0\u3000"     # 空白（含不换行空格与全角空格）
+    "\u200b\u200c\u200d\ufeff"  # 零宽空格/连接符/BOM
+)
+
+
+def _clean_cell(value: str) -> str:
+    """去掉单个值首尾的引号、成对引号与尾随标点（CSV 单元格清洗辅助）。"""
+    out = value
+    for open_q, close_q in _PATH_WRAPPERS:
+        if out.startswith(open_q) and out.endswith(close_q) and len(out) > 1:
+            out = out[len(open_q):-len(close_q)]
+    return out.strip()
+
+
+def normalize_path_spec(raw: str) -> str:
+    """规范化用户/界面传入的路径字符串（**幂等**，只动首尾、不动路径本体）。
+
+    为什么需要：路径的两个入口（侧栏 text_input 与对话中模型抽取的路径）此前
+    规范不一致——模型会剥掉引号，而粘贴的内容原样透传。用户从对话记录里复制
+    ``"C:\\...\\x.mcap"``（含引号）粘贴进侧栏，引号成了路径的一部分，
+    ``Path.exists()`` 为 False，"偶发"地弹出"文件不存在"（真实事故 2026-09-10）。
+
+    处理顺序（保守，宁可少动）：
+      1. 迭代剥离成对包裹的引号（ASCII / 中文 / 全角 / 直角，可能嵌套）；
+      2. 去首尾污染字符（引号、空白、零宽字符、尾随中文标点如"。""，"）；
+      3. 去掉 ``file://`` / ``file:///`` URL 前缀（浏览器复制路径的常见形态）；
+      4. Windows 上把正斜杠统一为反斜杠——仅当盘符形态（如 ``C:/x``）成立时，
+         避免误伤 UNC 与已含反斜杠的路径。
+
+    规范化**不保证**路径存在；调用方仍须正常校验并如实报错。返回值只在
+    内容确有变化时与原值不同，因此可安全用于"是否需要告知用户已自动纠正"。
+
+    Args:
+        raw: 原始路径字符串（可能含引号、空白、URL 前缀等污染）。
+
+    Returns:
+        规范化后的路径字符串；输入不是字符串或为空白时原样返回。
+    """
+    if not isinstance(raw, str):
+        return raw
+    text = raw.strip()
+    if not text:
+        return raw
+
+    # 1) 成对引号（迭代以覆盖 “"path"” 这类嵌套/混合包裹）。
+    for _ in range(4):
+        before = text
+        for open_q, close_q in _PATH_WRAPPERS:
+            if (text.startswith(open_q) and text.endswith(close_q)
+                    and len(text) > len(open_q) + len(close_q) - 1):
+                text = text[len(open_q):-len(close_q)]
+        text = text.strip()
+        if text == before:
+            break
+
+    # 2) 首尾污染字符（引号/空白/零宽/尾随标点）。
+    text = text.strip(_PATH_POLLUTION_CHARS)
+
+    # 3) file:// URL 前缀（file:///C:/x → C:/x）。
+    low = text.lower()
+    for prefix in ("file:///", "file://", "file:/"):
+        if low.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    # Windows 常见形态：file:///C:\x（保留盘符前的多余斜杠会被剔除）。
+    if len(text) > 2 and text[0] == "/" and text[1].isalpha() and text[2] == ":":
+        text = text[1:]
+
+    # 4) 盘符形态的路径统一分隔符（仅 Windows 有意义）。
+    if len(text) > 1 and text[1] == ":":
+        text = text.replace("/", "\\")
+
+    return text
+
+
+def _error(
+    error: str,
+    reason: str,
+    user_message: str,
+    *,
+    supported_formats: list[str] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """构造统一的错误返回结构。
+
+    Args:
+        error: 机器可读的错误类型标识。
+        reason: 具体原因（面向开发者/日志，需可定位：含异常类型+肇事文件/阶段）。
+        user_message: 可直接转达给用户的中文说明。
+        supported_formats: 支持的格式列表（可选）。
+        extra: 额外内部字段（如 traceback 关键帧），供定位调试，不进 user_message。
+
+    Returns:
+        统一结构的错误 dict：success=False + error/reason/user_message。
+        错误返回**不附带文件内容预览**，避免模型把内容片段编造进回答。
+    """
+    result: dict[str, Any] = {
+        "success": False,
+        "error": error,
+        "reason": reason,
+        "user_message": user_message,
+    }
+    if supported_formats is not None:
+        result["supported_formats"] = supported_formats
+    if extra is not None:
+        result.update(extra)
+    return result
+
+
 # JSONL 嗅探采样行数：目录嗅探时只取前若干行判列结构与 dtype。
 # 取 5 行而非 _FINGERPRINT_SAMPLE_ROWS(500)：JSONL 需逐行解析 JSON，成本高于
 # csv/parquet 的列裁剪；而判别列结构与 dtype（含嵌套值 → object）5 行已足够。
@@ -1203,9 +1333,29 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
     Raises:
         不直接抛出异常；错误以结构化 dict 返回，便于 Agent 恢复并如实转达。
     """
+    # 入参规范化（幂等）：剥离粘贴路径常见的引号/空白/零宽字符/URL 前缀。
+    # 两个入口（侧栏粘贴 / 对话中模型抽取）此前规范不一致——模型会剥引号，
+    # 粘贴原样透传，导致同一路径在对话里可加载、在侧栏报"文件不存在"
+    # （真实事故 2026-09-10）。规范化后两者行为一致。
+    cleaned = normalize_path_spec(path)
+    path_was_cleaned = cleaned != path
+    raw_input = path
+    path = cleaned
     source = Path(path)
 
     if not source.exists():
+        # 诚实降级：若确实做过剥离，把"纠正后的路径"一并告知——避免用户
+        # 对着自己输入的原文反复核对却看不出差异（引号/零宽字符肉眼不可见）。
+        if path_was_cleaned:
+            return _error(
+                "file_not_found",
+                f"文件不存在（已在入参中剥离引号/空白等字符后仍不存在）："
+                f"原始={raw_input!r}，规范化后={path}",
+                f"路径中检测到引号、空白或不可见字符，已自动剥离后重试，但"
+                f"路径 {path} 仍不存在。请检查路径是否正确（注意：已自动去掉"
+                "首尾的引号/空格）。",
+                extra={"normalized_path": path},
+            )
         return _error(
             "file_not_found",
             f"文件不存在：{path}",
@@ -1340,6 +1490,17 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         )
     else:
         result["user_message"] = f"已加载数据集 {dataset_id}，当前可对其进行分析。"
+    # 入参被自动纠正时如实告知（不静默）——用户下次粘贴才知道要留意引号/空格。
+    if path_was_cleaned:
+        result["path_normalized"] = {
+            "raw": raw_input,
+            "used": path,
+            "note": "路径首尾含引号/空白/不可见字符，已自动剥离后加载成功。",
+        }
+        result["user_message"] += (
+            " （提示：原路径首尾含引号或空白字符，已自动剥离后使用。"
+            "下次粘贴请确认没有多余的引号。）"
+        )
     if h5_structure:
         result["user_message"] += (
             f" 该文件为 HDF5 原生层级结构，主表为节点 {meta['h5_source_node']}，"

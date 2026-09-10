@@ -103,6 +103,11 @@ def probe_mcap(path: str) -> dict[str, Any]:
         不直接抛出；缺依赖时抛 McapDependencyError 由调用方转结构化错误
         （与 load_dataset 的缺依赖契约一致），其余异常转 success=False。
     """
+    # 入参规范化（与 load_dataset 同源，幂等）：本函数是公开接口，可能被
+    # 直接调用（不经 load_dataset 的规范化），故在此再兜一次。
+    from app.tools.load_dataset import normalize_path_spec
+
+    path = normalize_path_spec(path)
     src = Path(path)
     reader_mod = _import_mcap()  # 缺依赖 → McapDependencyError（调用方处理）
 

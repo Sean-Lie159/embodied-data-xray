@@ -222,7 +222,13 @@ def read_stream(req: ReadRequest) -> ReadResult:
         清单（不是错误——单文件格式本就没有子流概念）。
     """
     file_part, sub = split_path_spec(req.path_spec)
-    fmt = resolve_fmt(req.path_spec, req.fmt)
+    # 入参规范化（**必须在拆分子流之前**，仅作用于文件部分）：剥离粘贴路径常见
+    # 的引号/空白/零宽字符/URL 前缀，与 load_dataset 同一实现（幂等）。
+    # 子流名不参与规范化——它是登记表里的原值（如 h5 节点路径、mcap topic）。
+    from app.tools.load_dataset import normalize_path_spec
+
+    file_part = normalize_path_spec(file_part)
+    fmt = resolve_fmt(file_part, req.fmt or None)
 
     if not fmt:
         return ReadResult.fail(
