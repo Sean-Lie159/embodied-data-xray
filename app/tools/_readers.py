@@ -410,9 +410,9 @@ class _JsonReader:
     extensions = [".json"]
 
     def frame(self, path: str, *, sub: str | None, limit: int | None) -> pd.DataFrame | None:
-        from app.tools._data_access import read_stream_full
+        from app.tools._data_access import _read_frame_impl
 
-        df = read_stream_full(path, "json")
+        df = _read_frame_impl(path, "json")
         return df.head(limit) if df is not None and limit is not None else df
 
     def columns(self, path: str, *, sub: str | None) -> list[str] | None:
@@ -421,9 +421,9 @@ class _JsonReader:
         return _read_table_columns(Path(path))
 
     def nrows(self, path: str, *, sub: str | None) -> int | None:
-        from app.tools._data_access import read_table_nrows
+        from app.tools._data_access import _read_nrows_impl
 
-        return read_table_nrows(path, "json")
+        return _read_nrows_impl(path, "json")
 
     def sub_streams(self, path: str) -> list[str]:
         return []
@@ -454,9 +454,9 @@ class _JsonlReader:
         return [str(k) for k in rows[0].keys()] if rows else []
 
     def nrows(self, path: str, *, sub: str | None) -> int | None:
-        from app.tools._data_access import read_table_nrows
+        from app.tools._data_access import _read_nrows_impl
 
-        return read_table_nrows(path, "jsonl")
+        return _read_nrows_impl(path, "jsonl")
 
     def sub_streams(self, path: str) -> list[str]:
         return []

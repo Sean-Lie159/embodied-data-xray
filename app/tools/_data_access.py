@@ -211,23 +211,19 @@ def read_nested_time_column(
     return pd.Series(vals, name=nested_path)
 
 
-def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
-    """按需读取流文件的全表。
+def _read_frame_impl(path: str, fmt: str) -> pd.DataFrame | None:
+    """全表读取的**底层实现**（reader 内部调用；避免经注册表递归）。
 
     JSON 顶层 dict 时按行列表键（frames/data）展开为 DataFrame，避免把标量键
     （如 fps）当数据列。JSONL 按行解析（lines=True），与 JSON 严格区分。
-    h5 节点流（path 带 ::node）按节点读取。
 
     Args:
-        path: 文件路径（h5 节点流形如 "<file>::<node>"）。
-        fmt: 格式（csv/parquet/json/jsonl/h5）。
+        path: 文件路径。
+        fmt: 格式（csv/parquet/json/jsonl）。
 
     Returns:
         DataFrame；读取失败返回 None。
     """
-    if fmt == "h5" and "::" in path:
-        return _read_h5_node_stream(path)
-
     import json as _json
 
     from app.tools.load_dataset import _detect_encoding
@@ -246,26 +242,43 @@ def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
                 return None
             return pd.DataFrame(rows)
         if fmt == "jsonl":
-            # JSONL：每行一个 JSON 对象 → 必须 lines=True（与 .json 严格区分）。
             encoding = _detect_encoding(Path(path).read_bytes())
             return pd.read_json(path, lines=True, encoding=encoding)
+        return None
     except Exception:  # noqa: BLE001
         return None
-    return None
 
 
-def read_table_nrows(path: str, fmt: str) -> int | None:
-    """只读表格行数（不读全量数据）。
+def read_stream_full(path: str, fmt: str) -> pd.DataFrame | None:
+    """按需读取流文件的全表（**薄包装**：内部走统一读取注册表）。
 
-    统一行数读数入口：inspect_streams / check_temporal_sync / load_dataset 主表评分
-    都经此函数获取行数，避免各自实现导致同一文件行数读数不一致。
+    保留本函数是为了不动既有调用方（工具层多处仍以此签名调用）；实际读取
+    经 ``_readers.read_stream`` 单一入口——格式分派、复合路径（``"<file>::<node>"``）
+    解析、h5 节点 / mcap topic 分派全部收敛在那里。
+
+    Args:
+        path: 文件路径（容器子流形如 "<file>::<node>"）。
+        fmt: 格式（csv/parquet/json/jsonl/h5/mcap）。
+
+    Returns:
+        DataFrame；读取失败返回 None。
+    """
+    from app.tools._readers import ReadRequest, read_stream
+
+    req = ReadRequest(path_spec=path, want="frame", fmt=fmt)
+    result = read_stream(req)
+    return result.frame if result.ok else None
+
+
+def _read_nrows_impl(path: str, fmt: str) -> int | None:
+    """行数读取的**底层实现**（reader 内部调用；避免经注册表递归）。
 
     Args:
         path: 文件路径。
         fmt: 格式（csv/parquet/json/jsonl）。
 
     Returns:
-        行数（不含表头）；读取失败返回 None。
+        行数；读取失败返回 None。
     """
     import json as _json
 
@@ -274,8 +287,8 @@ def read_table_nrows(path: str, fmt: str) -> int | None:
     try:
         if fmt == "csv":
             encoding = _detect_encoding(Path(path).read_bytes())
-            # 用 python 引擎只读首列以降低成本；与全量读同一引擎，行数一致。
-            return int(pd.read_csv(path, encoding=encoding, usecols=[0], engine="python").shape[0])
+            return int(pd.read_csv(path, encoding=encoding, usecols=[0],
+                                   engine="python").shape[0])
         if fmt == "parquet":
             return int(pd.read_parquet(path, columns=None).shape[0])
         if fmt == "json":
@@ -284,13 +297,31 @@ def read_table_nrows(path: str, fmt: str) -> int | None:
             rows = _json_row_list(obj)
             return len(rows) if rows is not None else 0
         if fmt == "jsonl":
-            # JSONL：非空行即一行记录（与 lines=True 读取语义一致）。
             encoding = _detect_encoding(Path(path).read_bytes())
             with Path(path).open("r", encoding=encoding, errors="replace") as f:
                 return sum(1 for line in f if line.strip())
         return None
     except Exception:  # noqa: BLE001
         return None
+
+
+def read_table_nrows(path: str, fmt: str) -> int | None:
+    """只读表格行数（**薄包装**：内部走统一读取注册表）。
+
+    统一行数读数入口：inspect_streams / check_temporal_sync / load_dataset
+    主表评分都经此获取行数，避免各自实现导致同一文件行数读数不一致。
+
+    Args:
+        path: 文件路径。
+        fmt: 格式（csv/parquet/json/jsonl）。
+
+    Returns:
+        行数（不含表头）；读取失败返回 None。
+    """
+    from app.tools._readers import ReadRequest, read_stream
+
+    result = read_stream(ReadRequest(path_spec=path, want="nrows", fmt=fmt))
+    return result.nrows if result.ok else None
 
 
 def expand_envelope(
