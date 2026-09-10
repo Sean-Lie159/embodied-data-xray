@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
-from typing import cast
+import time
+from dataclasses import dataclass
+from typing import Any, cast
 
 from agents import Agent, Model, Runner, RunResult, Tool
 from agents.exceptions import MaxTurnsExceeded
@@ -17,6 +19,64 @@ from app.agent.context import RunContext
 # 单轮运行的返回类型。契约：正常分支 result 为 RunResult（含本轮完整结果）；
 # MaxTurnsExceeded 分支 result 为 None（此时 final_output 已由本函数生成友好提示）。
 RunTurnResult = tuple[str, list[TResponseInputItem], RunResult | None]
+
+
+@dataclass
+class RunMetrics:
+    """单轮运行的观测指标（供 UI 展示"这轮跑了多久、几次工具循环"）。
+
+    为什么需要：502 排查时缺少"这一轮实际跑了几次模型往返、耗时多少"的事实，
+    只能靠猜（是超时过载还是服务侧抖动？）。本结构把这两个量固定记录下来，
+    使同类问题可直接肉眼判定，也是"批量纪律"是否生效的度量。
+
+    注意：仅记录**已实现的调用轮数**（无论成功或失败），异常分支同样回填——
+    失败轮没有指标恰恰是最需要看数据的情况。
+
+    Attributes:
+        duration_ms: 本轮端到端耗时（毫秒，含工具执行与全部模型往返）。
+        n_model_calls: 本轮实际发生的模型往返次数（≈ 工具调用轮数 + 1）。
+        n_tool_calls: 本轮 SDK 报告的工具调用次数（result 为 None 时无法获取，
+            回填 0）。
+        completed: 是否正常完成（False 表示撞 max_turns 或模型 API 异常）。
+    """
+
+    duration_ms: int = 0
+    n_model_calls: int = 0
+    n_tool_calls: int = 0
+    completed: bool = True
+
+
+def _extract_raw_usage(result: RunResult | None) -> Any:
+    """从 RunResult 提取 SDK 原始 usage 对象（可能为 None）。
+
+    仅用于读取 requests 计数等观测字段；任何结构不符都安全降级为 None。
+    """
+    if result is None:
+        return None
+    try:
+        state = result.to_state()
+        wrapper = getattr(state, "_context", None)
+        return getattr(wrapper, "usage", None) if wrapper is not None else None
+    except Exception:  # noqa: BLE001 - 观测字段取不到不影响主流程
+        return None
+
+
+def _count_tool_calls(result: RunResult | None) -> int:
+    """统计本轮 SDK 报告的工具调用次数（取 RunResult 与 usage 两者的较大值）。"""
+    if result is None:
+        return 0
+    by_items = 0
+    try:
+        by_items = len(result.tool_input_items or [])
+    except Exception:  # noqa: BLE001
+        by_items = 0
+    usage = _extract_raw_usage(result)
+    by_usage = 0
+    try:
+        by_usage = int(getattr(usage, "requests", 0) or 0)
+    except Exception:  # noqa: BLE001
+        by_usage = 0
+    return max(by_items, by_usage)
 
 # 历史压缩参数的**默认值**（供 CLI 等单会话路径使用）。
 #
@@ -106,6 +166,19 @@ time_column 与结构证据（不要求用户提供字段路径等内部细节�
 时用 align_container_streams（一次看全貌）；需要逐帧残差与漂移时再对单个\
 子流用时间同步检查。确认某路相机画面内容（朝向 / 遮挡）时用 \
 inspect_video_frame 抽单帧——**画面含义需用户判读，不得凭文件名臆断画面内容**。
+14. 批量纪律（效率硬约束）：**一次工具调用能覆盖 N 条流的，绝不拆成 N 次调用**。\
+逐流循环调用会让整轮耗时随流数线性增长（真实事故：检查 24 条流时逐流发问，\
+整轮串行十余次模型往返，最终触发上游 502 超时）。因此：问"多条流/全部流"的\
+丢包、对齐、采样率、异常等问题时，**必须**把范围一次性作为参数传给单个工具\
+（如 check_temporal_sync 的 streams 传文件名子串列表，一次即可返回各流明细），\
+不得对每条流各调用一次再自行汇总；只有单个工具返回被截断、或确需按流换用\
+不同参数（如不同的 time_column / baseline_stream）时才追加调用，且不得重复\
+调用已覆盖的流。回答多流问题时，优先引用同一次调用返回的汇总与逐流明细。
+15. 耗时纪律（上下文预算之外的另一项硬约束）：工具调用有实际计算与 IO 成本，\
+应按"先粗后细"推进——先用一次调用拿到全量概览（对齐全貌、逐流概况、缺失汇总），\
+**仅在概览显示某条流确有疑点、或用户明确要求逐帧细节时**，才对该流做深入调用。\
+不要为了"更稳妥"而对已通过的工具重复调用；不要把一次调用能回答的问题拆成\
+多轮追问；用户问题范围含糊时，先按当前数据集全量执行一次再报告，而非逐条试探。
 
 【表述】
 1. 全程用中文回答。
@@ -283,6 +356,7 @@ async def run_turn(
     *,
     history_budget_tokens: int | None = None,
     history_keep_recent_turns: int | None = None,
+    metrics: RunMetrics | None = None,
 ) -> RunTurnResult:
     """执行单轮 Agent 运行。
 
@@ -295,6 +369,9 @@ async def run_turn(
         history_budget_tokens: 历史压缩阈值（**按会话传入**，多会话各自独立）；
             None 时用模块默认值（CLI 单会话路径）。<=0 关闭自动压缩。
         history_keep_recent_turns: 压缩保留的最近轮数；None 时用模块默认值。
+        metrics: 可选，传入一个 :class:`RunMetrics` 实例用于回填本轮耗时与
+            模型往返次数（**含异常分支**，失败轮的指标最需要观测）。传 None
+            时不做记录，行为与改动前完全一致（零回归）。
 
     Returns:
         (final_output, next_input, result) 三元组：final_output 为最终回答文本，
@@ -306,6 +383,18 @@ async def run_turn(
     Raises:
         ConfigError: 工具或模型配置异常。
     """
+    _t0 = time.perf_counter()
+    _m = metrics if metrics is not None else RunMetrics()
+
+    def _finish(
+        payload: RunTurnResult, *, n_tool_calls: int = 0, completed: bool = True
+    ) -> RunTurnResult:
+        """统一回填观测指标并返回结果（成功/异常分支共用，避免遗漏）。"""
+        _m.duration_ms = int((time.perf_counter() - _t0) * 1000)
+        _m.n_tool_calls = n_tool_calls
+        _m.completed = completed
+        return payload
+
     # 第 3 层防御：历史压缩。**在送给模型之前**拦截（不是爆了再压）——
     # 历史超阈值即把旧轮次的工具返回原文压缩为结论摘要。
     budget = (
@@ -359,7 +448,9 @@ async def run_turn(
             *(history_input or []),
             {"role": "user", "content": user_input},
         ]
-        return (msg, fallback_input, None)
+        # 撞上限说明轮数已到 max_turns：按已知轮数回填（供 UI 显示"跑了多久"）。
+        _m.n_model_calls = max(_m.n_model_calls, max_turns)
+        return _finish((msg, fallback_input, None), n_tool_calls=0, completed=False)
     except BaseException as exc:  # noqa: BLE001
         # 键盘中断/系统退出不吞（用户主动中断应正常传播）。
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -371,13 +462,22 @@ async def run_turn(
             *(history_input or []),
             {"role": "user", "content": user_input},
         ]
-        return (_describe_model_error(exc), fallback_input, None)
+        return _finish(
+            (_describe_model_error(exc), fallback_input, None),
+            n_tool_calls=0,
+            completed=False,
+        )
 
     # final_output 在 SDK（RunResultBase）中类型标注为 Any | None，无法通过泛型收紧；
     # 这里用 str() 强制转成 str，并在类型检查层忽略 Any 告警（运行时行为不变）。
     final: str = str(result.final_output or "").strip()  # pyright: ignore[reportAny]
     next_input = result.to_input_list(mode="normalized")
-    return final, next_input, result
+    _m.n_model_calls = max(1, _count_tool_calls(result) + 1)
+    return _finish(
+        (final, next_input, result),
+        n_tool_calls=_count_tool_calls(result),
+        completed=True,
+    )
 
 
 def _extract_tool_name(item: RunItem) -> str:

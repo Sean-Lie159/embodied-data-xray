@@ -44,9 +44,10 @@ def test_streamlit_app_user_input_renders_chat() -> None:
     """模拟一次用户输入：应无异常渲染，且聊天记录出现（assistant 消息）。
 
     这是 UI 改动的回归保障：验证用户输入后，agent 回复能在聊天区正常渲染。
-    会触发一次真实模型调用（轻量"你好"），依赖 .env 配置的模型可用。
+    会触发一次真实模型调用（轻量"你好"）——耗时取决于服务商响应，超时放宽到
+    120s（默认 15s 在服务侧稍慢时就会假失败，误报掩盖真实回归）。
     """
-    at = _app()
+    at = AppTest.from_file(str(_APP), default_timeout=120)
     at.run()
     # 模拟用户输入。
     at.chat_input[0].set_value("你好").run()

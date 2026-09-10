@@ -20,6 +20,7 @@ from agents import RunResult
 from agents.usage import Usage
 
 from app.agent.agent import (
+    RunMetrics,
     build_agent,
     configure_history_compaction,
     format_tool_activity,
@@ -103,6 +104,9 @@ class ChatTurn:
     tool_calls: list[str] = field(default_factory=list)  # 本轮调用的工具名列表
     findings: list[dict] = field(default_factory=list)  # 截止本轮的最新 findings
     usage: dict[str, int] | None = None  # 本轮 token 用量（input/output/total），获取不到为 None
+    # 本轮观测指标（耗时 / 模型往返次数 / 工具调用次数 / 是否正常完成）。
+    # 用于回答"这轮为什么慢/是不是工具循环太多"——502 类问题的第一手事实。
+    metrics: dict[str, Any] | None = None
 
 
 def extract_usage(result: RunResult | None) -> dict[str, int] | None:
@@ -266,10 +270,14 @@ class ChatService:
         """异步执行单轮对话（供已有事件循环的调用方使用）。"""
         composed = _compose_user_input(user_input, self._pending_notes)
         self._pending_notes.clear()
+        # 观测指标容器：由 run_turn 回填（**含失败轮**——502 排查最需要失败轮的
+        # 耗时与往返次数，这决定了是"工具循环太多"还是"服务侧单次抖动"）。
+        metrics = RunMetrics()
         final, self.history_input, result = await run_turn(
             self.agent, self.context, composed, self.history_input,
             history_budget_tokens=self._history_budget,
             history_keep_recent_turns=self._keep_recent_turns,
+            metrics=metrics,
         )
         tool_activity = format_tool_activity(result)
         tool_calls = _extract_tool_names(result)
@@ -279,6 +287,12 @@ class ChatService:
             tool_calls=tool_calls,
             findings=list(self.context.findings),
             usage=extract_usage(result),
+            metrics={
+                "duration_ms": metrics.duration_ms,
+                "n_model_calls": metrics.n_model_calls,
+                "n_tool_calls": metrics.n_tool_calls,
+                "completed": metrics.completed,
+            },
         )
 
     def truncate_history_to_turn(self, turn_index: int) -> dict[str, Any]:

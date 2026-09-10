@@ -17,14 +17,50 @@ from app.services.chat_service import ChatTurn
 def render_tool_activity(turn: ChatTurn) -> None:
     """在回复下方渲染可折叠的工具调用轨迹面板。
 
-    聊天正文保持干净，技术细节（工具调用）可展开查看。
+    聊天正文保持干净，技术细节（工具调用）可展开查看。耗时与工具循环次数
+    一并展示（502 排查的第一手事实：逐流循环会表现为循环次数高 + 耗时随流数
+    线性增长）。
     """
-    if not turn.tool_activity:
+    metrics = turn.metrics or {}
+    if not turn.tool_activity and not metrics:
         return
     with st.expander("查看执行过程"):
+        # 摘要行：耗时 + 工具循环次数（始终可见，便于一眼判断慢在哪里）。
+        st.caption(f"本轮耗时 {_format_duration(metrics.get('duration_ms'))}｜"
+                   f"{_loop_summary(metrics)}")
+        if not turn.tool_activity:
+            return
         st.caption(turn.tool_activity)
         if turn.tool_calls:
             st.caption("本轮调用工具：" + "、".join(turn.tool_calls))
+
+
+def _format_duration(duration_ms: Any) -> str:
+    """把毫秒耗时格式化为可读文本（<1s 用毫秒，否则用秒）。"""
+    if not isinstance(duration_ms, (int, float)) or duration_ms <= 0:
+        return "未知"
+    if duration_ms < 1000:
+        return f"{int(duration_ms)} ms"
+    return f"{duration_ms / 1000:.1f} s"
+
+
+def _loop_summary(metrics: dict) -> str:
+    """把工具循环指标格式化为一行摘要。
+
+    模型往返次数（n_model_calls）≈ 工具调用轮数 + 1，是判断"是否逐流循环"的
+    关键量：一次调用覆盖 N 条流应为个位数，逐流循环会接近 N。
+    """
+    calls = metrics.get("n_model_calls")
+    tools = metrics.get("n_tool_calls")
+    done = metrics.get("completed", True)
+    if not isinstance(calls, (int, float)) or calls <= 0:
+        return "过程未知"
+    text = f"模型往返 {int(calls)} 次"
+    if isinstance(tools, (int, float)) and tools > 0:
+        text += f"｜工具调用 {int(tools)} 次"
+    if not done:
+        text += "｜未正常完成"
+    return text
 
 
 def render_token_stats(usage: dict | None, cumulative: dict) -> None:
@@ -52,6 +88,26 @@ def render_token_stats(usage: dict | None, cumulative: dict) -> None:
     cost = _estimate_cost_text(usage, cumulative)
     if cost:
         st.caption(f"成本估算：{cost}")
+    st.caption(_speed_text(cumulative))
+
+
+def _speed_text(cumulative: dict) -> str:
+    """会话级速度摘要：累计耗时 + 总模型往返次数 + 平均每次往返耗时。
+
+    平均单次往返耗时（duration / n_model_calls）是判断瓶颈位置的量：
+    该值稳定在低位而总耗时高，说明是**往返次数多**（工具循环/逐流调用）——
+    这正是可以靠"批量纪律"优化的那一类；该值本身很高则属单次请求慢
+    （服务侧或上下文过大），优化方向不同。
+    """
+    total_ms = int(cumulative.get("duration_ms", 0) or 0)
+    calls = int(cumulative.get("n_model_calls", 0) or 0)
+    if total_ms <= 0:
+        return "速度：暂无数据"
+    text = f"速度：累计耗时 {_format_duration(total_ms)}"
+    if calls > 0:
+        text += (f"｜模型往返 {calls} 次"
+                 f"｜平均 {total_ms / calls / 1000:.1f} s/次")
+    return text
 
 
 def _estimate_cost_text(usage: dict | None, cumulative: dict) -> str:

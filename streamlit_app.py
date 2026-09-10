@@ -77,7 +77,8 @@ def _create_session(name: str | None = None) -> str:
         "service": ChatService(session_tag=tag),
         "messages": [],
         "cumulative": {"input_tokens": 0, "output_tokens": 0,
-                       "total_tokens": 0, "rounds": 0},
+                       "total_tokens": 0, "rounds": 0,
+                       "duration_ms": 0, "n_model_calls": 0},
         "editing_index": None,
         "name": name or f"对话 {len(st.session_state.sessions) + 1}",
     }
@@ -105,6 +106,20 @@ def _close_session(tag: str) -> None:
         return
     if st.session_state.get("active_session") == tag:
         st.session_state.active_session = next(iter(sessions))
+
+
+def _accumulate_metrics(cumulative: dict, turn) -> None:
+    """把本轮观测指标（耗时 / 模型往返次数）累加进会话统计。
+
+    为什么在 UI 侧累加而不在 ChatService 内：累计量是**展示语义**（会话级
+    统计），服务层只负责单轮事实；两处口径不同，混在一起会让 service 承担
+    它不该知道的 UI 概念。
+    """
+    m = getattr(turn, "metrics", None) or {}
+    cumulative["duration_ms"] = int(cumulative.get("duration_ms", 0)) + int(
+        m.get("duration_ms", 0) or 0)
+    cumulative["n_model_calls"] = int(cumulative.get("n_model_calls", 0)) + int(
+        m.get("n_model_calls", 0) or 0)
 
 
 def _render_session_tabs() -> None:
@@ -244,6 +259,7 @@ def _main() -> None:
                                 cumulative["total_tokens"] += turn.usage.get(
                                     "total_tokens", 0)
                             cumulative["rounds"] += 1
+                            _accumulate_metrics(cumulative, turn)
                             st.rerun()
                 else:
                     with st.chat_message(msg["role"]):
@@ -285,6 +301,7 @@ def _main() -> None:
                 cumulative["output_tokens"] += turn.usage.get("output_tokens", 0)
                 cumulative["total_tokens"] += turn.usage.get("total_tokens", 0)
             cumulative["rounds"] += 1
+            _accumulate_metrics(cumulative, turn)
             messages.append({"role": "assistant", "content": turn.reply, "turn": turn})
 
     # ---- 右侧：展示区（固定高度独立滚动容器）----
