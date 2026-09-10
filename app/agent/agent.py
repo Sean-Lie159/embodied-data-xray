@@ -206,6 +206,74 @@ def guard_tools(tools: list[Any], *, budget_tokens: int) -> list[Any]:
     return guarded
 
 
+def _describe_model_error(exc: BaseException) -> str:
+    """把模型 API 异常转成**可读的中文提示**（含重试建议）。
+
+    为什么需要：模型侧故障（502 上游错误 / 限流 / 超时 / 鉴权失败）不是本工具
+    或数据的问题，但此前会以裸异常外抛、炸穿 UI 页面（用户看到 traceback 白屏，
+    聊天记录还可能处于半截状态）。本函数把它们转成用户能理解并知道怎么做的
+    提示——符合项目「错误可恢复 + 诚实降级」纪律。
+
+    Args:
+        exc: 捕获到的异常。
+
+    Returns:
+        面向用户的中文提示文本。
+    """
+    name = type(exc).__name__
+    text = str(exc)
+    low = text.lower()
+
+    # 按 HTTP 状态码/错误类型给出**可操作**的提示。
+    if "502" in text or "bad gateway" in low or "upstream error" in low:
+        return (
+            "模型服务暂时不可用（502 上游错误）——这不是数据或分析本身的问题，"
+            "通常是模型服务侧临时故障或过载。请稍后重试（直接重发这条消息即可）。"
+        )
+    if "503" in text or "service unavailable" in low:
+        return (
+            "模型服务暂时不可用（503）——服务侧过载或正在维护。"
+            "请稍后重试（直接重发这条消息即可）。"
+        )
+    if "504" in text or "timeout" in low or name in ("APITimeoutError", "TimeoutError"):
+        return (
+            "模型请求超时（504/超时）——可能是本轮上下文较大或服务侧响应慢。"
+            "可稍后重试；若反复超时，建议先压缩历史（侧栏「压缩历史」）或缩小问题范围。"
+        )
+    if "429" in text or "rate limit" in low:
+        return (
+            "模型请求过于频繁（429 限流）——请稍等片刻再重发；"
+            "若持续出现，请检查所用服务商的配额与并发限制。"
+        )
+    if "401" in text or "403" in text or "invalid api key" in low or "unauthorized" in low:
+        return (
+            "模型鉴权失败（401/403）——请检查 .env 中的 OPENAI_API_KEY 与 "
+            "OPENAI_BASE_URL 是否正确、密钥是否已过期。"
+        )
+    if "404" in text or "model_not_found" in low or "does not exist" in low:
+        return (
+            "模型不存在或不可用（404）——请检查 .env 中的 DEFAULT_MODEL "
+            "是否为所用服务商支持的模型名。"
+        )
+    if "context" in low and ("length" in low or "too long" in low or "maximum" in low):
+        return (
+            "上下文超出模型上限——请先在侧栏点击「压缩历史」，"
+            "或缩小本次问题的范围后重试。"
+        )
+    if "connection" in low or name in ("APIConnectionError",):
+        return (
+            "无法连接模型服务——请检查网络与 OPENAI_BASE_URL 是否可达"
+            "（若使用了代理，确认代理正在运行）。稍后可直接重发本条消息。"
+        )
+    # 兜底：如实说明类型与摘要，不假装成功、也不裸露 traceback。
+    brief = text.strip().splitlines()[0][:200] if text.strip() else "(无详细信息)"
+    return (
+        f"本轮模型调用失败（{name}）：{brief}\n"
+        "这通常不是数据或分析本身的问题。请稍后重试（直接重发本条消息即可）；"
+        "若反复出现，请检查 .env 的模型配置与服务商状态。"
+    )
+
+
 async def run_turn(
     agent: Agent[RunContext],
     context: RunContext,
@@ -231,8 +299,9 @@ async def run_turn(
     Returns:
         (final_output, next_input, result) 三元组：final_output 为最终回答文本，
         next_input 为可传给下一轮 run 的 input 列表，result 为完整 RunResult；
-        当触发 MaxTurnsExceeded 时 result 为 None，此时 final_output 已由本函数
-        生成友好的超限提示，调用方不得再对 result 解引用（需判空）。
+        当触发 MaxTurnsExceeded 或模型 API 异常（502/限流/超时/网络/鉴权等）时
+        result 为 None，此时 final_output 已由本函数生成友好提示（含重试建议），
+        调用方不得再对 result 解引用（需判空）。历史保持不变，用户可直接重发。
 
     Raises:
         ConfigError: 工具或模型配置异常。
@@ -267,6 +336,10 @@ async def run_turn(
     else:
         input_items = user_input
 
+    # 兜底范围覆盖**模型侧故障**：不只是 MaxTurnsExceeded，还包括 502/503/504
+    # （服务端错误）、限流、超时、网络不可达、鉴权失败等——此前这些会以裸异常
+    # 外抛，炸穿 UI 页面（用户看到 traceback 白屏）。现统一转结构化友好提示，
+    # 并保留历史与已产生的对话记录（用户可直接重发）。
     try:
         result = await Runner.run(
             agent,
@@ -280,12 +353,25 @@ async def run_turn(
             f"本轮工具调用次数已达上限（max_turns={max_turns}），为避免死循环已停止。"
             + "请尝试更明确地描述需求，或分步提问。"
         )
-        # 保持与原实现相同的 `or` 语义：history 为 None 或空列表时都用仅含
-        # 用户消息的列表作为 fallback，避免改变运行时行为。
-        fallback_input: list[TResponseInputItem] = history_input or [
-            {"role": "user", "content": user_input}
+        # 与异常分支一致：fallback 含**本轮用户消息**（用户追问/重发时模型
+        # 能看到上一句，回答不脱节）。
+        fallback_input: list[TResponseInputItem] = [
+            *(history_input or []),
+            {"role": "user", "content": user_input},
         ]
         return (msg, fallback_input, None)
+    except BaseException as exc:  # noqa: BLE001
+        # 键盘中断/系统退出不吞（用户主动中断应正常传播）。
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        # 兜底历史**必须含本轮用户消息**：否则用户"直接重发"时本轮问题不在
+        # 上下文里（模型看不到上一句，回答会脱节）。成功分支由 SDK 的
+        # to_input_list 自然包含本轮消息；异常分支由这里手工补上。
+        fallback_input: list[TResponseInputItem] = [
+            *(history_input or []),
+            {"role": "user", "content": user_input},
+        ]
+        return (_describe_model_error(exc), fallback_input, None)
 
     # final_output 在 SDK（RunResultBase）中类型标注为 Any | None，无法通过泛型收紧；
     # 这里用 str() 强制转成 str，并在类型检查层忽略 Any 告警（运行时行为不变）。
