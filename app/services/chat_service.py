@@ -136,6 +136,13 @@ def extract_usage(result: RunResult | None) -> dict[str, int] | None:
         return None
 
 
+def _new_session_tag() -> str:
+    """生成短会话标识（用于输出文件名隔离，形如 "s-1a2b"）。"""
+    import uuid
+
+    return f"s-{uuid.uuid4().hex[:4]}"
+
+
 def _count_turns(history: list[Any]) -> int:
     """统计历史中的轮数（按 user 消息切分）。"""
     return len(_split_turns(history)) if history else 0
@@ -150,9 +157,14 @@ class ChatService:
         print(turn.reply)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_tag: str | None = None) -> None:
         self.agent = self._build_agent()
-        self.context = RunContext()
+        # 会话标识：UI 多会话时用于隔离输出文件名（缺省自动生成短标）；
+        # 单会话场景可传 "" 关闭前缀（文件名与历史行为完全一致）。
+        self.context = RunContext(
+            session_tag=(session_tag if session_tag is not None
+                         else _new_session_tag())
+        )
         self.history_input: list[Any] | None = None
         # 面板事件便签：UI 侧栏加载等状态变化，下一轮 reply 时拼入模型输入
         # （工具层状态与模型认知的桥梁，见 add_context_note docstring）。

@@ -24,7 +24,10 @@ def _output_report_path(context: RunContext) -> Path:
     base = Path(context.output_dir) if context.output_dir else Path("outputs")
     base.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    return base / f"{context.dataset_id or 'dataset'}_report_{ts}.md"
+    from app.tools._data_access import output_prefix
+
+    return base / (f"{output_prefix(context)}{context.dataset_id or 'dataset'}"
+                   f"_report_{ts}.md")
 
 
 def _build_dataset_overview(context: RunContext) -> str:

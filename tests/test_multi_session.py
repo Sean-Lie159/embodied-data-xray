@@ -122,3 +122,62 @@ def test_run_turn_uses_passed_budget(tmp_path: Path) -> None:
 
 
 # --- 3. session_tag（输出文件名隔离）下个 commit 覆盖 ------------------------
+
+# --- 3. session_tag：输出文件名隔离（多会话分析同一数据集不互相覆盖）-------
+
+
+def test_session_tag_default_empty_zero_regression() -> None:
+    """缺省 session_tag 为空串 → 文件名与单会话场景完全一致（零回归）。"""
+    from app.tools._data_access import output_prefix
+
+    ctx = RunContext(dataset_id="demo")
+    assert ctx.session_tag == ""
+    assert output_prefix(ctx) == ""
+
+
+def test_session_tag_prefix_applied() -> None:
+    """session_tag 非空 → 输出前缀含会话标识。"""
+    from app.tools._data_access import output_prefix
+
+    ctx = RunContext(dataset_id="demo", session_tag="s-1a2b")
+    assert output_prefix(ctx) == "s-1a2b_"
+
+
+def test_plot_and_report_names_include_session_tag(tmp_path: Path) -> None:
+    """图表与报告文件名含会话前缀（多会话分析同一数据集不覆盖）。"""
+    from app.tools.generate_report import _output_report_path
+    from app.tools.plot_chart import _output_path
+
+    ctx_a = RunContext(output_dir=str(tmp_path), dataset_id="same",
+                       session_tag="s-aaaa")
+    ctx_b = RunContext(output_dir=str(tmp_path), dataset_id="same",
+                       session_tag="s-bbbb")
+    pa, pb = _output_path(ctx_a, "line"), _output_path(ctx_b, "line")
+    assert pa.name.startswith("s-aaaa_same_line_")
+    assert pb.name.startswith("s-bbbb_same_line_")
+    assert pa != pb  # 同一数据集、同一秒内也不冲突
+
+    ra = _output_report_path(ctx_a)
+    rb = _output_report_path(ctx_b)
+    assert ra.name.startswith("s-aaaa_same_report_")
+    assert rb.name.startswith("s-bbbb_same_report_")
+    assert ra != rb
+
+
+def test_new_session_tag_unique_and_prefixed() -> None:
+    """自动生成的会话标识唯一且有前缀。"""
+    from app.services.chat_service import _new_session_tag
+
+    tags = {_new_session_tag() for _ in range(20)}
+    assert len(tags) == 20
+    assert all(t.startswith("s-") and len(t) == 6 for t in tags)
+
+
+def test_chat_service_accepts_session_tag() -> None:
+    """ChatService 可显式指定 / 关闭会话标识（不连真实模型，只验构造路径）。"""
+    import inspect
+
+    from app.services.chat_service import ChatService
+
+    sig = inspect.signature(ChatService.__init__)
+    assert "session_tag" in sig.parameters

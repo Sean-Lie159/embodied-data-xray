@@ -55,7 +55,10 @@ def _output_path(context: RunContext, chart_type: str) -> Path:
     base = Path(context.output_dir) if context.output_dir else Path("outputs")
     base.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    name = f"{context.dataset_id or 'dataset'}_{chart_type}_{ts}.png"
+    from app.tools._data_access import output_prefix
+
+    name = (f"{output_prefix(context)}{context.dataset_id or 'dataset'}"
+            f"_{chart_type}_{ts}.png")
     return base / name
 
 

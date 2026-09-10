@@ -40,6 +40,10 @@ class RunContext:
     # 最近一次历史压缩的统计（未压缩过为 None）；由 run_turn 在自动压缩时写入，
     # 供 UI/CLI 展示"已压缩 N 条、节省约 X token"。
     last_compaction: dict | None = None
+    # 会话标识（UI 多会话时由 ChatService 生成）：仅用作**输出文件名前缀**，
+    # 避免多个会话分析同一数据集时输出互相覆盖。缺省空串 → 文件名与单会话
+    # 场景完全一致（零回归）。
+    session_tag: str = ""
 
     def output_path(self) -> Path:
         """返回输出目录的绝对路径，目录不存在时自动创建。"""

@@ -453,6 +453,22 @@ def expand_envelope(
     return out, note
 
 
+def output_prefix(context: RunContext) -> str:
+    """输出文件名前缀：会话标识（多会话隔离）；无则空串。
+
+    多会话时两个会话可能分析**同一数据集**（dataset_id 相同），仅靠秒级
+    时间戳区分会互相覆盖——故文件名前缀带上会话标识。
+
+    Args:
+        context: 运行时上下文。
+
+    Returns:
+        前缀（形如 "s-1a2b_"）；无会话标识时返回空串（文件名与单会话一致）。
+    """
+    tag = getattr(context, "session_tag", "") or ""
+    return f"{tag}_" if tag else ""
+
+
 def _split(path_spec: str) -> tuple[str, str | None]:
     """委托 _readers.split_path_spec（避免本模块重复实现解析逻辑）。"""
     from app.tools._readers import split_path_spec
