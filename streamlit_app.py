@@ -1,8 +1,11 @@
 """Streamlit 界面入口（唯一入口：streamlit run streamlit_app.py）。
 
-布局：左侧对话区 + 右侧展示区（图表 / Findings·报告 / 数据概况 tabs）。
-会话状态（ChatService、对话历史）存于 st.session_state，只有新的用户输入才触发
-agent 执行；页面重跑（切换 tab、点击按钮）不重复调用 agent。
+布局：顶部**多会话标签页** + 左侧对话区 + 右侧展示区（图表 / Findings·报告 /
+数据概况 tabs）。**每个会话独立**持有 ChatService（含 RunContext / 对话历史 /
+数据集 / token 累计），可分析同一或不同数据集，互不干扰。
+
+会话状态存于 st.session_state（刷新页面重置属正常，不持久化）；切换标签页不
+丢状态、也不触发 agent 执行——只有新的用户输入才调用 agent。
 """
 
 from __future__ import annotations
@@ -54,32 +57,77 @@ def _inject_scroll_css() -> None:
     )
 
 
-def _get_service() -> ChatService:
-    """惰性初始化并缓存 ChatService（含 agent / RunContext / 对话历史）。"""
-    if "service" not in st.session_state:
-        st.session_state.service = ChatService()
-    return st.session_state.service
+def _sessions() -> dict[str, dict]:
+    """会话字典：{会话ID: {service, messages, cumulative, editing_index, name}}。
+
+    首次访问时自动创建一个会话（保证始终有 active 会话）。
+    """
+    if "sessions" not in st.session_state or not st.session_state.sessions:
+        st.session_state.sessions = {}
+        _create_session()
+    return st.session_state.sessions
 
 
-def _get_messages() -> list[dict]:
-    """返回对话消息列表（含每轮的回复与工具轨迹）。"""
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    return st.session_state.messages
+def _create_session(name: str | None = None) -> str:
+    """新建会话并返回其 ID（不切换 active）。"""
+    from app.services.chat_service import _new_session_tag
+
+    tag = _new_session_tag()
+    st.session_state.sessions[tag] = {
+        "service": ChatService(session_tag=tag),
+        "messages": [],
+        "cumulative": {"input_tokens": 0, "output_tokens": 0,
+                       "total_tokens": 0, "rounds": 0},
+        "editing_index": None,
+        "name": name or f"对话 {len(st.session_state.sessions) + 1}",
+    }
+    if "active_session" not in st.session_state:
+        st.session_state.active_session = tag
+    return tag
 
 
-def _get_editing_index() -> int | None:
-    """当前正在编辑的用户消息下标（None=非编辑态；跨 rerun 保持）。"""
-    return st.session_state.get("editing_index")
+def _active() -> dict:
+    """当前 active 会话的状态 dict（自动兜底：active 失效时取会话列表首个）。"""
+    sessions = _sessions()
+    active = st.session_state.get("active_session")
+    if active not in sessions:
+        active = next(iter(sessions))
+        st.session_state.active_session = active
+    return sessions[active]
 
 
-def _get_cumulative_usage() -> dict:
-    """返回会话累计 token 用量（st.session_state 维护，刷新页面重置属正常）。"""
-    if "cumulative_usage" not in st.session_state:
-        st.session_state.cumulative_usage = {
-            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "rounds": 0,
-        }
-    return st.session_state.cumulative_usage
+def _close_session(tag: str) -> None:
+    """关闭会话；关到最后一个时自动新建（保证始终有会话）。"""
+    sessions = _sessions()
+    sessions.pop(tag, None)
+    if not sessions:
+        _create_session()
+        return
+    if st.session_state.get("active_session") == tag:
+        st.session_state.active_session = next(iter(sessions))
+
+
+def _render_session_tabs() -> None:
+    """顶部会话标签页：切换 / 关闭 / 新建。"""
+    sessions = _sessions()
+    active = st.session_state.active_session
+    cols = st.columns([1] * len(sessions) + [0.6])
+    for col, (tag, stt) in zip(cols, list(sessions.items())):
+        with col:
+            label = ("● " if tag == active else "") + stt["name"]
+            if st.button(label, key=f"tab_{tag}", use_container_width=True):
+                if tag != active:
+                    st.session_state.active_session = tag
+                    st.rerun()
+            # 关闭按钮（小字）：关到最后一个时自动新建。
+            if st.button("×", key=f"close_{tag}", help="关闭该对话"):
+                _close_session(tag)
+                st.rerun()
+    with cols[-1]:
+        if st.button("＋ 新建对话", key="new_session", use_container_width=True):
+            _create_session()
+            st.session_state.active_session = list(_sessions())[-1]
+            st.rerun()
 
 
 def _main() -> None:
@@ -94,9 +142,13 @@ def _main() -> None:
         render_onboarding()
         return
 
-    service = _get_service()
-    messages = _get_messages()
-    cumulative = _get_cumulative_usage()
+    # 顶部：多会话标签页（新建 / 切换 / 关闭）；以下全部作用于 active 会话。
+    _render_session_tabs()
+
+    _stt = _active()
+    service: ChatService = _stt["service"]
+    messages: list[dict] = _stt["messages"]
+    cumulative: dict = _stt["cumulative"]
 
     # 侧栏：模型设置（expander，随时改；保存后自动重建 service）。
     with st.sidebar:
@@ -105,6 +157,10 @@ def _main() -> None:
         # 数据加载：路径（主）+ 单文件上传（辅）+ 示例数据集（可选）；
         # 加载结果进对话流（决策 3），故需传入 messages。
         render_data_loader(service, messages)
+        # 该会话加载数据集后，标签名自动改为数据集名（多会话时便于辨识）。
+        ds_id = service.context.dataset_id
+        if ds_id and _stt.get("name", "").startswith("对话 "):
+            _stt["name"] = f"{ds_id[:18]}…" if len(ds_id) > 18 else ds_id
 
     # 侧栏：Token 统计（本轮 + 会话累计；刷新页面重置属正常，不持久化）。
     with st.sidebar:
@@ -148,7 +204,7 @@ def _main() -> None:
         st.subheader("对话")
         # 聊天记录独立滚动容器：回顾历史时输入框不跟随滚动。
         chat_container = st.container(height=_SCROLL_HEIGHT)
-        editing_index = _get_editing_index()
+        editing_index = _stt.get("editing_index")
         with chat_container:
             # 渲染历史消息（新消息在容器底部，配合滚动锚定自动贴底）。
             for i, msg in enumerate(messages):
@@ -165,7 +221,7 @@ def _main() -> None:
                                             type="primary")
                         do_cancel = c2.button("取消", key=f"edit_cancel_{i}")
                         if do_cancel:
-                            st.session_state.editing_index = None
+                            _stt["editing_index"] = None
                             st.rerun()
                         if do_save and new_text.strip():
                             # 语义核心：截断 agent 历史到该轮之前（bot 上下文
@@ -174,7 +230,7 @@ def _main() -> None:
                             messages[:] = messages[:i] + [
                                 {"role": "user", "content": new_text.strip()}
                             ]
-                            st.session_state.editing_index = None
+                            _stt["editing_index"] = None
                             with st.spinner("重新生成回答……"):
                                 turn = service.reply(new_text.strip())
                             messages.append(
@@ -197,7 +253,7 @@ def _main() -> None:
                         if msg["role"] == "user" and i == len(messages) - 1:
                             if st.button("✏️ 编辑", key=f"edit_btn_{i}",
                                          help="修改并重新发送，之后的回答将重新生成"):
-                                st.session_state.editing_index = i
+                                _stt["editing_index"] = i
                                 st.rerun()
                         # 助手回复下方附工具轨迹（可折叠）。
                         if msg["role"] == "assistant" and msg.get("turn"):
@@ -238,7 +294,7 @@ def _main() -> None:
             tab_charts, tab_findings, tab_overview = st.tabs(
                 ["图表", "Findings/报告", "数据概况"]
             )
-            findings = service.context.findings if "service" in st.session_state else []
+            findings = service.context.findings
 
             with tab_charts:
                 render_charts(findings)

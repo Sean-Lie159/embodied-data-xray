@@ -264,3 +264,88 @@ def test_merge_preserves_other_sessions_entries(tmp_path: Path) -> None:
     streams = load_profile(out)["datasets"]["ds"]["streams"]
     assert set(streams) == {"x.csv", "y.csv"}
     assert streams["x.csv"]["source"] == "user_confirmed"
+
+# --- 5. UI 多会话（AppTest：新建 / 切换 / 关闭 / 状态保留）-------------------
+
+
+def _app():
+    from pathlib import Path as _P
+
+    from streamlit.testing.v1 import AppTest
+
+    return AppTest.from_file(
+        str(_P(__file__).resolve().parents[1] / "streamlit_app.py"),
+        default_timeout=20,
+    )
+
+
+def test_ui_creates_one_session_by_default() -> None:
+    """首次打开自动创建一个会话（保证始终有 active 会话）。"""
+    at = _app()
+    at.run()
+    assert not at.exception
+    assert len(at.session_state.sessions) == 1
+    assert at.session_state.active_session in at.session_state.sessions
+
+
+def test_ui_new_session_button_adds_session() -> None:
+    """点"＋ 新建对话" → 会话数 +1 且新会话为 active、messages 为空。"""
+    at = _app()
+    at.run()
+    before = len(at.session_state.sessions)
+    btn = [b for b in at.button if b.key == "new_session"][0]
+    btn.click().run()
+    assert not at.exception
+    assert len(at.session_state.sessions) == before + 1
+    active = at.session_state.active_session
+    assert at.session_state.sessions[active]["messages"] == []
+
+
+def test_ui_switch_session_preserves_state() -> None:
+    """切换标签页：各会话状态独立保留（切换后 messages 仍属于各自会话）。"""
+    at = _app()
+    at.run()
+    first = at.session_state.active_session
+    # 给第一个会话塞一条消息（模拟已对话）。
+    at.session_state.sessions[first]["messages"] = [
+        {"role": "user", "content": "会话1的消息"}]
+    # 新建并切到第二个。
+    [b for b in at.button if b.key == "new_session"][0].click().run()
+    second = at.session_state.active_session
+    assert second != first
+    assert at.session_state.sessions[second]["messages"] == []
+    # 切回第一个：消息仍在（状态保留）。
+    [b for b in at.button if b.key == f"tab_{first}"][0].click().run()
+    assert at.session_state.active_session == first
+    assert at.session_state.sessions[first]["messages"][0]["content"] == "会话1的消息"
+
+
+def test_ui_close_session_removes_it() -> None:
+    """关闭会话：会话数 -1；关到最后一个时自动新建（始终有会话）。"""
+    at = _app()
+    at.run()
+    [b for b in at.button if b.key == "new_session"][0].click().run()
+    assert len(at.session_state.sessions) == 2
+    target = list(at.session_state.sessions)[0]
+    [b for b in at.button if b.key == f"close_{target}"][0].click().run()
+    assert not at.exception
+    assert len(at.session_state.sessions) == 1
+    # 关掉最后一个 → 自动新建。
+    last = list(at.session_state.sessions)[0]
+    [b for b in at.button if b.key == f"close_{last}"][0].click().run()
+    assert len(at.session_state.sessions) == 1
+
+
+def test_ui_sessions_have_independent_services() -> None:
+    """两会话各有独立 ChatService 与 RunContext（数据集互不干扰）。"""
+    at = _app()
+    at.run()
+    [b for b in at.button if b.key == "new_session"][0].click().run()
+    sessions = at.session_state.sessions
+    services = [s["service"] for s in sessions.values()]
+    assert len(services) == 2
+    assert services[0] is not services[1]
+    assert services[0].context is not services[1].context
+    # 会话标识不同 → 输出文件名不冲突。
+    tags = {s["service"].context.session_tag for s in sessions.values()}
+    assert len(tags) == 2
