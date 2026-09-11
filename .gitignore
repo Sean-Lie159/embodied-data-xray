@@ -8,8 +8,10 @@ reference/
 # 数据不进仓库
 data/
 
-# Agent 生成的图表与报告
-outputs/
+# Agent 生成的图表与报告。用 outputs/* 而非 outputs/ —— 只有前者能配合
+# 下面的 ! 规则豁免目录内的说明文件（git 不会 re-include 被忽略目录内的文件）。
+outputs/*
+!outputs/README.md
 
 # Python
 __pycache__/

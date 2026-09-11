@@ -54,6 +54,27 @@ streamlit run streamlit_app.py      # 或 Streamlit 图形界面
 
 也可以用脚本直接生成示例数据集：`python scripts/make_sample_dataset.py`。
 
+### 产物在哪里
+
+Agent 生成的图表与报告都在项目根目录的 `outputs/` 下，**按数据集分子目录**便于
+查找与清理：
+
+```
+outputs/
+└── by_dataset/<数据集名-短哈希>/
+    ├── charts/      # 图表 png
+    ├── reports/     # Markdown 报告
+    └── profile.json # 该数据集的语义确认画像（跨会话生效）
+```
+
+`outputs/` 已被 `.gitignore` 排除（不进仓库），可随时整个删除。子目录名的
+6 位短哈希用于避免两个不同的长数据集名落到同一目录。文件名前的
+`s-xxxx_` 前缀是会话标识——多个对话分析同一数据集时靠它避免产物互相覆盖。
+详见 `outputs/README.md`。
+
+> 早期版本把产物平铺在 `outputs/` 根目录、确认画像集中在单个
+> `.dataset_profile.json`；升级后旧画像会在首次读取时自动迁移到新位置。
+
 ## 支持的数据布局清单
 
 当前**已验证**的数据布局（每种布局的结构骨架已固化为回归测试）：
