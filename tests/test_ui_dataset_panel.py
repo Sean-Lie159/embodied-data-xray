@@ -68,31 +68,63 @@ def test_panel_renders_all_segments(tmp_path) -> None:
 
 
 def test_quality_not_checked_vs_no_warning(tmp_path) -> None:
-    """措辞区分"未检查"与"无问题"（防误导为"没问题"）。"""
-    # 未检查：qc 为空。
+    """措辞与**色块**都区分"未检查"与"无问题"（防误导为"没问题"）。
+
+    V4 起三种状态用不同原生色块（docs/UI视觉优化设计.md 3.3）：
+    未检查 → st.info；已检查无告警 → st.success；有告警 → st.warning。
+    """
+    # 未检查：qc 为空 → info，且**不出现** success（不得暗示"没问题"）。
     at = _run_panel(tmp_path, _base_summary(qc={}))
     assert not at.exception
-    caps = " ".join(c.value for c in at.caption)
-    assert "尚未执行" in caps
+    infos = " ".join(i.value for i in at.info)
+    assert "尚未执行" in infos
+    assert not [s for s in at.success if "无单位告警" in s.value]
 
-    # 已检查无告警。
+    # 已检查无告警 → success。
     qc = {"check_temporal_sync": {"result": "pass", "detail": {
         "unit_warnings": [], "clock_conflicts": []}}}
     at2 = _run_panel(tmp_path, _base_summary(qc=qc))
     assert not at2.exception
-    caps2 = " ".join(c.value for c in at2.caption)
-    assert "无单位告警" in caps2
+    succ = " ".join(s.value for s in at2.success)
+    assert "无单位告警" in succ
 
 
 def test_unit_warnings_shown(tmp_path) -> None:
-    """有单位告警时出现告警文案与展开清单。"""
+    """有单位告警时出现 warning 色块与展开清单（三态互斥）。"""
     qc = {"check_temporal_sync": {"result": "warn", "detail": {
         "unit_warnings": ["流 a.csv：时间戳单位未知", "流 b.csv：时间戳单位未知"],
         "clock_conflicts": []}}}
     at = _run_panel(tmp_path, _base_summary(qc=qc))
     assert not at.exception
-    caps = " ".join(c.value for c in at.caption)
-    assert "2 条流时间戳单位未知" in caps
+    warns = " ".join(w.value for w in at.warning)
+    assert "2 条流时间戳单位未知" in warns
+    # 互斥：有告警时不应同时出现"无单位告警"的 success。
+    assert not [s for s in at.success if "无单位告警" in s.value]
+
+
+def test_quality_states_are_mutually_exclusive(tmp_path) -> None:
+    """三态互斥：未检查(info) / 无告警(success) / 有告警(warning) 各只出现一个。"""
+    # 未检查：有 info，无 success/warning（关于质量的）。
+    at = _run_panel(tmp_path, _base_summary(qc={}))
+    assert any("尚未执行" in i.value for i in at.info)
+    assert not [s for s in at.success if "告警" in s.value]
+    assert not [w for w in at.warning if "告警" in w.value or "单位" in w.value]
+
+    # 无告警：有 success，无 warning。
+    qc_ok = {"check_temporal_sync": {"result": "pass",
+                                     "detail": {"unit_warnings": [],
+                                                "clock_conflicts": []}}}
+    at2 = _run_panel(tmp_path, _base_summary(qc=qc_ok))
+    assert any("无单位告警" in s.value for s in at2.success)
+    assert not [w for w in at2.warning if "单位" in w.value]
+
+    # 有告警：有 warning，无"无单位告警"success。
+    qc_bad = {"check_temporal_sync": {"result": "warn",
+                                      "detail": {"unit_warnings": ["x"],
+                                                 "clock_conflicts": []}}}
+    at3 = _run_panel(tmp_path, _base_summary(qc=qc_bad))
+    assert any("单位未知" in w.value for w in at3.warning)
+    assert not [s for s in at3.success if "无单位告警" in s.value]
 
 
 def test_main_table_truncation_warning(tmp_path) -> None:

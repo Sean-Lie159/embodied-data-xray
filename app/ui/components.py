@@ -299,10 +299,12 @@ def _render_semantic_progress(streams: list[dict], qc_state: dict | None) -> Non
         classified = sum(1 for s in streams if _is_classified(s))
     unclassified = max(0, n - classified)
 
+    # 状态用原生语义色块承载（docs/UI视觉优化设计.md 3.3）：
+    # 全部已分类 → success（绿）；有未分类 → warning（黄）。不用 emoji 符号。
     if classified == n and n > 0:
-        st.caption(f"{classified}/{n} 条流已分类 ✓")
+        st.success(f"{classified}/{n} 条流已分类")
     else:
-        st.caption(f"{classified}/{n} 条流已分类 · {unclassified} 条未分类 ⚠️")
+        st.warning(f"{classified}/{n} 条流已分类 · {unclassified} 条未分类")
     hint = (qc_state or {}).get("unclassified_hint")
     if hint:
         st.caption("建议：让 Agent 批量提交语义假设并确认（一次确认，跨会话生效）。")
@@ -336,28 +338,30 @@ def _render_quality_warnings(qc: dict) -> None:
     """[3] 数据质量告警段（单位未知 / 时钟形态矛盾）。
 
     **措辞区分"未检查"与"无问题"**（docs/数据集状态面板设计.md 5 节）：
-    未执行时间同步检查时不渲染本段（并明确说"尚未检查"），绝不暗示"没问题"。
+    三种状态互斥且用**不同的原生色块**承载（docs/UI视觉优化设计.md 3.3）——
+    未检查 → ``st.info``（蓝，中性）；已检查无告警 → ``st.success``（绿）；
+    有告警 → ``st.warning``（黄）。绝不把"没查"渲染成"没问题"。
     """
     sync = (qc or {}).get("check_temporal_sync")
     if not sync:
         st.markdown("**数据质量告警**")
-        st.caption("尚未执行时间同步检查（如需请让 Agent 检查时间同步）。")
+        st.info("尚未执行时间同步检查（如需请让 Agent 检查时间同步）。")
         return
     detail = sync.get("detail", {})
     unit_warnings = detail.get("unit_warnings") or []
     clock_conflicts = detail.get("clock_conflicts") or []
     if not unit_warnings and not clock_conflicts:
         st.markdown("**数据质量告警**")
-        st.caption("已执行时间同步检查，无单位告警。")
+        st.success("已执行时间同步检查，无单位告警。")
         return
     st.markdown("**数据质量告警**")
     if unit_warnings:
-        st.caption(f"⚠️ {len(unit_warnings)} 条流时间戳单位未知（不参与跨流对齐）")
+        st.warning(f"{len(unit_warnings)} 条流时间戳单位未知（不参与跨流对齐）")
         with st.expander("查看单位未知的流", expanded=False):
             for w in unit_warnings:
                 st.markdown(f"- {w}")
     if clock_conflicts:
-        st.caption(f"⚠️ {len(clock_conflicts)} 条流疑似时钟形态矛盾")
+        st.warning(f"{len(clock_conflicts)} 条流疑似时钟形态矛盾")
         with st.expander("查看时钟矛盾的流", expanded=False):
             for c in clock_conflicts:
                 st.markdown(f"- {c}")
@@ -412,29 +416,32 @@ def render_dataset_overview(summary: dict[str, Any]) -> None:
 
     if streams:
         st.divider()
-        st.markdown("**流清单**")
-        # 视频 fps 映射（ffprobe 实测），供视频流展示帧率而非"未知"。
-        fps_by_file = summary.get("video_fps_by_file") or {}
-        rows = []
-        for s in streams:
-            path = s.get("path", "")
-            name = Path(path).name if path else "(main)"
-            role = (s.get("role") or {}).get("role", s.get("kind", "?"))
-            mr = s.get("measured_rate")
-            rate = (mr or {}).get("sample_rate_hz") if isinstance(mr, dict) else None
-            if rate is not None:
-                rate_str = f"{rate} Hz"
-            elif path in fps_by_file:
-                rate_str = f"{fps_by_file[path]} fps（视频）"
-            else:
-                rate_str = "未知"
-            # 语义标签与来源（新增两列，来源于已有流登记表字段）。
-            label = s.get("semantic_label") or s.get("kind") or "未分类"
-            source_raw = s.get("label_source")
-            source = _LABEL_SOURCE_TEXT.get(source_raw, source_raw or "自动识别")
-            rows.append({"流": name, "角色": role, "采样率": rate_str,
-                         "语义标签": label, "来源": source})
-        st.table(rows)
+        # 流清单是最长的内容块：用描边卡片包一层，使长表格有明确边界
+        # （docs/UI视觉优化设计.md 3.1 右栏部分）。
+        with st.container(border=True):
+            st.markdown("**流清单**")
+            # 视频 fps 映射（ffprobe 实测），供视频流展示帧率而非"未知"。
+            fps_by_file = summary.get("video_fps_by_file") or {}
+            rows = []
+            for s in streams:
+                path = s.get("path", "")
+                name = Path(path).name if path else "(main)"
+                role = (s.get("role") or {}).get("role", s.get("kind", "?"))
+                mr = s.get("measured_rate")
+                rate = (mr or {}).get("sample_rate_hz") if isinstance(mr, dict) else None
+                if rate is not None:
+                    rate_str = f"{rate} Hz"
+                elif path in fps_by_file:
+                    rate_str = f"{fps_by_file[path]} fps（视频）"
+                else:
+                    rate_str = "未知"
+                # 语义标签与来源（新增两列，来源于已有流登记表字段）。
+                label = s.get("semantic_label") or s.get("kind") or "未分类"
+                source_raw = s.get("label_source")
+                source = _LABEL_SOURCE_TEXT.get(source_raw, source_raw or "自动识别")
+                rows.append({"流": name, "角色": role, "采样率": rate_str,
+                             "语义标签": label, "来源": source})
+            st.table(rows)
 
     main_table = summary.get("main_table") or {}
     if main_table:

@@ -335,13 +335,18 @@ def _main() -> None:
     messages: list[dict] = _stt["messages"]
     cumulative: dict = _stt["cumulative"]
 
-    # 侧栏：模型设置（expander，随时改；保存后自动重建 service）。
+    # 侧栏四块用描边卡片分隔（docs/UI视觉优化设计.md 3.1）：
+    # 卡片描边本身即边界，故不再用 st.divider() 串联（减噪）。
+    # 描边在深浅两套主题下自动跟随 borderColor，无需额外适配。
     with st.sidebar:
-        render_model_settings()
-        st.divider()
-        # 数据加载：路径（主）+ 单文件上传（辅）+ 示例数据集（可选）；
+        # [卡片 1] 模型设置（expander，随时改；保存后自动重建 service）。
+        with st.container(border=True):
+            render_model_settings()
+
+        # [卡片 2] 数据加载：路径（主）+ 单文件上传（辅）+ 示例数据集（可选）；
         # 加载结果进对话流（决策 3），故需传入 messages。
-        render_data_loader(service, messages)
+        with st.container(border=True):
+            render_data_loader(service, messages)
         # 该会话加载数据集后，标签名自动改为数据集名（多会话时便于辨识）。
         ds_id = service.context.dataset_id
         if ds_id and _stt.get("name", "").startswith("对话 "):
@@ -350,36 +355,36 @@ def _main() -> None:
                 if len(ds_id) > SESSION_LABEL_MAX_CHARS else ds_id
             )
 
-    # 侧栏：Token 统计（本轮 + 会话累计；刷新页面重置属正常，不持久化）。
-    with st.sidebar:
+        # [卡片 3] Token 统计（本轮 + 会话累计；刷新页面重置属正常，不持久化）。
         last = _last_turn(messages)
-        render_token_stats(last.usage if last is not None else None, cumulative)
+        with st.container(border=True):
+            render_token_stats(last.usage if last is not None else None, cumulative)
 
-        # 上下文管理：历史体积 + 手动压缩（对应"二者皆做"的手动入口）。
-        st.divider()
-        st.caption("上下文管理")
-        stats = service.history_stats()
-        st.write(
-            f"历史：约 {stats['turns']} 轮 · 估算 {stats['estimated_tokens']:,} token"
-        )
-        last_c = stats.get("last_compaction")
-        if last_c:
-            st.caption(
-                f"上次压缩：{last_c['compacted_outputs']} 条 · "
-                f"{last_c['before_tokens']:,} → {last_c['after_tokens']:,} token"
-                f"（省约 {last_c['saved_tokens']:,}）"
+        # [卡片 4] 上下文管理：历史体积 + 手动压缩（"二者皆做"的手动入口）。
+        with st.container(border=True):
+            st.markdown("**上下文管理**")
+            stats = service.history_stats()
+            st.write(
+                f"历史：约 {stats['turns']} 轮 · 估算 {stats['estimated_tokens']:,} token"
             )
-        if st.button("压缩历史", help="把较早轮次的工具返回明细压缩为结论摘要"):
-            if not service.history_input:
-                st.info("历史为空，无需压缩。")
-            else:
-                r = service.compact_now()
-                st.success(
-                    f"已压缩 {r['compacted_outputs']} 条旧工具返回（保留最近 "
-                    f"{r['kept_turns']} 轮完整）：{r['before_tokens']:,} → "
-                    f"{r['after_tokens']:,} token（省约 {r['saved_tokens']:,}）"
+            last_c = stats.get("last_compaction")
+            if last_c:
+                st.caption(
+                    f"上次压缩：{last_c['compacted_outputs']} 条 · "
+                    f"{last_c['before_tokens']:,} → {last_c['after_tokens']:,} token"
+                    f"（省约 {last_c['saved_tokens']:,}）"
                 )
-                st.rerun()
+            if st.button("压缩历史", help="把较早轮次的工具返回明细压缩为结论摘要"):
+                if not service.history_input:
+                    st.info("历史为空，无需压缩。")
+                else:
+                    r = service.compact_now()
+                    st.success(
+                        f"已压缩 {r['compacted_outputs']} 条旧工具返回（保留最近 "
+                        f"{r['kept_turns']} 轮完整）：{r['before_tokens']:,} → "
+                        f"{r['after_tokens']:,} token（省约 {r['saved_tokens']:,}）"
+                    )
+                    st.rerun()
 
     left, right = st.columns(list(COLUMN_RATIO), gap="large")
 
