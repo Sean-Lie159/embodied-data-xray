@@ -51,15 +51,18 @@ def _find_timestamp_col(df: pd.DataFrame) -> str | None:
 
 
 def _output_path(context: RunContext, chart_type: str) -> Path:
-    """构造输出文件路径：outputs/<dataset>_<chart_type>_<timestamp>.png。"""
-    base = Path(context.output_dir) if context.output_dir else Path("outputs")
-    base.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    from app.tools._data_access import output_prefix
+    """构造输出文件路径：outputs/by_dataset/<数据集>/charts/<...>.png。
 
+    子目录归类见 docs/UI优化总纲与输出目录改造设计.md 第 3 节；文件名规则不变
+    （仍含 session_tag 前缀与 dataset_id），多会话输出隔离契约零改动。
+    """
+    from app.tools._data_access import output_prefix
+    from app.tools.output_paths import chart_dir
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
     name = (f"{output_prefix(context)}{context.dataset_id or 'dataset'}"
             f"_{chart_type}_{ts}.png")
-    return base / name
+    return chart_dir(context.output_dir or "outputs", context.dataset_id) / name
 
 
 def _save_fig(fig, path: Path) -> None:
