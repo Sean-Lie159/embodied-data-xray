@@ -181,6 +181,60 @@ def _run_agent_turn(service, prompt: str, placeholder) -> ChatTurn:
     return final_turn
 
 
+def _is_failed(turn) -> bool:
+    """该轮是否未正常完成（模型 API 异常或撞 max_turns）。"""
+    m = getattr(turn, "metrics", None) or {}
+    return m.get("completed") is False
+
+
+def _error_kind(turn) -> str | None:
+    """该轮失败类别（None 表示正常）。"""
+    m = getattr(turn, "metrics", None) or {}
+    return m.get("error_kind")
+
+
+def _retry_turn(service, messages: list[dict], cumulative: dict, user_idx: int) -> None:
+    """重试第 user_idx 条用户消息对应的一轮（**替换而非追加**，见设计 2.3）。
+
+    语义（避免消息与历史重复的关键）：
+    1. agent 历史回退到本轮之前（同输入不在历史中重复）——复用编辑重发的方法；
+    2. messages 截断到该用户消息之后（丢弃失败的 assistant 消息）；
+    3. 用原文本重新执行；成功后经 _record_turn 追加新的 assistant 消息。
+
+    Args:
+        service: 当前会话 ChatService。
+        messages: 会话消息列表（就地修改）。
+        cumulative: 会话语义统计（就地修改）。
+        user_idx: 该用户消息在 messages 中的下标。
+    """
+    user_text = messages[user_idx]["content"]
+    service.truncate_history_to_turn(user_idx)
+    del messages[user_idx + 1:]
+    placeholder = st.empty()
+    turn = _run_agent_turn(service, user_text, placeholder)
+    _record_turn(cumulative, turn, messages)
+
+
+def _render_failure_actions(service, messages: list[dict], cumulative: dict,
+                            user_idx: int, turn) -> None:
+    """失败轮的操作区：重试本轮（+ 上下文超限时"压缩历史并重试"）。
+
+    仅在**最后一轮**失败时由调用方渲染（重试语义要求其后无对话）。
+    """
+    kind = _error_kind(turn)
+    st.warning("本轮未完成，可直接重试。")
+    cols = st.columns(2)
+    if kind == "context_overflow":
+        if cols[0].button("压缩历史并重试", key=f"retry_compact_{user_idx}",
+                          type="primary"):
+            service.compact_now()
+            _retry_turn(service, messages, cumulative, user_idx)
+            st.rerun()
+    if cols[1].button("🔁 重试本轮", key=f"retry_{user_idx}"):
+        _retry_turn(service, messages, cumulative, user_idx)
+        st.rerun()
+
+
 def _record_turn(cumulative: dict, turn, messages: list[dict]) -> None:
     """把一轮结果记入会话统计与消息列表（token / 轮数 / 耗时 / 往返次数）。
 
@@ -351,6 +405,10 @@ def _main() -> None:
                             st.rerun()
                 else:
                     with st.chat_message(msg["role"]):
+                        # 失败轮先给醒目标记（滚历史时一眼可辨，见设计 2.1）。
+                        if (msg["role"] == "assistant" and msg.get("turn")
+                                and _is_failed(msg["turn"])):
+                            st.caption("⚠️ 本轮未完成")
                         st.markdown(msg["content"])
                         # 用户消息旁的编辑入口（最近一条才显示，避免历史深处
                         # 编辑造成大面积重生成；与主流对话 UI 一致）。
@@ -359,6 +417,13 @@ def _main() -> None:
                                          help="修改并重新发送，之后的回答将重新生成"):
                                 _stt["editing_index"] = i
                                 st.rerun()
+                        # 失败轮的恢复入口：仅最后一轮失败时显示（重试要求其后
+                        # 无对话；该 assistant 消息的 user 消息在下标 i-1）。
+                        if (msg["role"] == "assistant" and msg.get("turn")
+                                and _is_failed(msg["turn"])
+                                and i == len(messages) - 1):
+                            _render_failure_actions(service, messages, cumulative,
+                                                    i - 1, msg["turn"])
                         # 助手回复下方附工具轨迹（可折叠）。
                         if msg["role"] == "assistant" and msg.get("turn"):
                             render_tool_activity(msg["turn"])

@@ -252,6 +252,8 @@ def test_chat_service_turn_exposes_metrics(monkeypatch) -> None:
     turn = svc.reply("你好")
     assert turn.metrics is not None
     assert set(turn.metrics) == {
-        "duration_ms", "n_model_calls", "n_tool_calls", "completed"}
+        "duration_ms", "n_model_calls", "n_tool_calls", "completed",
+        "error_kind"}  # error_kind 为 2026-09-11 新增（供 UI 精确重试入口）
     assert turn.metrics["completed"] is False
+    assert turn.metrics["error_kind"] == "api"  # 502 归类为 api
     assert turn.usage is None

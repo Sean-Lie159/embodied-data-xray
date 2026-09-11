@@ -316,7 +316,11 @@ class ChatService:
                 "n_model_calls": metrics.n_model_calls,
                 "n_tool_calls": metrics.n_tool_calls,
                 "completed": metrics.completed,
+                "error_kind": metrics.error_kind,
             },
+            # 非流式路径：失败时最终正文本身即为友好提示，error 只做标记
+            # （UI 据此渲染"本轮未完成"与重试入口）。
+            error=None if metrics.completed else "本轮未正常完成。",
         )
 
     def reply_stream(self, user_input: str) -> "Iterator[StreamChunk]":
@@ -424,6 +428,7 @@ class ChatService:
                 "n_model_calls": metrics.n_model_calls,
                 "n_tool_calls": metrics.n_tool_calls,
                 "completed": metrics.completed,
+                "error_kind": metrics.error_kind,
             },
             error=done_event.error,
         )

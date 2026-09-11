@@ -38,12 +38,16 @@ class RunMetrics:
         n_tool_calls: 本轮 SDK 报告的工具调用次数（result 为 None 时无法获取，
             回填 0）。
         completed: 是否正常完成（False 表示撞 max_turns 或模型 API 异常）。
+        error_kind: 失败类别（None 表示正常）；用于 UI 精确渲染与恢复入口——
+            ``"context_overflow"`` 时提供"压缩历史并重试"，``"max_turns"`` 与
+            ``"api"`` 提供"重试本轮"。新增可选字段，缺省 None（零回归）。
     """
 
     duration_ms: int = 0
     n_model_calls: int = 0
     n_tool_calls: int = 0
     completed: bool = True
+    error_kind: str | None = None
 
 
 def _extract_raw_usage(result: RunResult | None) -> Any:
@@ -293,6 +297,20 @@ def guard_tools(tools: list[Any], *, budget_tokens: int) -> list[Any]:
     return guarded
 
 
+def classify_model_error(exc: BaseException) -> str:
+    """把模型/运行异常归类，供 UI 精确渲染恢复入口（与 _describe_model_error 同判据）。
+
+    Returns:
+        "context_overflow"（上下文超限，建议压缩历史后重试）/ "api"（其它模型侧
+        故障，建议直接重试）。
+    """
+    text = str(exc).lower()
+    if "context" in text and ("length" in text or "too long" in text
+                              or "maximum" in text):
+        return "context_overflow"
+    return "api"
+
+
 def _describe_model_error(exc: BaseException) -> str:
     """把模型 API 异常转成**可读的中文提示**（含重试建议）。
 
@@ -494,6 +512,7 @@ async def run_turn(
         )
         # 撞上限说明轮数已到 max_turns：按已知轮数回填（供 UI 显示"跑了多久"）。
         _m.n_model_calls = max(_m.n_model_calls, max_turns)
+        _m.error_kind = "max_turns"
         return _finish(
             (msg, _fallback_input(history_input, user_input), None),
             n_tool_calls=0, completed=False,
@@ -502,6 +521,7 @@ async def run_turn(
         # 键盘中断/系统退出不吞（用户主动中断应正常传播）。
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
+        _m.error_kind = classify_model_error(exc)
         return _finish(
             (_describe_model_error(exc),
              _fallback_input(history_input, user_input), None),
@@ -703,6 +723,7 @@ async def stream_turn(
         _m.n_model_calls = max(_m.n_model_calls, max_turns)
         _m.n_tool_calls = 0
         _m.completed = False
+        _m.error_kind = "max_turns"
         msg = (
             f"本轮工具调用次数已达上限（max_turns={max_turns}），为避免死循环已停止。"
             + "请尝试更明确地描述需求，或分步提问。"
@@ -717,6 +738,7 @@ async def stream_turn(
         # 不丢已展示内容（诚实降级）。
         _m.duration_ms = int((time.perf_counter() - _t0) * 1000)
         _m.completed = False
+        _m.error_kind = classify_model_error(exc)
         yield TurnEvent(kind="done", final=acc, error=_describe_model_error(exc),
                         next_input=_fallback_input(history_input, user_input))
         return
