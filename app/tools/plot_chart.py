@@ -31,9 +31,50 @@ from agents.decorators import tool  # noqa: E402
 
 from app.agent.context import RunContext  # noqa: E402
 from app.tools import _data_access, _sniffing  # noqa: E402
+from app.visual_theme import CHART_COLORS, CHART_GRID, CHART_INK  # noqa: E402
 
 # 常见时间戳列名（复用约定）。
 _TIMESTAMP_COLS = ("timestamp", "time", "ts", "ts_ns", "t", "stamp", "frame_time")
+
+
+def _apply_chart_theme() -> None:
+    """应用统一图表风格（docs/UI视觉优化设计.md 5.1）。
+
+    要点：
+    - **透明底**（figure/axes/savefig）——图表是 png，深色页面上若为白底会呈现
+      刺眼的"白贴片"；透明底则随页面底色走，浅/深两套主题都适配；
+    - **中性灰文字**（CHART_INK）——静态图片无法随主题重绘，纯黑在深底看不清、
+      纯白在浅底看不清，故只能取中间明度（一张图同时适配两种主题）；
+    - 去上右边框 + 淡网格：减噪，主流图表风格；
+    - 配色引用 app/visual_theme.CHART_COLORS（与 Streamlit 主题的
+      chartCategoricalColors 同一份值，有单测断言）。
+
+    在模块导入时调用一次（rcParams 是全局状态；本项目全部图表都在本模块绘制，
+    影响面一致且更统一）。
+    """
+    matplotlib.rcParams.update({
+        "figure.facecolor": "none",
+        "axes.facecolor": "none",
+        "savefig.transparent": True,
+        "savefig.facecolor": "none",
+        "axes.edgecolor": CHART_GRID,
+        "axes.grid": True,
+        "grid.color": CHART_GRID,
+        "grid.linewidth": 0.6,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.titlesize": 12,
+        "axes.titleweight": "semibold",
+        "font.size": 10,
+        "text.color": CHART_INK,
+        "axes.labelcolor": CHART_INK,
+        "xtick.color": CHART_INK,
+        "ytick.color": CHART_INK,
+        "axes.prop_cycle": matplotlib.cycler(color=list(CHART_COLORS)),
+    })
+
+
+_apply_chart_theme()
 
 
 def _safe_title(title: str | None, fallback: str) -> str:
@@ -66,8 +107,9 @@ def _output_path(context: RunContext, chart_type: str) -> Path:
 
 
 def _save_fig(fig, path: Path) -> None:
+    """保存图表为**透明底** png（深色模式下不出现白贴片，见 _apply_chart_theme）。"""
     fig.tight_layout()
-    fig.savefig(path, dpi=100)
+    fig.savefig(path, dpi=100, transparent=True)
     plt.close(fig)
 
 
