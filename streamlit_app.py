@@ -13,7 +13,7 @@ from __future__ import annotations
 import streamlit as st
 
 from app.config.settings import is_configured
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, ChatTurn
 from app.ui.components import (
     render_charts,
     render_dataset_overview,
@@ -135,6 +135,50 @@ def _open_chart_dialog() -> None:
             st.rerun()
 
     _dialog()
+
+
+def _run_agent_turn(service, prompt: str, placeholder) -> ChatTurn:
+    """执行一轮 agent（流式或非流式），把正文渲染进 placeholder。
+
+    统一入口：流式开启时逐块更新 placeholder（首字节可见 + 工具播报），
+    关闭或异常时回退到非流式 reply()。两条路径返回的 ChatTurn 同构，
+    调用方的收尾逻辑（_record_turn）无需区分。
+
+    Args:
+        service: 当前会话的 ChatService。
+        prompt: 用户本轮输入。
+        placeholder: ``st.empty()`` 占位符（流式逐块写入正文）。
+
+    Returns:
+        本轮 ChatTurn（含 usage/metrics/error）。
+    """
+    from app.config.settings import get_settings
+    from app.ui.constants import STREAM_CURSOR
+
+    if not getattr(get_settings(), "stream_output_enabled", True):
+        # 非流式回退路径（配置关闭，或流式实现出问题时的一键回退）。
+        with st.spinner("分析中……"):
+            turn = service.reply(prompt)
+        placeholder.markdown(turn.reply)
+        return turn
+
+    acc = ""
+    final_turn = None
+    for chunk in service.reply_stream(prompt):
+        if chunk.kind == "tool":
+            # 工具播报：斜体 + 与正文区分（不阻塞后续正文写入）。
+            placeholder.markdown(f"_{chunk.text}…_")
+        elif chunk.kind == "delta":
+            acc += chunk.text
+            placeholder.markdown(acc + STREAM_CURSOR)
+        elif chunk.kind == "final":
+            final_turn = chunk.turn
+    if final_turn is None:
+        # 理论上不会发生（reply_stream 必 yield final）；兜底为空轮。
+        final_turn = service.reply(prompt)
+    # 收尾：去掉光标；失败轮保留已产出的部分正文（诚实降级）。
+    placeholder.markdown(final_turn.reply)
+    return final_turn
 
 
 def _record_turn(cumulative: dict, turn, messages: list[dict]) -> None:
@@ -300,8 +344,9 @@ def _main() -> None:
                                 {"role": "user", "content": new_text.strip()}
                             ]
                             _stt["editing_index"] = None
-                            with st.spinner("重新生成回答……"):
-                                turn = service.reply(new_text.strip())
+                            placeholder = st.empty()
+                            turn = _run_agent_turn(service, new_text.strip(),
+                                                   placeholder)
                             _record_turn(cumulative, turn, messages)
                             st.rerun()
                 else:
@@ -333,9 +378,8 @@ def _main() -> None:
 
                 # 只有新输入才调用 agent（页面重跑时 prompt 为空，不触发）。
                 with st.chat_message("assistant"):
-                    with st.spinner("分析中……"):
-                        turn = service.reply(prompt)
-                    st.markdown(turn.reply)
+                    placeholder = st.empty()
+                    turn = _run_agent_turn(service, prompt, placeholder)
                     render_tool_activity(turn)
 
             # 累计本轮统计并追加 assistant 消息（集中入口，防漏加）。

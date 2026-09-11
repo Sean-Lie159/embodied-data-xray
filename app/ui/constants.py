@@ -23,3 +23,6 @@ SESSION_LABEL_MAX_CHARS = 18
 
 # 左右栏宽度比（左：对话，右：展示区）。
 COLUMN_RATIO = (1, 1.2)
+
+# 流式输出时正文末尾的光标字符（视觉提示"还在生成中"，收尾时去掉）。
+STREAM_CURSOR = "▌"

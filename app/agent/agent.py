@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Any, cast
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, cast
 
 from agents import Agent, Model, ModelSettings, Runner, RunResult, Tool
 from agents.exceptions import MaxTurnsExceeded
@@ -361,6 +361,61 @@ def _describe_model_error(exc: BaseException) -> str:
     )
 
 
+def _maybe_compact_history(
+    context: RunContext,
+    history_input: list[TResponseInputItem] | None,
+    *,
+    history_budget_tokens: int | None,
+    history_keep_recent_turns: int | None,
+) -> list[TResponseInputItem] | None:
+    """第 3 层防御：历史压缩（在送给模型之前拦截）。
+
+    run_turn 与 stream_turn 共用的前置步骤（抽公共函数避免两套实现漂移）。
+    """
+    budget = (
+        _DEFAULT_HISTORY_BUDGET_TOKENS
+        if history_budget_tokens is None else max(0, int(history_budget_tokens))
+    )
+    keep_recent = (
+        _DEFAULT_HISTORY_KEEP_RECENT_TURNS
+        if history_keep_recent_turns is None
+        else max(1, int(history_keep_recent_turns))
+    )
+    if history_input is not None and budget > 0:
+        from app.agent.history_compaction import (
+            compact_history,
+            estimate_history_tokens,
+        )
+
+        if estimate_history_tokens(history_input) > budget:
+            history_input, _stats = compact_history(
+                history_input, keep_recent_turns=keep_recent
+            )
+            context.last_compaction = _stats
+    return history_input
+
+
+def _build_input_items(
+    history_input: list[TResponseInputItem] | None, user_input: str
+) -> list[TResponseInputItem] | str:
+    """组装本轮输入：有历史时拼接，否则仅用户消息。"""
+    if history_input is not None:
+        user_msg: TResponseInputItem = {"role": "user", "content": user_input}
+        return [*history_input, user_msg]
+    return user_input
+
+
+def _fallback_input(
+    history_input: list[TResponseInputItem] | None, user_input: str
+) -> list[TResponseInputItem]:
+    """异常/超限分支的历史：**必须含本轮用户消息**。
+
+    否则用户"直接重发"时本轮问题不在上下文里（模型看不到上一句，回答脱节）。
+    成功分支由 SDK 的 to_input_list 自然包含本轮消息。
+    """
+    return [*(history_input or []), {"role": "user", "content": user_input}]
+
+
 async def run_turn(
     agent: Agent[RunContext],
     context: RunContext,
@@ -411,33 +466,14 @@ async def run_turn(
 
     # 第 3 层防御：历史压缩。**在送给模型之前**拦截（不是爆了再压）——
     # 历史超阈值即把旧轮次的工具返回原文压缩为结论摘要。
-    budget = (
-        _DEFAULT_HISTORY_BUDGET_TOKENS
-        if history_budget_tokens is None else max(0, int(history_budget_tokens))
+    history_input = _maybe_compact_history(
+        context, history_input,
+        history_budget_tokens=history_budget_tokens,
+        history_keep_recent_turns=history_keep_recent_turns,
     )
-    keep_recent = (
-        _DEFAULT_HISTORY_KEEP_RECENT_TURNS
-        if history_keep_recent_turns is None
-        else max(1, int(history_keep_recent_turns))
-    )
-    if history_input is not None and budget > 0:
-        from app.agent.history_compaction import (
-            compact_history,
-            estimate_history_tokens,
-        )
-
-        if estimate_history_tokens(history_input) > budget:
-            history_input, _stats = compact_history(
-                history_input, keep_recent_turns=keep_recent
-            )
-            context.last_compaction = _stats
 
     # 组装本轮输入：有历史时，把历史与用户本轮消息拼接；否则仅用用户消息。
-    if history_input is not None:
-        user_msg: TResponseInputItem = {"role": "user", "content": user_input}
-        input_items: list[TResponseInputItem] | str = [*history_input, user_msg]
-    else:
-        input_items = user_input
+    input_items = _build_input_items(history_input, user_input)
 
     # 兜底范围覆盖**模型侧故障**：不只是 MaxTurnsExceeded，还包括 502/503/504
     # （服务端错误）、限流、超时、网络不可达、鉴权失败等——此前这些会以裸异常
@@ -456,28 +492,19 @@ async def run_turn(
             f"本轮工具调用次数已达上限（max_turns={max_turns}），为避免死循环已停止。"
             + "请尝试更明确地描述需求，或分步提问。"
         )
-        # 与异常分支一致：fallback 含**本轮用户消息**（用户追问/重发时模型
-        # 能看到上一句，回答不脱节）。
-        fallback_input: list[TResponseInputItem] = [
-            *(history_input or []),
-            {"role": "user", "content": user_input},
-        ]
         # 撞上限说明轮数已到 max_turns：按已知轮数回填（供 UI 显示"跑了多久"）。
         _m.n_model_calls = max(_m.n_model_calls, max_turns)
-        return _finish((msg, fallback_input, None), n_tool_calls=0, completed=False)
+        return _finish(
+            (msg, _fallback_input(history_input, user_input), None),
+            n_tool_calls=0, completed=False,
+        )
     except BaseException as exc:  # noqa: BLE001
         # 键盘中断/系统退出不吞（用户主动中断应正常传播）。
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
-        # 兜底历史**必须含本轮用户消息**：否则用户"直接重发"时本轮问题不在
-        # 上下文里（模型看不到上一句，回答会脱节）。成功分支由 SDK 的
-        # to_input_list 自然包含本轮消息；异常分支由这里手工补上。
-        fallback_input: list[TResponseInputItem] = [
-            *(history_input or []),
-            {"role": "user", "content": user_input},
-        ]
         return _finish(
-            (_describe_model_error(exc), fallback_input, None),
+            (_describe_model_error(exc),
+             _fallback_input(history_input, user_input), None),
             n_tool_calls=0,
             completed=False,
         )
@@ -545,3 +572,162 @@ def format_tool_activity(result: RunResult | None) -> str:
         name = _extract_tool_name(item)
         lines.append(f"调用工具: {name}")
     return " → ".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 流式输出（docs/流式输出设计.md）
+# ---------------------------------------------------------------------------
+
+# 工具名 → 面向用户的功能描述（播报用）。与 SYSTEM_PROMPT 表述纪律一致：
+# 对普通用户用功能语言，不展示内部工具名与参数。
+_TOOL_FUNCTION_TEXT: dict[str, str] = {
+    "load_dataset": "正在加载数据集",
+    "profile_data": "正在生成数据概况",
+    "inspect_streams": "正在探测设备清单",
+    "check_temporal_sync": "正在检查时间同步",
+    "check_sensor_sanity": "正在检查传感器合理性",
+    "compute_stats": "正在计算统计指标",
+    "plot_chart": "正在绘图",
+    "generate_report": "正在生成报告",
+    "propose_stream_semantics": "正在验证流语义假设",
+    "unpack_mcap": "正在解包容器",
+    "align_container_streams": "正在对齐子流",
+    "inspect_video_frame": "正在抽查视频帧",
+    "compare_datasets": "正在对比数据集",
+}
+
+
+def describe_tool_call(tool_name: str) -> str:
+    """把工具名转为面向用户的进行时播报文本（未知工具降级为工具名本身）。"""
+    return _TOOL_FUNCTION_TEXT.get(tool_name, f"正在执行 {tool_name}")
+
+
+@dataclass
+class TurnEvent:
+    """流式单轮的单个事件。
+
+    kind 取值：
+    - ``"delta"``：正文增量（text 为新增片段）；
+    - ``"tool"``：工具调用播报（tool_name 为工具名，text 为功能描述）；
+    - ``"done"``：收尾（final 为完整正文，next_input/result 供下一轮与统计）。
+    """
+
+    kind: str
+    text: str = ""
+    tool_name: str = ""
+    final: str = ""
+    next_input: list[TResponseInputItem] | None = None
+    result: RunResult | None = None
+    error: str | None = None
+
+
+def _is_tool_call_item(item: Any) -> bool:
+    """判断流事件中的 item 是否为工具调用（复用 format_tool_activity 的判据）。"""
+    item_type = getattr(item, "type", "") or ""
+    class_name = type(item).__name__.lower()
+    return (
+        "tool_call" in str(item_type).lower()
+        or "toolcall" in class_name
+        or "function_call" in str(item_type).lower()
+    )
+
+
+async def stream_turn(
+    agent: Agent[RunContext],
+    context: RunContext,
+    user_input: str,
+    history_input: list[TResponseInputItem] | None = None,
+    max_turns: int = 15,
+    *,
+    history_budget_tokens: int | None = None,
+    history_keep_recent_turns: int | None = None,
+    metrics: RunMetrics | None = None,
+) -> AsyncIterator[TurnEvent]:
+    """流式执行单轮 Agent 运行（yield TurnEvent 序列，最后一项 kind="done"）。
+
+    与 :func:`run_turn` 共用历史压缩、错误兜底与 metrics 回填逻辑（抽公共私有
+    函数）；**不改 run_turn 的签名与返回契约**（零回归）。
+
+    中途失败处理（docs/流式输出设计.md 3.4）：若异常发生在已产出若干 delta 之后，
+    不再新 yield delta，转而 yield 一个 kind="done"、error 非空的事件——
+    **已输出的部分正文保留**（不突然清空），error 为可操作的中文提示。
+
+    Args:
+        agent: 主 Agent。
+        context: 运行时上下文（跨轮共享）。
+        user_input: 用户本轮输入。
+        history_input: 上一轮返回的 input 列表，首轮为 None。
+        max_turns: 单轮最大循环轮数。
+        history_budget_tokens: 历史压缩阈值（按会话传入）；None 用模块默认。
+        history_keep_recent_turns: 压缩保留的最近轮数；None 用模块默认。
+        metrics: 可选，回填本轮耗时与模型往返次数（含异常分支）。
+
+    Yields:
+        TurnEvent：若干 delta/tool 事件，最后一个为 done。
+    """
+    _t0 = time.perf_counter()
+    _m = metrics if metrics is not None else RunMetrics()
+
+    history_input = _maybe_compact_history(
+        context, history_input,
+        history_budget_tokens=history_budget_tokens,
+        history_keep_recent_turns=history_keep_recent_turns,
+    )
+    input_items = _build_input_items(history_input, user_input)
+
+    acc = ""
+    try:
+        result = Runner.run_streamed(
+            agent, input=input_items, context=context, max_turns=max_turns,
+        )
+        async for ev in result.stream_events():
+            etype = getattr(ev, "type", "") or ""
+            # 正文增量。
+            if etype == "raw_response_event":
+                data = getattr(ev, "data", None)
+                delta = getattr(data, "delta", None) if data is not None else None
+                dtype = getattr(data, "type", "") or ""
+                if isinstance(delta, str) and delta and "output_text" in str(dtype):
+                    acc += delta
+                    yield TurnEvent(kind="delta", text=delta)
+                continue
+            # 工具调用播报。
+            if etype == "run_item_stream_event":
+                item = getattr(ev, "item", None)
+                if item is not None and _is_tool_call_item(item):
+                    name = _extract_tool_name(item)
+                    yield TurnEvent(kind="tool", tool_name=name,
+                                    text=describe_tool_call(name))
+    except MaxTurnsExceeded:
+        _m.duration_ms = int((time.perf_counter() - _t0) * 1000)
+        _m.n_model_calls = max(_m.n_model_calls, max_turns)
+        _m.n_tool_calls = 0
+        _m.completed = False
+        msg = (
+            f"本轮工具调用次数已达上限（max_turns={max_turns}），为避免死循环已停止。"
+            + "请尝试更明确地描述需求，或分步提问。"
+        )
+        yield TurnEvent(kind="done", final=acc, error=msg,
+                        next_input=_fallback_input(history_input, user_input))
+        return
+    except BaseException as exc:  # noqa: BLE001
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        # 注意：流式下异常可能发生在已 yield 若干 delta 之后——保留 acc（部分正文），
+        # 不丢已展示内容（诚实降级）。
+        _m.duration_ms = int((time.perf_counter() - _t0) * 1000)
+        _m.completed = False
+        yield TurnEvent(kind="done", final=acc, error=_describe_model_error(exc),
+                        next_input=_fallback_input(history_input, user_input))
+        return
+
+    # 正常结束：从 result 取完整正文（可能比 acc 更完整，作为权威值）。
+    final: str = str(getattr(result, "final_output", "") or "").strip()
+    if not final:
+        final = acc
+    next_input = result.to_input_list(mode="normalized")
+    _m.duration_ms = int((time.perf_counter() - _t0) * 1000)
+    _m.n_tool_calls = _count_tool_calls(result)
+    _m.n_model_calls = max(1, _m.n_tool_calls + 1)
+    _m.completed = True
+    yield TurnEvent(kind="done", final=final, next_input=next_input, result=result)

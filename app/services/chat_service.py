@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from agents import RunResult
 from agents.usage import Usage
@@ -26,6 +26,7 @@ from app.agent.agent import (
     format_tool_activity,
     guard_tools,
     run_turn,
+    stream_turn,
 )
 from app.agent.history_compaction import (
     _split_turns,
@@ -108,6 +109,24 @@ class ChatTurn:
     # 本轮观测指标（耗时 / 模型往返次数 / 工具调用次数 / 是否正常完成）。
     # 用于回答"这轮为什么慢/是不是工具循环太多"——502 类问题的第一手事实。
     metrics: dict[str, Any] | None = None
+    # 流式轮的错误提示（未正常完成时非空）；非流式（reply）路径为 None。
+    # 与 metrics["completed"] 配合，供 UI 渲染"本轮未完成"与重试入口。
+    error: str | None = None
+
+
+@dataclass
+class StreamChunk:
+    """流式输出的单个块（供 UI 消费）。
+
+    kind 取值：
+    - ``"delta"``：正文增量（text 为新增片段）；
+    - ``"tool"``：工具调用播报（text 为功能描述）；
+    - ``"final"``：收尾块（turn 为完整 ChatTurn，含 findings/usage/metrics）。
+    """
+
+    kind: str
+    text: str = ""
+    turn: "ChatTurn | None" = None
 
 
 def extract_usage(result: RunResult | None) -> dict[str, int] | None:
@@ -298,6 +317,115 @@ class ChatService:
                 "n_tool_calls": metrics.n_tool_calls,
                 "completed": metrics.completed,
             },
+        )
+
+    def reply_stream(self, user_input: str) -> "Iterator[StreamChunk]":
+        """同步流式执行单轮对话：逐块 yield 正文增量/工具播报，最后 yield 完整结果。
+
+        实现（docs/流式输出设计.md 3.2 方案甲）：在后台线程里新建事件循环消费
+        :func:`stream_turn` 的异步生成器，经队列桥接回同步调用方——把 asyncio
+        完整封在服务层内，UI 只面对同步生成器（与 reply() 的调用风格一致，
+        UI 不碰 asyncio）。
+
+        最后一个块 kind="final"，其 turn 为完整 :class:`ChatTurn`（含
+        findings/usage/metrics），**与 reply() 返回的结构同构**，使 UI 侧的
+        收尾逻辑（写 messages / 累计统计）可完全复用。
+
+        Args:
+            user_input: 用户本轮输入。
+
+        Yields:
+            StreamChunk：若干 delta/tool 块，最后一个 final 块。
+        """
+        import queue
+        import threading
+
+        composed = _compose_user_input(user_input, self._pending_notes)
+        self._pending_notes.clear()
+        metrics = RunMetrics()
+        q: "queue.Queue[Any]" = queue.Queue()
+        _DONE = object()
+
+        async def _pump() -> None:
+            try:
+                async for ev in stream_turn(
+                    self.agent, self.context, composed, self.history_input,
+                    history_budget_tokens=self._history_budget,
+                    history_keep_recent_turns=self._keep_recent_turns,
+                    metrics=metrics,
+                ):
+                    q.put(ev)
+            except BaseException as exc:  # noqa: BLE001 - 异常经队列送达消费端
+                q.put(exc)
+            finally:
+                q.put(_DONE)
+
+        def _run() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(_pump())
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        done_event = None
+        try:
+            while True:
+                item = q.get()
+                if item is _DONE:
+                    break
+                if isinstance(item, BaseException):
+                    # 兜底：_pump 自身异常（理论上 stream_turn 已吞）。转成
+                    # 收尾事件，保留已产出的正文（见下方 acc 处理）。
+                    if isinstance(item, (KeyboardInterrupt, SystemExit)):
+                        raise item
+                    from app.agent.agent import TurnEvent, _describe_model_error
+                    done_event = TurnEvent(kind="done", final="",
+                                           error=_describe_model_error(item),
+                                           next_input=None)
+                    break
+                kind = getattr(item, "kind", "")
+                if kind == "delta":
+                    yield StreamChunk(kind="delta", text=item.text)
+                elif kind == "tool":
+                    yield StreamChunk(kind="tool", text=item.text)
+                elif kind == "done":
+                    done_event = item
+        finally:
+            thread.join(timeout=5)
+
+        turn = self._finalize_stream_turn(done_event, metrics)
+        yield StreamChunk(kind="final", text=turn.reply, turn=turn)
+
+    def _finalize_stream_turn(self, done_event, metrics: RunMetrics) -> ChatTurn:
+        """把 stream_turn 的收尾事件整理为 ChatTurn（并写回历史）。"""
+        from app.agent.agent import TurnEvent
+
+        if done_event is None:
+            done_event = TurnEvent(kind="done", final="", error="本轮未产生任何结果。")
+        result = done_event.result
+        # 历史写回：正常分支用 next_input；异常分支的 fallback_input 已含本轮
+        # 用户消息（与 run_turn 一致，保证"直接重发"能接上）。
+        if done_event.next_input is not None:
+            self.history_input = done_event.next_input
+        tool_activity = format_tool_activity(result) if result is not None else ""
+        tool_calls = _extract_tool_names(result)
+        return ChatTurn(
+            reply=done_event.final,
+            tool_activity=tool_activity,
+            tool_calls=tool_calls,
+            findings=list(self.context.findings),
+            usage=extract_usage(result),
+            metrics={
+                "duration_ms": metrics.duration_ms,
+                "n_model_calls": metrics.n_model_calls,
+                "n_tool_calls": metrics.n_tool_calls,
+                "completed": metrics.completed,
+            },
+            error=done_event.error,
         )
 
     def truncate_history_to_turn(self, turn_index: int) -> dict[str, Any]:
