@@ -126,58 +126,121 @@ def _estimate_cost_text(usage: dict | None, cumulative: dict) -> str:
     return f"本轮 ≈${cost:.4f} / 累计 ≈${cost_acc:.4f}"
 
 
-def render_charts(findings: list[dict]) -> None:
-    """渲染 findings 中 type=chart 的图片。
+def _chart_dialog() -> None:
+    """放大查看单个图表的对话框。
 
-    图片路径来自 chart 条目的 file_path（相对 outputs/ 的相对路径）。
-    文件缺失时降级显示提示而非报错。
+    设计（docs/右栏信息架构重构设计.md 2.1）：网格缩略图 + 点击放大，
+    替代此前"每张图全宽铺开"的低密度呈现。被选中的图表下标存于
+    session_state["zoom_chart"]，由缩略图按钮写入。
+    """
+    idx = st.session_state.get("zoom_chart")
+    charts = st.session_state.get("_charts_cache", [])
+    if idx is None or idx >= len(charts):
+        return
+    f = charts[idx]
+    fp = f.get("file_path", "")
+    title = f.get("title", "图表")
+    st.subheader(title)
+    desc = f.get("description", "")
+    if desc:
+        st.caption(desc)
+    path = Path(fp) if fp else None
+    if path is not None and path.exists():
+        st.image(str(path), use_container_width=True)
+    else:
+        st.warning(f"图表文件缺失：{fp or '（无路径）'}。该文件可能已被清理。")
+    spec = f.get("plot_spec", {})
+    if spec:
+        st.caption(
+            f"坐标：x={spec.get('x_axis', '?')}，y={spec.get('y_axis', [])}，"
+            f"分组={spec.get('grouped_by', None)}，曲线数={spec.get('n_series', '?')}"
+        )
+
+
+def render_charts(findings: list[dict]) -> None:
+    """渲染 findings 中 type=chart 的图片（两列缩略图 + 点击放大，最新在上）。
+
+    设计见 docs/右栏信息架构重构设计.md 2.1：倒序（最新在最上）+ 缩略图网格
+    + 点击 @st.dialog 放大。仅改渲染方式，finding 字段与语义不变。
     """
     charts = [f for f in findings if f.get("type") == "chart"]
     if not charts:
         st.info("暂无图表。请先通过对话生成图表。")
         return
 
-    for i, f in enumerate(charts):
-        fp = f.get("file_path", "")
-        title = f.get("title", f"图表 {i + 1}")
-        desc = f.get("description", "")
-        spec = f.get("plot_spec", {})
-        st.subheader(title)
-        if desc:
-            st.caption(desc)
-        if fp:
-            path = Path(fp)
-            if path.exists():
-                st.image(str(path), use_container_width=True)
+    # 倒序：最新在最上（多轮分析时注意力在最近一轮）。
+    charts = list(reversed(charts))
+    # 供放大对话框取用（dialog 在页面底部渲染，需能访问到当前图表列表）。
+    st.session_state["_charts_cache"] = charts
+
+    for row_start in range(0, len(charts), 2):
+        cols = st.columns(2)
+        for col, f in zip(cols, charts[row_start:row_start + 2]):
+            with col:
+                fp = f.get("file_path", "")
+                title = f.get("title", "图表")
+                path = Path(fp) if fp else None
+                if path is not None and path.exists():
+                    st.image(str(path), use_container_width=True)
+                else:
+                    st.warning("图片缺失")
+                # 缩略图下方：标题 + 类型/表名（finding 已有字段，不新增数据）。
+                st.caption(f"**{title}**")
+                meta_bits = [str(f.get("chart_type", ""))]
+                if f.get("table_name"):
+                    meta_bits.append(f"表：{f['table_name']}")
+                meta_txt = " · ".join(b for b in meta_bits if b)
+                if meta_txt:
+                    st.caption(meta_txt)
+                if st.button("放大查看", key=f"zoom_{row_start}_{id(f)}",
+                             use_container_width=True):
+                    st.session_state["zoom_chart"] = charts.index(f)
+                    st.rerun()
+
+
+def _render_finding_group(title: str, items: list[dict]) -> None:
+    """渲染一个 finding 分组（表头 + 条目列表）；空组不渲染（防噪声）。"""
+    if not items:
+        return
+    with st.expander(f"{title}（{len(items)}）", expanded=True):
+        for f in reversed(items):  # 组内同样最新在上
+            tool = f.get("tool", "?")
+            summary = f.get("summary") or f.get("description") or ""
+            if summary:
+                st.markdown(f"- **{tool}**：{summary}")
             else:
-                st.warning(f"图表文件缺失：{fp}。该文件可能已被清理。")
-        else:
-            st.warning("该图表条目缺少文件路径。")
-        if spec:
-            st.caption(
-                f"坐标：x={spec.get('x_axis', '?')}，y={spec.get('y_axis', [])}，"
-                f"分组={spec.get('grouped_by', None)}，曲线数={spec.get('n_series', '?')}"
-            )
-        st.divider()
+                st.markdown(f"- **{tool}**")
 
 
 def render_findings_and_report(findings: list[dict]) -> None:
-    """展示 findings 列表与报告下载按钮。"""
+    """按类型分组展示 findings 与报告下载按钮（最新优先）。
+
+    设计见 docs/右栏信息架构重构设计.md 2.2：此前所有类型混在一列扁平 bullet
+    且最新在最后；改为按 type 分组（图表清单/统计结论/质检结果/报告），
+    组内倒序，空组不渲染。
+    """
     if not findings:
         st.info("当前会话暂无分析结果。")
         return
 
-    st.subheader("Findings")
-    for f in findings:
-        ftype = f.get("type", "?")
-        tool = f.get("tool", "?")
-        summary = f.get("summary") or f.get("description") or ""
-        st.markdown(f"- **[{ftype}]** {tool}: {summary}")
+    # 按 type 分组（type 是稳定小集合；用户心智是"看图/看数字/看报告"）。
+    charts = [f for f in findings if f.get("type") == "chart"]
+    stats = [f for f in findings if f.get("type") == "stat"]
+    reports = [f for f in findings if f.get("type") == "report"]
+    others = [f for f in findings
+              if f.get("type") not in ("chart", "stat", "report")]
 
-    # 报告下载按钮。
-    report_paths = [f.get("file_path") for f in findings if f.get("type") == "report"]
-    if report_paths:
-        for rp in report_paths:
+    _render_finding_group("统计结论", stats)
+    _render_finding_group("图表清单", charts)
+    _render_finding_group("其它结果", others)
+
+    # 报告下载按钮（保留原逻辑，仅位置归组）。
+    if reports:
+        st.subheader("报告")
+        for f in reversed(reports):
+            rp = f.get("file_path")
+            if not rp:
+                continue
             path = Path(rp)
             if path.exists():
                 st.download_button(
@@ -185,6 +248,7 @@ def render_findings_and_report(findings: list[dict]) -> None:
                     data=path.read_bytes(),
                     file_name=path.name,
                     mime="text/markdown",
+                    key=f"dl_{path.name}",
                 )
             else:
                 st.warning(f"报告文件缺失：{rp}")

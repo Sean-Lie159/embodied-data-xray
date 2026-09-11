@@ -119,6 +119,24 @@ def _close_session(tag: str) -> None:
         st.session_state.active_session = next(iter(sessions))
 
 
+def _open_chart_dialog() -> None:
+    """打开图表放大对话框（@st.dialog 装饰器需在模块级定义）。
+
+    逻辑本身在 ``components._chart_dialog``（UI 组件层）；此处只提供
+    Streamlit 对话框壳。关闭对话框时清掉选中下标，避免下次重跑又弹出。
+    """
+    from app.ui.components import _chart_dialog
+
+    @st.dialog("图表详情", width="large")
+    def _dialog() -> None:
+        _chart_dialog()
+        if st.button("关闭", key="close_chart_dialog"):
+            st.session_state["zoom_chart"] = None
+            st.rerun()
+
+    _dialog()
+
+
 def _record_turn(cumulative: dict, turn, messages: list[dict]) -> None:
     """把一轮结果记入会话统计与消息列表（token / 轮数 / 耗时 / 往返次数）。
 
@@ -338,6 +356,10 @@ def _main() -> None:
                 render_findings_and_report(findings)
             with tab_overview:
                 render_dataset_overview(service.dataset_summary())
+
+    # 图表放大对话框：放在页面末尾渲染（@st.dialog 的调用位置不影响弹出）。
+    if hasattr(st, "dialog") and st.session_state.get("zoom_chart") is not None:
+        _open_chart_dialog()
 
 
 if __name__ == "__main__":
