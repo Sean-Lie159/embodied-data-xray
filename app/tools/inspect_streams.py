@@ -639,6 +639,19 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "n_table_streams": len([s for s in streams if s.get("kind") != "video"]),
     }
 
+    # 质检状态回写 meta：供 UI 数据集状态面板稳定展示（避免 UI 自行推算而与
+    # 工具口径打架）。新增 key 不影响任何现有消费方；meta 每会话独立。
+    # 见 docs/数据集状态面板设计.md 2.3 解法 A。
+    context.meta["qc_state"] = {
+        "n_streams": n_streams,
+        "n_classified": classified,
+        "n_unclassified": max(0, n_streams - classified),
+        "unclassified_hint": unclassified_hint,
+        "clock_source": clock_source,
+        "n_empty_streams": len(empty_streams),
+        "n_user_confirmed": len(user_confirmed_overrides),
+    }
+
     return {
         "success": True,
         "dataset": context.dataset_id,

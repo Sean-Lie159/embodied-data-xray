@@ -254,19 +254,16 @@ def render_findings_and_report(findings: list[dict]) -> None:
                 st.warning(f"报告文件缺失：{rp}")
 
 
-def render_dataset_overview(summary: dict[str, Any]) -> None:
-    """展示当前数据集的能力标签与流清单摘要。"""
-    dataset_id = summary.get("dataset_id")
-    if not dataset_id:
-        st.info("尚未加载数据集。请先在对话中提供数据路径。")
-        return
+# 语义标签来源的显示名（profile_store 定义的常量 → 中文）。
+_LABEL_SOURCE_TEXT = {
+    "user_confirmed": "用户确认",
+    "content_fingerprint": "内容指纹",
+    "dictionary": "词典",
+}
 
-    st.subheader(f"数据集：{dataset_id}")
-    guessed = summary.get("guessed_type")
-    if guessed:
-        st.caption(f"推测类型：{guessed}")
 
-    caps = summary.get("capabilities", {})
+def _render_capabilities(caps: dict) -> None:
+    """[1] 能力标签段（保持原有展示逻辑不变）。"""
     st.markdown("**能力标签**")
     # IMU 轴数：无 IMU（✗）时不显示轴数（避免"✗（未知轴）"的冗余）；有 IMU 但
     # 轴数未知时才显示"未知轴"。
@@ -285,8 +282,136 @@ def render_dataset_overview(summary: dict[str, Any]) -> None:
     ]
     st.markdown("\n".join(cap_lines))
 
+
+def _render_semantic_progress(streams: list[dict], qc_state: dict | None) -> None:
+    """[2] 语义确认进度段（含已确认清单）。
+
+    口径与 inspect_streams 一致（docs/数据集状态面板设计.md 2.2）：
+    优先用工具回写的 qc_state（与工具同一次计算，绝不与工具口径打架）；
+    工具未调用过时退化为 UI 自算（同一判据，见下方 _is_classified）。
+    """
+    st.markdown("**语义确认进度**")
+    n = (qc_state or {}).get("n_streams")
+    if n is None:
+        n = len(streams)
+    classified = (qc_state or {}).get("n_classified")
+    if classified is None:
+        classified = sum(1 for s in streams if _is_classified(s))
+    unclassified = max(0, n - classified)
+
+    if classified == n and n > 0:
+        st.caption(f"{classified}/{n} 条流已分类 ✓")
+    else:
+        st.caption(f"{classified}/{n} 条流已分类 · {unclassified} 条未分类 ⚠️")
+    hint = (qc_state or {}).get("unclassified_hint")
+    if hint:
+        st.caption("建议：让 Agent 批量提交语义假设并确认（一次确认，跨会话生效）。")
+
+    # 已确认清单（来自持久化画像，跨会话生效——非模型记忆）。
+    confirmed = [s for s in streams
+                 if s.get("label_source") == "user_confirmed"]
+    if confirmed:
+        with st.expander(f"已确认清单（{len(confirmed)}）", expanded=False):
+            st.caption("来自持久化确认画像，跨会话生效（非模型记忆）。")
+            rows = []
+            for s in confirmed:
+                path = s.get("path", "")
+                rows.append({
+                    "流": Path(path).name if path else "(main)",
+                    "语义": s.get("semantic_label") or s.get("kind") or "?",
+                })
+            st.table(rows)
+
+
+def _is_classified(s: dict) -> bool:
+    """流是否已分类（与 inspect_streams 的判据一致，见其 classified 统计）。"""
+    return (
+        s.get("label_source") == "user_confirmed"
+        or ((s.get("semantic_label") or "").find("未知") < 0
+            and s.get("kind") not in (None, "unknown"))
+    )
+
+
+def _render_quality_warnings(qc: dict) -> None:
+    """[3] 数据质量告警段（单位未知 / 时钟形态矛盾）。
+
+    **措辞区分"未检查"与"无问题"**（docs/数据集状态面板设计.md 5 节）：
+    未执行时间同步检查时不渲染本段（并明确说"尚未检查"），绝不暗示"没问题"。
+    """
+    sync = (qc or {}).get("check_temporal_sync")
+    if not sync:
+        st.markdown("**数据质量告警**")
+        st.caption("尚未执行时间同步检查（如需请让 Agent 检查时间同步）。")
+        return
+    detail = sync.get("detail", {})
+    unit_warnings = detail.get("unit_warnings") or []
+    clock_conflicts = detail.get("clock_conflicts") or []
+    if not unit_warnings and not clock_conflicts:
+        st.markdown("**数据质量告警**")
+        st.caption("已执行时间同步检查，无单位告警。")
+        return
+    st.markdown("**数据质量告警**")
+    if unit_warnings:
+        st.caption(f"⚠️ {len(unit_warnings)} 条流时间戳单位未知（不参与跨流对齐）")
+        with st.expander("查看单位未知的流", expanded=False):
+            for w in unit_warnings:
+                st.markdown(f"- {w}")
+    if clock_conflicts:
+        st.caption(f"⚠️ {len(clock_conflicts)} 条流疑似时钟形态矛盾")
+        with st.expander("查看时钟矛盾的流", expanded=False):
+            for c in clock_conflicts:
+                st.markdown(f"- {c}")
+
+
+def _render_main_table(main_table: dict) -> None:
+    """[5] 数据概况段（主表行/列；截断时明确提示）。"""
+    if not main_table:
+        return
+    st.markdown("**数据概况**")
+    rows_total = main_table.get("rows_total")
+    rows_loaded = main_table.get("rows_loaded")
+    n_cols = main_table.get("n_cols")
+    bits = []
+    if rows_loaded is not None:
+        bits.append(f"行数 {rows_loaded:,}")
+    if n_cols is not None:
+        bits.append(f"列数 {n_cols}")
+    if bits:
+        st.caption(" · ".join(bits))
+    if (rows_total is not None and rows_loaded is not None
+            and rows_total != rows_loaded):
+        st.warning(
+            f"主表被截断装载：{rows_loaded:,} / {rows_total:,} 行"
+            "（分析基于截断后数据，非全量）。"
+        )
+
+
+def render_dataset_overview(summary: dict[str, Any]) -> None:
+    """展示当前数据集状态（五段式，见 docs/数据集状态面板设计.md 2.1）。
+
+    段：[1] 能力标签 · [2] 语义确认进度 · [3] 数据质量告警 ·
+    [4] 流清单 · [5] 数据概况。**只做展示，不提供语义编辑入口**
+    （语义确认必须走 Agent + 工具验证，是项目核心纪律）。
+    """
+    dataset_id = summary.get("dataset_id")
+    if not dataset_id:
+        st.info("尚未加载数据集。请先在对话中提供数据路径。")
+        return
+
+    st.subheader(f"数据集：{dataset_id}")
+    guessed = summary.get("guessed_type")
+    if guessed:
+        st.caption(f"推测类型：{guessed}")
+
     streams = summary.get("streams", [])
+    _render_capabilities(summary.get("capabilities", {}))
+    st.divider()
+    _render_semantic_progress(streams, summary.get("qc_state"))
+    st.divider()
+    _render_quality_warnings(summary.get("qc", {}))
+
     if streams:
+        st.divider()
         st.markdown("**流清单**")
         # 视频 fps 映射（ffprobe 实测），供视频流展示帧率而非"未知"。
         fps_by_file = summary.get("video_fps_by_file") or {}
@@ -303,5 +428,16 @@ def render_dataset_overview(summary: dict[str, Any]) -> None:
                 rate_str = f"{fps_by_file[path]} fps（视频）"
             else:
                 rate_str = "未知"
-            rows.append({"流": name, "角色": role, "采样率": rate_str})
+            # 语义标签与来源（新增两列，来源于已有流登记表字段）。
+            label = s.get("semantic_label") or s.get("kind") or "未分类"
+            source_raw = s.get("label_source")
+            source = _LABEL_SOURCE_TEXT.get(source_raw, source_raw or "自动识别")
+            rows.append({"流": name, "角色": role, "采样率": rate_str,
+                         "语义标签": label, "来源": source})
         st.table(rows)
+
+    main_table = summary.get("main_table") or {}
+    if main_table:
+        st.divider()
+        _render_main_table(main_table)
+

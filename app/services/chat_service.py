@@ -325,10 +325,16 @@ class ChatService:
         return {"before_turns": len(turns), "after_turns": turn_index}
 
     def dataset_summary(self) -> dict[str, Any]:
-        """返回当前数据集的能力标签与流清单摘要（供 UI 展示）。
+        """返回当前数据集的状态摘要（供 UI 数据集状态面板展示）。
 
         含 video_fps_by_file（视频文件 → fps，来自 ffprobe），供流清单表格展示
         视频帧率（否则视频流采样率显示"未知"，但 fps 实际可得）。
+
+        另含数据集状态面板所需字段（docs/数据集状态面板设计.md 2.2）：
+        - ``main_table``：主表行/列数与截断信息（数据概况段）；
+        - ``qc_state``：inspect_streams 回写的质检状态（语义确认进度段）；
+        - ``qc``：check_temporal_sync 写的质量明细（单位告警/时钟矛盾段）。
+        缺失时 UI 降级为"尚未检查"，**不误报为"无问题"**。
         """
         caps = self.context.meta.get("capabilities", {})
         streams = self.context.meta.get("streams", [])
@@ -343,6 +349,9 @@ class ChatService:
             "streams": streams,
             "guessed_type": self.context.meta.get("guessed_type"),
             "video_fps_by_file": video_fps_by_file,
+            "main_table": self.context.meta.get("main_table", {}),
+            "qc_state": self.context.meta.get("qc_state"),
+            "qc": self.context.meta.get("qc", {}),
         }
 
 
