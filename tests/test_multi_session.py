@@ -320,20 +320,51 @@ def test_ui_switch_session_preserves_state() -> None:
     assert at.session_state.sessions[first]["messages"][0]["content"] == "会话1的消息"
 
 
-def test_ui_close_session_removes_it() -> None:
-    """关闭会话：会话数 -1；关到最后一个时自动新建（始终有会话）。"""
+def test_ui_close_current_session_removes_it() -> None:
+    """关闭当前会话：会话数 -1；只剩一个时关闭按钮禁用（多会话升级设计 2.3）。"""
     at = _app()
     at.run()
     [b for b in at.button if b.key == "new_session"][0].click().run()
     assert len(at.session_state.sessions) == 2
-    target = list(at.session_state.sessions)[0]
-    [b for b in at.button if b.key == f"close_{target}"][0].click().run()
+    # 只有一个会话时"关闭当前"应禁用。
+    assert [b for b in at.button if b.key == "close_current"][0].disabled is False
+    [b for b in at.button if b.key == "close_current"][0].click().run()
     assert not at.exception
     assert len(at.session_state.sessions) == 1
-    # 关掉最后一个 → 自动新建。
-    last = list(at.session_state.sessions)[0]
-    [b for b in at.button if b.key == f"close_{last}"][0].click().run()
-    assert len(at.session_state.sessions) == 1
+    # 只剩一个 → 关闭按钮禁用（保留至少一个对话）。
+    assert [b for b in at.button if b.key == "close_current"][0].disabled is True
+
+
+def test_ui_tab_count_is_n_plus_two() -> None:
+    """控件数 = 会话数 + 2（N 个标签 + 关闭当前 + 新建），防回退到 2N 按钮。
+
+    多会话标签页升级设计 2.1：关闭入口收敛为单个按钮。
+    """
+    at = _app()
+    at.run()
+    [b for b in at.button if b.key == "new_session"][0].click().run()
+    [b for b in at.button if b.key == "new_session"][0].click().run()
+    n = len(at.session_state.sessions)
+    assert n == 3
+    tab_btns = [b for b in at.button if b.key and b.key.startswith("tab_")]
+    assert len(tab_btns) == n
+    assert any(b.key == "close_current" for b in at.button)
+    assert any(b.key == "new_session" for b in at.button)
+    # 不应存在旧的按会话关闭按钮。
+    assert not [b for b in at.button if b.key and b.key.startswith("close_s-")]
+
+
+def test_ui_active_tab_uses_primary_type() -> None:
+    """当前标签用 primary 填充色区分（取代 ● 前缀）。"""
+    at = _app()
+    at.run()
+    active = at.session_state.active_session
+    btn = [b for b in at.button if b.key == f"tab_{active}"][0]
+    assert btn.proto.type == "primary"
+    # 新建一个后，旧的 active 应变为 secondary。
+    [b for b in at.button if b.key == "new_session"][0].click().run()
+    old = [b for b in at.button if b.key == f"tab_{active}"][0]
+    assert old.proto.type == "secondary"
 
 
 def test_ui_sessions_have_independent_services() -> None:

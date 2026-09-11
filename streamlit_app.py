@@ -276,23 +276,40 @@ def _last_turn(messages: list[dict]):
 
 
 def _render_session_tabs() -> None:
-    """顶部会话标签页：切换 / 关闭 / 新建。"""
+    """顶部会话标签条：切换 / 关闭当前 / 新建。
+
+    设计（docs/多会话标签页升级设计.md 2.1–2.3）：
+    - 标签条用**横向滚动容器**（不再按会话数均分列宽），标签多时不挤压变形；
+    - 每个标签只占**一个按钮**，当前标签用 primary 填充色区分（取代 `● ` 前缀，
+      可多显示名字）；
+    - 关闭入口收敛为**一个**"关闭当前"按钮（控件数由 2N 降到 N+2）；
+      只剩 1 个会话时该按钮禁用（避免"关了又自动新建"的隐晦行为）；
+    - 不做"关闭非当前会话"（需要每标签一个关闭控件，与前一条取舍冲突）。
+    """
     sessions = _sessions()
     active = st.session_state.active_session
-    cols = st.columns([1] * len(sessions) + [0.6])
-    for col, (tag, stt) in zip(cols, list(sessions.items())):
-        with col:
-            label = ("● " if tag == active else "") + stt["name"]
-            if st.button(label, key=f"tab_{tag}", use_container_width=True):
-                if tag != active:
-                    st.session_state.active_session = tag
-                    st.rerun()
-            # 关闭按钮（小字）：关到最后一个时自动新建。
-            if st.button("×", key=f"close_{tag}", help="关闭该对话"):
-                _close_session(tag)
-                st.rerun()
-    with cols[-1]:
-        if st.button("＋ 新建对话", key="new_session", use_container_width=True):
+    names = list(sessions.keys())
+
+    left, right = st.columns([4, 1])
+    with left:
+        # 横向滚动容器：标签不压缩宽度（需要时容器内滚动，而非变形）。
+        with st.container(horizontal=True, horizontal_alignment="left"):
+            for tag, stt in sessions.items():
+                is_active = tag == active
+                if st.button(stt["name"], key=f"tab_{tag}",
+                             type="primary" if is_active else "secondary"):
+                    if not is_active:
+                        st.session_state.active_session = tag
+                        st.rerun()
+    with right:
+        c_close, c_new = st.columns(2)
+        only_one = len(sessions) <= 1
+        if c_close.button("关闭当前", key="close_current", use_container_width=True,
+                          disabled=only_one,
+                          help="至少保留一个对话" if only_one else "关闭当前对话"):
+            _close_session(active)
+            st.rerun()
+        if c_new.button("＋ 新建", key="new_session", use_container_width=True):
             _create_session()
             st.session_state.active_session = list(_sessions())[-1]
             st.rerun()
