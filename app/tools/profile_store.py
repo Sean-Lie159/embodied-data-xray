@@ -1,8 +1,17 @@
 """数据集语义画像持久化（四层架构第 4 层）。
 
-把用户对语义识别结果的确认持久化到项目 ``outputs/.dataset_profile.json``（按
-dataset_id 索引，集中管理，不进数据集目录）。再次加载该数据集时，load_dataset
-优先读取此文件覆盖第 1-3 层的自动识别结果。
+把用户对语义识别结果的确认持久化到 **每数据集一个文件**：
+
+    outputs/by_dataset/<数据集名净化>/profile.json
+
+（2026-09-11 改造，见 docs/UI优化总纲与输出目录改造设计.md 3.2/3.5。）
+改造前所有数据集共用一个 ``outputs/.dataset_profile.json``，多会话并发写要靠
+全局锁 + 重读合并保护；拆分后**跨数据集不再竞争**，锁粒度降到"每数据集"。
+再次加载该数据集时，load_dataset 优先读取画像覆盖第 1-3 层的自动识别结果。
+
+**兼容迁移**：旧格式（单个 ``.dataset_profile.json``，按 dataset_id 索引）在
+首次读取新路径未命中时**惰性迁移**——取出该 dataset_id 的分片写入新路径；
+旧文件保留不删（保守，避免误删用户确认）。
 
 每个映射记录来源：user_confirmed（用户确认）/ content_fingerprint（内容指纹）/
 dictionary（词典）。文件不可用时（不存在/损坏）安全降级为"无覆盖"，不抛异常。
@@ -18,8 +27,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-# 持久化文件名（落在项目 outputs/ 下，不进数据集目录）。
-_PROFILE_FILENAME = ".dataset_profile.json"
+# 画像文件名（落在 outputs/by_dataset/<净名>/profile.json）。
+_PROFILE_FILENAME = "profile.json"
+
+# 改造前的全局画像文件名（outputs/.dataset_profile.json），仅用于迁移读取。
+_LEGACY_PROFILE_FILENAME = ".dataset_profile.json"
 
 # 合法来源标记。
 SOURCE_USER = "user_confirmed"
@@ -59,18 +71,35 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
                 pass
 
 
-def _profile_path(output_dir: str) -> Path:
-    """返回持久化文件路径。
+def _profile_path(output_dir: str, dataset_id: str) -> Path:
+    """返回某数据集画像文件路径（outputs/by_dataset/<净名>/profile.json）。
 
     Args:
         output_dir: 项目输出目录（settings.output_dir）。
+        dataset_id: 数据集标识名。
 
     Returns:
-        outputs/.dataset_profile.json 的完整路径。
+        该数据集画像文件的完整路径（父目录会创建）。
     """
-    p = Path(output_dir)
-    p.mkdir(parents=True, exist_ok=True)
-    return p / _PROFILE_FILENAME
+    from app.tools.output_paths import dataset_output_dir
+
+    return dataset_output_dir(output_dir, dataset_id) / _PROFILE_FILENAME
+
+
+def _legacy_profile_path(output_dir: str) -> Path:
+    """返回改造前的全局画像文件路径（outputs/.dataset_profile.json）。"""
+    return Path(output_dir) / _LEGACY_PROFILE_FILENAME
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    """读取 JSON 文件为 dict；不存在/损坏/非 dict 时返回 None（安全降级）。"""
+    if not path.exists():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 @contextmanager
@@ -125,28 +154,50 @@ def _file_lock(path: Path, timeout_s: float = _LOCK_TIMEOUT_S):
                 pass
 
 
-def load_profile(output_dir: str) -> dict[str, Any]:
-    """读取持久化画像（全量）。文件不存在/损坏时返回空 dict，不抛异常。
+def _empty_profile() -> dict[str, Any]:
+    """空画像结构（与旧全量格式同构，便于迁移与调用方兼容）。"""
+    return {"schema_version": 1, "datasets": {}}
+
+
+def load_profile(output_dir: str, dataset_id: str) -> dict[str, Any]:
+    """读取指定数据集画像（新路径），未命中时回退旧全局文件并迁移。
+
+    迁移语义（docs/UI优化总纲与输出目录改造设计.md 3.5）：
+    1. 先读新路径 ``by_dataset/<净名>/profile.json``，命中即返回；
+    2. 未命中 → 读旧全局 ``outputs/.dataset_profile.json``，取该 dataset_id 的分片；
+    3. 命中旧数据 → **写入新路径**（惰性迁移）后返回；旧文件保留不删；
+    4. 都没有 → 返回空画像。
+
+    返回结构与旧格式同构（``{"schema_version":1,"datasets":{<id>:...}}``），
+    使既有调用方（save/load_dataset_profile）无需大改。
 
     Args:
         output_dir: 项目输出目录。
+        dataset_id: 数据集标识名。
 
     Returns:
-        dict，含 schema_version、datasets（按 dataset_id 索引的画像）。
+        dict，含 schema_version 与 datasets（**只含本数据集**的分片）。
     """
-    path = _profile_path(output_dir)
-    if not path.exists():
-        return {"schema_version": 1, "datasets": {}}
-    try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(obj, dict):
-            return {"schema_version": 1, "datasets": {}}
+    path = _profile_path(output_dir, dataset_id)
+    obj = _read_json_dict(path)
+    if obj is not None:
         obj.setdefault("schema_version", 1)
-        obj.setdefault("datasets", {})
+        datasets = obj.setdefault("datasets", {})
+        if not isinstance(datasets, dict):
+            obj["datasets"] = {}
         return obj
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-        # 损坏文件安全降级，不中断加载流程。
-        return {"schema_version": 1, "datasets": {}}
+
+    # 新路径未命中 → 尝试从旧全局文件迁移本数据集的分片。
+    legacy = _read_json_dict(_legacy_profile_path(output_dir))
+    if legacy is not None:
+        shard = (legacy.get("datasets") or {}).get(dataset_id)
+        if isinstance(shard, dict):
+            migrated = {"schema_version": legacy.get("schema_version", 1),
+                        "datasets": {dataset_id: shard}}
+            _atomic_write(path, migrated)  # 迁移落盘；失败则下次再试，不抛异常
+            return migrated
+
+    return _empty_profile()
 
 
 def load_dataset_profile(output_dir: str, dataset_id: str) -> dict[str, Any]:
@@ -159,7 +210,7 @@ def load_dataset_profile(output_dir: str, dataset_id: str) -> dict[str, Any]:
     Returns:
         dict，含 streams（文件名→覆盖映射）、pairs（覆盖配对）等；无记录返回空 dict。
     """
-    profile = load_profile(output_dir)
+    profile = load_profile(output_dir, dataset_id)
     return profile.get("datasets", {}).get(dataset_id, {})
 
 
@@ -184,13 +235,14 @@ def save_dataset_profile(
     Returns:
         更新后的全量画像 dict（已落盘）。
     """
-    path = _profile_path(output_dir)
+    path = _profile_path(output_dir, dataset_id)
 
     # 多会话并发保护：加锁 → **重读**（拿盘上最新状态）→ 合并 → 原子写。
     # 为什么必须重读：两个会话同时对同一数据集确认不同流时，若各自基于
     # 进入函数时的旧快照写入，后写的会丢掉先写的确认（读-改-写竞态）。
+    # 注：拆分后锁粒度是"每数据集"，跨数据集不再竞争（较旧全局单文件更优）。
     with _file_lock(path):
-        profile = load_profile(output_dir)
+        profile = load_profile(output_dir, dataset_id)
         datasets = profile.setdefault("datasets", {})
         entry = datasets.setdefault(dataset_id, {
             "streams": {},

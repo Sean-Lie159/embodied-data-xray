@@ -217,7 +217,7 @@ def test_concurrent_confirmations_do_not_lose_updates(tmp_path: Path) -> None:
         th.join(timeout=10)
 
     assert not errors, errors
-    streams = load_profile(out)["datasets"]["ds"]["streams"]
+    streams = load_profile(out, "ds")["datasets"]["ds"]["streams"]
     assert "a0.csv" in streams and "a1.csv" in streams, (
         f"并发确认丢失：{list(streams)}"
     )
@@ -231,10 +231,10 @@ def test_atomic_write_leaves_no_partial_file(tmp_path: Path) -> None:
 
     save_dataset_profile(str(tmp_path), "ds",
                          stream_overrides={"a.csv": {"kind": "k"}})
-    path = _profile_path(str(tmp_path))
+    path = _profile_path(str(tmp_path), "ds")
     assert path.exists()
     json.loads(path.read_text(encoding="utf-8"))  # 完整可解析
-    leftovers = [p.name for p in tmp_path.iterdir() if ".tmp-" in p.name]
+    leftovers = [p.name for p in path.parent.iterdir() if ".tmp-" in p.name]
     assert leftovers == [], f"残留临时文件：{leftovers}"
 
 
@@ -244,7 +244,7 @@ def test_lock_released_after_write(tmp_path: Path) -> None:
 
     save_dataset_profile(str(tmp_path), "ds",
                          stream_overrides={"a.csv": {"kind": "k"}})
-    lock = _profile_path(str(tmp_path)).with_name(".dataset_profile.json.lock")
+    lock = _profile_path(str(tmp_path), "ds").with_name("profile.json.lock")
     assert not lock.exists(), "锁文件未释放"
     # 再次写入应正常（锁未残留）。
     save_dataset_profile(str(tmp_path), "ds",
@@ -261,7 +261,7 @@ def test_merge_preserves_other_sessions_entries(tmp_path: Path) -> None:
     out = str(tmp_path)
     save_dataset_profile(out, "ds", stream_overrides={"x.csv": {"kind": "kx"}})
     save_dataset_profile(out, "ds", stream_overrides={"y.csv": {"kind": "ky"}})
-    streams = load_profile(out)["datasets"]["ds"]["streams"]
+    streams = load_profile(out, "ds")["datasets"]["ds"]["streams"]
     assert set(streams) == {"x.csv", "y.csv"}
     assert streams["x.csv"]["source"] == "user_confirmed"
 

@@ -1189,9 +1189,10 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     # 附加到流登记表（确定性，读前 5 行；单文件失败静默降级不阻塞加载）。
     _attach_nested_discovery(meta["streams"])
 
-    # 第 4 层：用户确认持久化覆盖。加载时优先读取 outputs/.dataset_profile.json
-    # 中该 dataset_id 的已确认映射（来源 user_confirmed），覆盖第 1-3 层自动识别。
-    # 文件不存在/损坏时安全降级为无覆盖，不中断加载。
+    # 第 4 层：用户确认持久化覆盖。加载时优先读取该数据集的画像
+    # （outputs/by_dataset/<数据集名>/profile.json）中已确认映射（来源
+    # user_confirmed），覆盖第 1-3 层自动识别。旧全局格式会自动迁移（见
+    # profile_store），文件不存在/损坏时安全降级为无覆盖，不中断加载。
     user_profile = profile_store.load_dataset_profile(context.output_dir, dataset_id)
     if user_profile.get("streams"):
         meta["streams"] = profile_store.apply_profile_overrides(

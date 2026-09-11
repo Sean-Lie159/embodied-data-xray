@@ -40,10 +40,77 @@ def test_missing_profile_returns_empty(tmp_path: Path) -> None:
 
 def test_corrupt_profile_degrades(tmp_path: Path) -> None:
     """损坏的画像文件安全降级为空，不抛异常。"""
-    (tmp_path / ".dataset_profile.json").write_text("{not json", encoding="utf-8")
+    from app.tools.profile_store import _profile_path
+
+    p = _profile_path(str(tmp_path), "x")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json", encoding="utf-8")
     prof = profile_store.load_dataset_profile(str(tmp_path), "x")
     assert prof.get("streams", {}) == {}
     assert prof.get("pairs", []) == []
+
+
+def test_profile_lands_in_dataset_subdir(tmp_path: Path) -> None:
+    """画像落在 outputs/by_dataset/<净名>/profile.json（子目录化）。"""
+    from app.tools.output_paths import sanitize_dataset_dir_name
+
+    profile_store.save_dataset_profile(
+        str(tmp_path), "lerobot",
+        stream_overrides={"a.csv": {"kind": "imu"}},
+    )
+    expected = (tmp_path / "by_dataset" / sanitize_dataset_dir_name("lerobot")
+                / "profile.json")
+    assert expected.exists()
+
+
+def test_legacy_profile_migrated_on_read(tmp_path: Path) -> None:
+    """旧全局画像被惰性迁移读取（跨会话确认不丢）。"""
+    import json
+
+    legacy = {
+        "schema_version": 1,
+        "datasets": {
+            "old_ds": {"streams": {"accel.csv": {"kind": "imu",
+                                                 "source": "user_confirmed"}},
+                       "pairs": []},
+            "other_ds": {"streams": {"x.csv": {"kind": "y"}}, "pairs": []},
+        },
+    }
+    (tmp_path / ".dataset_profile.json").write_text(
+        json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
+    )
+    # 读取旧数据集 → 应迁移出该分片。
+    prof = profile_store.load_dataset_profile(str(tmp_path), "old_ds")
+    assert prof["streams"]["accel.csv"]["kind"] == "imu"
+
+    # 且已写入新路径。
+    from app.tools.output_paths import sanitize_dataset_dir_name
+
+    new_path = (tmp_path / "by_dataset" / sanitize_dataset_dir_name("old_ds")
+                / "profile.json")
+    assert new_path.exists()
+
+    # 旧文件保留不删（保守）；其它数据集分片不受影响。
+    assert (tmp_path / ".dataset_profile.json").exists()
+    other = profile_store.load_dataset_profile(str(tmp_path), "other_ds")
+    assert other["streams"]["x.csv"]["kind"] == "y"
+
+
+def test_new_path_takes_priority_over_legacy(tmp_path: Path) -> None:
+    """新路径已有画像时，不再读旧文件（避免旧数据覆盖新确认）。"""
+    import json
+
+    profile_store.save_dataset_profile(
+        str(tmp_path), "ds", stream_overrides={"a.csv": {"kind": "new"}},
+    )
+    legacy = {"schema_version": 1,
+              "datasets": {"ds": {"streams": {"a.csv": {"kind": "old"}},
+                                  "pairs": []}}}
+    (tmp_path / ".dataset_profile.json").write_text(
+        json.dumps(legacy), encoding="utf-8"
+    )
+    prof = profile_store.load_dataset_profile(str(tmp_path), "ds")
+    assert prof["streams"]["a.csv"]["kind"] == "new"
 
 
 def test_apply_profile_overrides_marks_source(tmp_path: Path) -> None:
