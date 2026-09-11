@@ -39,6 +39,23 @@ class Settings(BaseSettings):
     openai_base_url: str = ""
     default_model: str = ""
     default_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    # 推理档位（reasoning_effort）：控制模型的思考链深度。
+    #
+    # 为什么需要显式配置：本项目基准链路是 CodeBuddy 网关 → 混元 hy3，而该网关
+    # 在**请求未带该字段时会自动注入 "high"**（见网关 upstream.py 的
+    # "Reasoning / chain-of-thought injection"）——即推理模式是网关替我们开的，
+    # 客户端不传就吃默认。实测（2026-09-11）：hy3 默认档思考 token 占总输出
+    # 91%~96%，一次 300 字的分析问答要烧约 900 个看不见的思考 token，按
+    # 13 ms/token 折算，绝大部分等待时间花在思考上而非正文。
+    #
+    # 取值与实测效果（同一问题，客户端传顶层 reasoning_effort 覆盖网关默认值）：
+    #   "high"：网关默认。推理最充分，耗时最长（实测思考 token 最高）。
+    #   "low" ：思考 token 约减少 24%（实测 179 → 136），保留推理能力，折中档。
+    #   "off" ：网关透传后上游不产生思考链；但**实测未见显著降幅**，且关闭推理
+    #           会削弱"识别口径矛盾 / 判断基线合理性"这类需要推断的任务表现，
+    #           故默认不采用。
+    # 留空（""）：完全不干预，由网关按自己的默认值处理（等价于 high）。
+    reasoning_effort: str = ""
 
     # --- 数据处理与运行 ------------------------------------------------------
     output_dir: str = "outputs"

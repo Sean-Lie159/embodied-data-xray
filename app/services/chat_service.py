@@ -36,6 +36,7 @@ from app.agent.context import RunContext
 from app.config import get_settings
 from app.llm import build_model
 from app.llm.context_window import derive_budget
+from app.llm.factory import build_model_settings
 from app.tools import (
     align_container_streams,
     check_sensor_sanity,
@@ -187,8 +188,12 @@ class ChatService:
             history_ratio=settings.history_budget_ratio,
             tool_output_ratio=settings.tool_output_budget_ratio,
         )
+        # 推理档位（REASONING_EFFORT）经 Agent 级 model_settings 注入；未配置时为
+        # None，不干预网关默认值（零回归）。
         return build_agent(
-            model, guard_tools(_ALL_TOOLS, budget_tokens=budget.tool_output_budget)
+            model,
+            guard_tools(_ALL_TOOLS, budget_tokens=budget.tool_output_budget),
+            model_settings=build_model_settings(settings),
         )
 
     def _configure_compaction(self) -> None:

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, cast
 
-from agents import Agent, Model, Runner, RunResult, Tool
+from agents import Agent, Model, ModelSettings, Runner, RunResult, Tool
 from agents.exceptions import MaxTurnsExceeded
 from agents.items import RunItem, TResponseInputItem
 
@@ -188,21 +188,35 @@ inspect_video_frame 抽单帧——**画面含义需用户判读，不得凭文�
 """
 
 
-def build_agent(model: Model, tools: list[Tool]) -> Agent[RunContext]:
+def build_agent(
+    model: Model,
+    tools: list[Tool],
+    model_settings: ModelSettings | None = None,
+) -> Agent[RunContext]:
     """构建主 Agent。
 
     Args:
         model: openai-agents 的 Model 实例。
         tools: 要注册给 Agent 的工具列表（应已过 :func:`guard_tools` 包装）。
+        model_settings: 可选的 Agent 级模型设置（当前承载推理档位；
+            由 :func:`app.llm.factory.build_model_settings` 构造）。
+            None 时不设置，行为与改动前一致（零回归）。
 
     Returns:
         配置好的 ``Agent`` 实例。
     """
+    # 注意：SDK 的 Agent 构造器**不接受 model_settings=None**（会抛
+    # TypeError: must be a ModelSettings instance or a dict），因此未配置推理档位
+    # 时必须省略该关键字参数，而不是传 None。此处用 dict 展开实现条件传参。
+    optional: dict[str, Any] = (
+        {"model_settings": model_settings} if model_settings is not None else {}
+    )
     return Agent[RunContext](
         name="embodied-data-xray",
         instructions=SYSTEM_PROMPT,
         model=model,
         tools=list(tools),
+        **optional,
     )
 
 
