@@ -1,0 +1,49 @@
+# Streamlit 主题配置（docs/UI视觉优化设计.md 第 2 节）
+#
+# 设计要点：
+# 1. [theme] 放"两套主题共用"的值（主色、圆角、字体层级、图表配色）；
+#    未在 [theme.light]/[theme.dark] 中设置的项会从此处继承。
+# 2. 侧栏颜色必须**显式**定义——官方规则：未定义 theme.sidebar.backgroundColor
+#    时会去取 theme.secondaryBackgroundColor（反之亦然），不显式定义会在
+#    浅/深两套主题下各自"交换"成意外颜色。
+# 3. 深色模式由用户经 Streamlit 原生设置菜单切换（右上角菜单 → Settings → Theme），
+#    本文件不引入任何切换代码。
+# 4. chartCategoricalColors 必须**正好 10 个颜色**（Streamlit 硬性要求），
+#    且与 app/visual_theme.py 的 CHART_COLORS **值完全一致**（有单测断言）。
+
+[theme]
+# 品牌主色：X 光/透视的冷色调（靛青）。主按钮、当前会话标签、滑块等强调元素。
+primaryColor = "#2E6F8E"
+# 基础圆角（卡片/按钮的统一观感）
+baseRadius = "medium"
+baseFontSize = 16
+# 标题层级：建立"从哪开始读"的视觉引导（h1 明显大于 h2，h3 起收紧）
+headingFontSizes = [30, 22, 18, 16, 15, 14]
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+# 图表配色：与主色同族的 10 色序列
+chartCategoricalColors = [
+    "#2E6F8E", "#4F9BBF", "#7BC0D9", "#A8D5E2", "#C9E4EA",
+    "#8FB8A8", "#B7C9A8", "#D9CBA8", "#C9A8B7", "#9E9E9E",
+]
+
+# ---- 浅色主题：主区白 / 侧栏浅灰蓝（"工作台 vs 控制面板"的分区感）----
+[theme.light]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F7F9"
+textColor = "#1B2A33"
+borderColor = "#DCE4E8"
+
+[theme.light.sidebar]
+backgroundColor = "#F4F7F9"
+secondaryBackgroundColor = "#FFFFFF"
+
+# ---- 深色主题：深蓝灰底（非纯黑，减少眩光且与主色同族）----
+[theme.dark]
+backgroundColor = "#0E1A20"
+secondaryBackgroundColor = "#16262E"
+textColor = "#E3EDF2"
+borderColor = "#2A3F4A"
+
+[theme.dark.sidebar]
+backgroundColor = "#16262E"
+secondaryBackgroundColor = "#1E333D"

@@ -3,9 +3,16 @@
 为什么需要集中（docs/UI工程质量与配置化设计.md 2.1）：此前魔法数字散落在
 ``streamlit_app.py`` 与各 panel 中，后续改动（流式 / 标签页 / 重试）都要复用
 这些值；集中后改一处即全局生效，且便于在文档中说明每个值的依据。
+
+**跨层视觉常量**（配色等）不在此处，而在 ``app/visual_theme.py``——
+工具层（plot_chart）也要用配色，放此处会造成"工具层依赖 UI 层"的依赖错觉
+（见 docs/UI视觉优化设计.md 5.2）。本模块只放**纯 UI 布局/交互**参数。
 """
 
 from __future__ import annotations
+
+# 供 UI 层引用跨层视觉常量（再导出，避免各处 import 两个模块）。
+from app.visual_theme import BRAND_PRIMARY, CHART_COLORS  # noqa: F401
 
 # 左右栏滚动容器高度（px）。
 # 依据：常见笔记本视口高度约 800~900px，减去标题栏/标签条/输入框后留给
