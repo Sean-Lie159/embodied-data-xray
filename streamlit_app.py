@@ -21,14 +21,20 @@ from app.ui.components import (
     render_token_stats,
     render_tool_activity,
 )
+from app.ui.constants import (
+    CHAT_INPUT_RESERVE_PX,
+    COLUMN_RATIO,
+    SCROLL_HEIGHT,
+    SESSION_LABEL_MAX_CHARS,
+)
 from app.ui.data_loader_panel import render_data_loader
 from app.ui.onboarding import render_onboarding
 from app.ui.settings_panel import render_model_settings
 
 st.set_page_config(page_title="Embodied-data-Xray", page_icon="🩻", layout="wide")
 
-# 左右栏可滚动容器高度（像素）。按视口合理设定，避免与页面级滚动叠成双重滚动条。
-_SCROLL_HEIGHT = 600
+# 左右栏可滚动容器高度（px）——集中在 app/ui/constants.py，见其依据注释。
+_SCROLL_HEIGHT = SCROLL_HEIGHT
 
 
 def _inject_scroll_css() -> None:
@@ -39,18 +45,23 @@ def _inject_scroll_css() -> None:
        ``st.container(height=...)`` 内独立滚动，避免"页面 + 容器"双重滚动条的别扭体验。
     2. 给聊天容器开启 ``overflow-anchor``（滚动锚定），使新消息到达时自动贴底，
        而不是把滚动位置留在旧消息处。
+
+    注意（技术债）：本函数依赖 Streamlit 内部 DOM 与类名（``.block-container``、
+    ``data-testid="stVerticalBlock"``），升级 Streamlit 时需重新验收布局
+    （打开页面确认无双重滚动条、最后一条消息不被输入框遮挡）。
     """
     st.markdown(
-        """
+        f"""
         <style>
         /* 页面主体不滚动：左右栏各自在固定高度容器内滚动，避免双重滚动条 */
-        .block-container { overflow: hidden; }
-        /* 输入框钉底（fixed）会盖住容器底部内容：给主区底部预留输入框高度 */
-        .block-container { padding-bottom: 130px; }
+        .block-container {{ overflow: hidden; }}
+        /* 输入框钉底（fixed）会盖住容器底部内容：给主区底部预留输入框高度。
+           像素值依据见 app/ui/constants.py 的 CHAT_INPUT_RESERVE_PX。 */
+        .block-container {{ padding-bottom: {CHAT_INPUT_RESERVE_PX}px; }}
         /* 滚动锚定：聊天/面板容器内新内容追加时尽量保持贴底/原位置稳定 */
-        [data-testid="stVerticalBlock"] > div {
+        [data-testid="stVerticalBlock"] > div {{
             overflow-anchor: auto;
-        }
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -108,18 +119,44 @@ def _close_session(tag: str) -> None:
         st.session_state.active_session = next(iter(sessions))
 
 
-def _accumulate_metrics(cumulative: dict, turn) -> None:
-    """把本轮观测指标（耗时 / 模型往返次数）累加进会话统计。
+def _record_turn(cumulative: dict, turn, messages: list[dict]) -> None:
+    """把一轮结果记入会话统计与消息列表（token / 轮数 / 耗时 / 往返次数）。
 
-    为什么在 UI 侧累加而不在 ChatService 内：累计量是**展示语义**（会话级
-    统计），服务层只负责单轮事实；两处口径不同，混在一起会让 service 承担
-    它不该知道的 UI 概念。
+    为什么集中（docs/UI工程质量与配置化设计.md 2.3）：此前 token 累加在
+    "正常输入"与"编辑重发"两处各写一遍，metrics 累加单列一个函数但调用点靠
+    人工记得——任何新增交互入口（流式 / 重试 / 重新生成）都可能漏掉某处，
+    导致统计静默偏差。集中后所有入口调用同一函数，杜绝漏加。
+
+    累计量放 UI 侧而不放 ChatService：累计是**展示语义**（会话级统计），
+    服务层只负责单轮事实；两处口径不同。
+
+    Args:
+        cumulative: 会话累计统计 dict（就地修改）。
+        turn: 本轮 ChatTurn。
+        messages: 会话消息列表（就地追加 assistant 消息）。
     """
+    if turn.usage:
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            cumulative[key] = cumulative.get(key, 0) + turn.usage.get(key, 0)
+    cumulative["rounds"] = cumulative.get("rounds", 0) + 1
     m = getattr(turn, "metrics", None) or {}
     cumulative["duration_ms"] = int(cumulative.get("duration_ms", 0)) + int(
         m.get("duration_ms", 0) or 0)
     cumulative["n_model_calls"] = int(cumulative.get("n_model_calls", 0)) + int(
         m.get("n_model_calls", 0) or 0)
+    messages.append({"role": "assistant", "content": turn.reply, "turn": turn})
+
+
+def _last_turn(messages: list[dict]):
+    """返回最近一条 assistant 消息携带的 ChatTurn（无则 None）。
+
+    比 ``messages[-1].get("turn")`` 更健壮：即便末尾是用户消息（如编辑态）
+    也能取到最近一次真实回答的用量，且不会因 turn 缺失抛 AttributeError。
+    """
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            return msg.get("turn")
+    return None
 
 
 def _render_session_tabs() -> None:
@@ -175,16 +212,15 @@ def _main() -> None:
         # 该会话加载数据集后，标签名自动改为数据集名（多会话时便于辨识）。
         ds_id = service.context.dataset_id
         if ds_id and _stt.get("name", "").startswith("对话 "):
-            _stt["name"] = f"{ds_id[:18]}…" if len(ds_id) > 18 else ds_id
+            _stt["name"] = (
+                f"{ds_id[:SESSION_LABEL_MAX_CHARS]}…"
+                if len(ds_id) > SESSION_LABEL_MAX_CHARS else ds_id
+            )
 
     # 侧栏：Token 统计（本轮 + 会话累计；刷新页面重置属正常，不持久化）。
     with st.sidebar:
-        last_usage = (
-            messages[-1].get("turn").usage
-            if messages and messages[-1].get("turn") is not None
-            else None
-        )
-        render_token_stats(last_usage, cumulative)
+        last = _last_turn(messages)
+        render_token_stats(last.usage if last is not None else None, cumulative)
 
         # 上下文管理：历史体积 + 手动压缩（对应"二者皆做"的手动入口）。
         st.divider()
@@ -212,7 +248,7 @@ def _main() -> None:
                 )
                 st.rerun()
 
-    left, right = st.columns([1, 1.2], gap="large")
+    left, right = st.columns(list(COLUMN_RATIO), gap="large")
 
     # ---- 左侧：对话区（聊天记录独立滚动 + 输入框钉底固定）----
     with left:
@@ -248,18 +284,7 @@ def _main() -> None:
                             _stt["editing_index"] = None
                             with st.spinner("重新生成回答……"):
                                 turn = service.reply(new_text.strip())
-                            messages.append(
-                                {"role": "assistant", "content": turn.reply,
-                                 "turn": turn})
-                            if turn.usage:
-                                cumulative["input_tokens"] += turn.usage.get(
-                                    "input_tokens", 0)
-                                cumulative["output_tokens"] += turn.usage.get(
-                                    "output_tokens", 0)
-                                cumulative["total_tokens"] += turn.usage.get(
-                                    "total_tokens", 0)
-                            cumulative["rounds"] += 1
-                            _accumulate_metrics(cumulative, turn)
+                            _record_turn(cumulative, turn, messages)
                             st.rerun()
                 else:
                     with st.chat_message(msg["role"]):
@@ -295,14 +320,8 @@ def _main() -> None:
                     st.markdown(turn.reply)
                     render_tool_activity(turn)
 
-            # 累计本轮 token 用量（usage 为 None 时不加，避免 0 冒充）。
-            if turn.usage:
-                cumulative["input_tokens"] += turn.usage.get("input_tokens", 0)
-                cumulative["output_tokens"] += turn.usage.get("output_tokens", 0)
-                cumulative["total_tokens"] += turn.usage.get("total_tokens", 0)
-            cumulative["rounds"] += 1
-            _accumulate_metrics(cumulative, turn)
-            messages.append({"role": "assistant", "content": turn.reply, "turn": turn})
+            # 累计本轮统计并追加 assistant 消息（集中入口，防漏加）。
+            _record_turn(cumulative, turn, messages)
 
     # ---- 右侧：展示区（固定高度独立滚动容器）----
     with right:

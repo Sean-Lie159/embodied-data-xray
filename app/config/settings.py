@@ -59,6 +59,8 @@ class Settings(BaseSettings):
 
     # --- 数据处理与运行 ------------------------------------------------------
     output_dir: str = "outputs"
+    # 单文件上传大小上限（MB）：仅 UI 辅助通道，目录型数据集请走路径输入。
+    upload_max_mb: int = Field(default=200, ge=1)
     # 主表装载行数上限（安全阀）。默认全量装载；仅当单表行数超过此阈值时截断，
     # 且返回必须同时含 rows_total / rows_loaded 并明确提示截断。默认值设得足够大，
     # 使常规采集数据（数万行）不被静默截断。

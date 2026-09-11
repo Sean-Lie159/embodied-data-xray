@@ -16,9 +16,6 @@ from app.config.settings import get_settings
 from app.tools.load_dataset import load_dataset_impl
 from app.ui.upload_store import ALLOWED_SUFFIXES, save_upload
 
-# 单文件上传大小上限（MB）：仅辅助通道，目录型数据集请走路径输入。
-_MAX_UPLOAD_MB = 200
-
 
 def _append_message(messages: list[dict], content: str) -> None:
     """向对话流追加一条 assistant 说明消息（不触发 agent，无工具轨迹）。"""
@@ -63,6 +60,8 @@ def _load_path(service, messages: list[dict], path: str) -> bool:
 
 def render_data_loader(service, messages: list[dict]) -> None:
     """渲染侧栏"数据加载"折叠面板（调用方置于 st.sidebar 内）。"""
+    # 上传上限来自配置（AGENTS.md 第 6 条：配置项集中在 app/config/）。
+    max_upload_mb = get_settings().upload_max_mb
     with st.expander("数据加载"):
         # 主路径：粘贴绝对路径（文件或目录均可）。
         path = st.text_input(
@@ -86,7 +85,7 @@ def render_data_loader(service, messages: list[dict]) -> None:
         st.divider()
         # 辅路径：单文件上传（目录型数据集不适用）。
         st.caption(
-            f"单文件上传（≤{_MAX_UPLOAD_MB}MB，{'/'.join(sorted(ALLOWED_SUFFIXES))}）；"
+            f"单文件上传（≤{max_upload_mb}MB，{'/'.join(sorted(ALLOWED_SUFFIXES))}）；"
             "多文件数据集请用上方路径输入。"
         )
         upload = st.file_uploader(
@@ -95,8 +94,8 @@ def render_data_loader(service, messages: list[dict]) -> None:
             key="dataset_uploader",
         )
         if upload is not None and st.button("保存并加载上传文件", key="btn_load_upload"):
-            if upload.size > _MAX_UPLOAD_MB * 1024 * 1024:
-                st.error(f"文件超过 {_MAX_UPLOAD_MB}MB 上限，请改用路径输入。")
+            if upload.size > max_upload_mb * 1024 * 1024:
+                st.error(f"文件超过 {max_upload_mb}MB 上限，请改用路径输入。")
             else:
                 try:
                     uploads_dir = Path(get_settings().output_path()) / "uploads"
