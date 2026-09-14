@@ -33,6 +33,72 @@ _MAX_SUBSTREAMS = 80
 _TRUNCATION_RATIO = 0.05
 
 
+def _timing_from_array(values: Any, unit: str) -> dict[str, Any] | None:
+    """从**已知单位**的时间戳数组算统计（采样率 / 跨度 / 缺口 / 流形态）。
+
+    与 :func:`_stream_timing` 的区别：单位由调用方给定（如 MCAP 容器时间恒为
+    纳秒），不做单位推断——避免对已明确的数据再猜一次。
+
+    **流形态辨别**（2026-09-14 真实缺陷）：突发型流（MCAP 的 /tf、IMU 突发内
+    微秒级、突发间毫秒级静默）的"缺口"是**伪影**——按"间隔 > 5×中位"统计会
+    把每个突发间静默都算成丢包（实测 /tf 报出 121620 个"缺口"，实为噪声）。
+    故对 burst 流把缺口计数置 None 并附说明，改报突发段数（与
+    check_temporal_sync 的既有口径一致）。
+
+    Args:
+        values: 时间戳序列（array-like，数值）。
+        unit: 单位（须在 TIME_UNITS 内，如 "ns"）。
+
+    Returns:
+        dict（start_ns/end_ns/span_s/n/rate_hz/n_gaps/max_gap_s/shape）；
+        不足 2 点返回 None。
+    """
+    arr = np.sort(np.asarray(values, dtype=float))
+    if arr.size == 0:
+        return None
+    from app.tools.timestamp_units import TIME_UNITS, to_ns
+
+    if unit in TIME_UNITS:
+        arr = to_ns(arr, unit)
+    if len(arr) < 2:
+        return None
+    span = float(arr[-1] - arr[0])
+    diffs = np.diff(arr)
+    med = float(np.median(diffs)) if len(diffs) else 0.0
+    n_gaps = int((diffs > 5 * med).sum()) if med > 0 else 0
+    max_gap = float(diffs.max()) if len(diffs) else 0.0
+
+    # 流形态：复用 check_temporal_sync 的唯一实现（阈值同源，避免两套口径）。
+    shape = "periodic"
+    try:
+        from app.config import get_settings
+        from app.tools.check_temporal_sync import _classify_stream_shape
+
+        shape = _classify_stream_shape(arr, get_settings())
+    except Exception:  # noqa: BLE001 - 形态判定失败不阻塞对齐
+        shape = "periodic"
+
+    out: dict[str, Any] = {
+        "start_ns": float(arr[0]),
+        "end_ns": float(arr[-1]),
+        "span_s": round(span / 1e9, 3),
+        "n": int(len(arr)),
+        "rate_hz": round((len(arr) - 1) / (span / 1e9), 3) if span > 0 else None,
+        "unit": unit,
+        "shape": shape,
+    }
+    if shape == "burst":
+        # 突发型：缺口计数不适用（突发间静默会被误报），改报突发段数。
+        big = int((diffs > 2.0 * med).sum()) if med > 0 else 0
+        out["n_gaps"] = None
+        out["n_bursts"] = big + 1 if len(diffs) else 0
+        out["gap_status"] = "not_applicable"
+    else:
+        out["n_gaps"] = n_gaps
+        out["max_gap_s"] = round(max_gap / 1e9, 3)
+    return out
+
+
 def _stream_timing(path_spec: str) -> dict[str, Any] | None:
     """取单个子流的时间戳统计（采样率 / 跨度 / 缺口）。
 
@@ -45,30 +111,12 @@ def _stream_timing(path_spec: str) -> dict[str, Any] | None:
     result = read_stream(ReadRequest(path_spec=path_spec, want="timestamp"))
     if not result.ok or result.timestamp is None:
         return None
-    arr = np.sort(np.asarray(result.timestamp, dtype=float))
-    # 时间戳单位：按列名/量级推断并归一化到纳秒（复用既有单位链路）。
-    from app.tools.timestamp_units import TIME_UNITS, infer_unit, to_ns
+    arr = np.asarray(result.timestamp, dtype=float)
+    # 时间戳单位：按列名/量级推断（复用既有单位链路）。
+    from app.tools.timestamp_units import infer_unit
 
     unit = infer_unit(arr, result.timestamp_column or "")["unit"]
-    if unit in TIME_UNITS:
-        arr = to_ns(arr, unit)
-    if len(arr) < 2:
-        return None
-    span = float(arr[-1] - arr[0])
-    diffs = np.diff(arr)
-    med = float(np.median(diffs)) if len(diffs) else 0.0
-    n_gaps = int((diffs > 5 * med).sum()) if med > 0 else 0
-    max_gap = float(diffs.max()) if len(diffs) else 0.0
-    return {
-        "start_ns": float(arr[0]),
-        "end_ns": float(arr[-1]),
-        "span_s": round(span / 1e9, 3),
-        "n": int(len(arr)),
-        "rate_hz": round((len(arr) - 1) / (span / 1e9), 3) if span > 0 else None,
-        "n_gaps": n_gaps,
-        "max_gap_s": round(max_gap / 1e9, 3),
-        "unit": unit,
-    }
+    return _timing_from_array(arr, unit)
 
 
 def align_container_streams_impl(
@@ -129,12 +177,38 @@ def align_container_streams_impl(
     subs = subs[:max_streams]
 
     # 逐子流取时间统计（只读时间戳列，不读全量数据）。
+    #
+    # **MCAP 走批量路径**（2026-09-14 性能事故）：mcap 库的
+    # `iter_messages(topics=[t])` 过滤开销与文件总消息数成正比（实测 1.86GB /
+    # 419 万条消息的容器：遍历全部 32.8s，而"只取单个 topic"也要 16s）——
+    # 逐 topic 过滤是 O(全部消息) × topic 数，26 个 topic 实测 431 秒。
+    # 故先一次遍历分桶取齐所有 topic 的时间戳，再逐个组装（总耗时 ≈ 33s）。
+    mcap_paths: dict[str, str] = {}   # topic -> file（MCAP 子流）
+    if any(s.get("format") == "mcap" for s in subs):
+        for s in subs:
+            if s.get("format") != "mcap":
+                continue
+            file_part, sub_name = (s.get("path", "").partition("::")[0],
+                                   s.get("path", "").partition("::")[2])
+            if sub_name:
+                mcap_paths[sub_name] = file_part
+    mcap_ts: dict[str, Any] = {}
+    if mcap_paths:
+        from app.tools.mcap_reader import read_mcap_all_timestamps
+
+        # 同一容器文件（本工具的 target_file）一次性取齐。
+        mcap_ts = read_mcap_all_timestamps(target_file, list(mcap_paths))
+
     rows: list[dict[str, Any]] = []
     for s in subs:
         spec = s.get("path", "")
-        timing = _stream_timing(spec)
-        label = s.get("semantic_label") or s.get("kind") or ""
         sub_name = spec.partition("::")[2]
+        if s.get("format") == "mcap" and sub_name in mcap_ts:
+            timing = _timing_from_array(
+                mcap_ts[sub_name]["log_time_ns"], "ns")
+        else:
+            timing = _stream_timing(spec)
+        label = s.get("semantic_label") or s.get("kind") or ""
         if timing is None:
             rows.append({
                 "sub": sub_name, "label": label, "status": "no_timestamp",
@@ -159,6 +233,7 @@ def align_container_streams_impl(
     master_start, master_span = master["start_ns"], master["span_s"]
 
     warnings: list[str] = []
+    burst_subs: list[str] = []
     for r in ok_rows:
         head_off = (r["start_ns"] - master_start) / 1e9
         tail_off = (r["end_ns"] - (master_start + master_span * 1e9)) / 1e9
@@ -173,11 +248,34 @@ def align_container_streams_impl(
         if abs(tail_off) > thr:
             notes.append(f"结束比主时钟{'早' if tail_off < 0 else '晚'} "
                          f"{abs(tail_off):.1f}s（疑似截断）")
-        if r["n_gaps"]:
+        # 缺口只对周期型流报（突发型的"缺口"是突发间静默的伪影，见
+        # _timing_from_array 的说明——此前误报 /tf 有 12 万个"缺口"）。
+        if r.get("shape") == "burst":
+            burst_subs.append(r["sub"])
+            notes.append(
+                f"突发型流（{r.get('n_bursts')} 个突发段）：丢包/缺口口径不适用，"
+                "突发间静默不算丢包"
+            )
+        elif r.get("n_gaps"):
             notes.append(f"{r['n_gaps']} 个缺口（最大 {r['max_gap_s']}s）")
         r["notes"] = notes
         if notes:
             warnings.append(f"{r['sub']}：{'；'.join(notes)}")
+
+    # 多时钟提示（**诚实降级**）：本工具取的是**容器时间戳**
+    # （MCAP 的 log_time / publish_time）。若容器为突发型而消息体自带传感器
+    # 时间戳（如 /tf 的 data.transforms[].timestamp_us），则容器时间可能只是
+    # 批量写入时间，据此判定的"采样率/缺口"不代表传感器真实节拍——必须提示
+    # 用户改用 time_column 指定传感器时间列复核，不得让结论被当作定论。
+    clock_note: str | None = None
+    if burst_subs:
+        clock_note = (
+            f"注意：{len(burst_subs)} 个子流（如 {burst_subs[0]}）在容器时间口径下"
+            "呈突发型。若其消息体自带传感器时间戳（MCAP 常见 data.*_time_us 字段），"
+            "则容器时间可能只是**批量写入时间**而非传感器采样节拍——"
+            "此时上述采样率与突发段数不代表真实节拍。建议用 check_temporal_sync 的 "
+            "time_column 参数指定传感器时间列复核后再下结论。"
+        )
 
     return {
         "success": True,
@@ -190,6 +288,8 @@ def align_container_streams_impl(
                    "rate_hz": master["rate_hz"]},
         "streams": rows,
         "warnings": warnings,
+        "burst_streams": burst_subs,
+        "clock_note": clock_note,
         "user_message": (
             f"容器 {Path(target_file).name}：{len(ok_rows)}/{len(subs)} 个子流"
             f"有可用时间戳；主时钟为 {master['sub']}（跨度 {master['span_s']}s，"
@@ -197,6 +297,7 @@ def align_container_streams_impl(
             + (f" 发现 {len(warnings)} 条可疑：{'；'.join(warnings[:3])}"
                + ("…" if len(warnings) > 3 else "") if warnings else " 各子流首尾对齐良好。")
             + (" （子流数超上限，已截断）" if truncated else "")
+            + (f" {clock_note}" if clock_note else "")
         ),
     }
 

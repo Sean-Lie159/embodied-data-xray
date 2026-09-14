@@ -584,17 +584,30 @@ class _McapReader:
         return [t["topic"] for t in (probe.get("topics") or [])]
 
     def timestamp(self, path: str, *, sub: str | None, column: str | None):
-        """MCAP 容器时间为 uint64 纳秒（列名带 _ns 后缀）。"""
-        df = self.frame(path, sub=sub, limit=None)
-        if df is None:
+        """MCAP 容器时间为 uint64 纳秒（列名带 _ns 后缀）。
+
+        **走轻量路径**（2026-09-14 性能事故修复）：此前实现是全量读 topic
+        （``self.frame(...)``，含每条消息的 ``json.loads`` 与 DataFrame 构建），
+        而取时间戳**不需要解析载荷**。实测 1.86GB/419 万条消息的 MCAP 上，
+        align_container_streams 逐 topic 全量读取共耗时 **909 秒**（卡死感）。
+        改用 :func:`read_mcap_topic_timestamps` 只迭代消息头后，无需 JSON 解码。
+        """
+        if not sub:
             return (None, None)
+        from app.tools.mcap_reader import read_mcap_topic_timestamps
+
+        result = read_mcap_topic_timestamps(path, sub)
+        if not result.get("success") or result.get("n_rows", 0) == 0:
+            return (None, None)
+        # 字段选择：默认容器日志时间（列名带 _ns 后缀，杜绝单位误读）。
         field = column or "mcap_log_time_ns"
-        if field not in df.columns:
-            field = "mcap_log_time_ns" if "mcap_log_time_ns" in df.columns else None
-        if field is None:
+        arr = (result["publish_time_ns"] if "publish_time" in str(field)
+               else result["log_time_ns"])
+        if arr is None or len(arr) == 0:
             return (None, None)
-        series = df[field]
-        series.name = field
+        import pandas as pd
+
+        series = pd.Series(arr, name=field)
         return (series, field)
 
 

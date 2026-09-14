@@ -217,6 +217,137 @@ def _iter_decoded_messages(
             )
 
 
+def read_mcap_topic_timestamps(
+    path: str, topic: str, max_messages: int | None = None
+) -> dict[str, Any]:
+    """**只读** topic 的时间戳列（不解析 JSON 载荷）。
+
+    为什么需要（2026-09-14 性能事故）：``align_container_streams`` 要对每个子流
+    取时间戳做对齐全貌，而原先走的是 ``read_mcap_topic`` **全量路径**——它对每条
+    消息都做 ``json.loads`` 并构建含 ``data`` 列的 DataFrame。实测某 1.86GB /
+    419 万条消息的 MCAP：26 个 topic 串行全量读取共 **909 秒**（其中
+    ``tactile_point_cloud`` 两个 topic 各需约 200 秒），用户侧表现为**卡死
+    15 分钟**。
+
+    本函数只迭代 MCAP 的消息记录、取 ``log_time``/``publish_time``（**无需 JSON
+    解码**，这是省时的关键），返回紧凑的一维数组。耗时从"秒级 × 消息数"降到
+    "毫秒级 × 消息数"。
+
+    Args:
+        path: .mcap 文件路径。
+        topic: 目标 topic 名。
+        max_messages: 可选，最多取多少条（None 为全量）。
+
+    Returns:
+        dict：success、log_time_ns（np.ndarray）、publish_time_ns（np.ndarray）、
+        n_rows、topic；topic 不存在时 success=False 且 error="topic_not_found"。
+    """
+    import numpy as np  # 局部导入：保持模块导入期轻量
+
+    reader_mod = _import_mcap()
+    log_times: list[int] = []
+    pub_times: list[int] = []
+    try:
+        with Path(path).open("rb") as f:
+            reader = reader_mod.make_reader(f)
+            for _schema, _channel, message in reader.iter_messages(topics=[topic]):
+                log_times.append(int(message.log_time))
+                pub_times.append(int(message.publish_time))
+                if max_messages is not None and len(log_times) >= max_messages:
+                    break
+    except Exception as exc:  # noqa: BLE001 - 读取失败转结构化错误，不抛
+        return {
+            "success": False,
+            "error": "read_failed",
+            "topic": topic,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "user_message": f"读取 MCAP topic {topic} 的时间戳失败。",
+        }
+
+    if not log_times:
+        probe = probe_mcap(path)
+        known = {t["topic"] for t in probe.get("topics", [])} if probe.get("success") else set()
+        if topic not in known:
+            return {
+                "success": False,
+                "error": "topic_not_found",
+                "topic": topic,
+                "user_message": (
+                    f"MCAP 中不存在 topic {topic}。可用 topic 见 probe_mcap 的 topics 清单。"
+                ),
+            }
+        return {
+            "success": True,
+            "topic": topic,
+            "log_time_ns": np.asarray([], dtype=np.int64),
+            "publish_time_ns": np.asarray([], dtype=np.int64),
+            "n_rows": 0,
+            "user_message": f"topic {topic} 存在但没有消息。",
+        }
+
+    return {
+        "success": True,
+        "topic": topic,
+        "log_time_ns": np.asarray(log_times, dtype=np.int64),
+        "publish_time_ns": np.asarray(pub_times, dtype=np.int64),
+        "n_rows": len(log_times),
+    }
+
+
+def read_mcap_all_timestamps(
+    path: str, topics: list[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """**一次遍历**取多个 topic 的时间戳（按 topic 分桶）。
+
+    为什么必须"一次遍历"而非逐个 topic 调用（2026-09-14 性能事故的深层原因）：
+    ``mcap`` 库的 ``iter_messages(topics=[t])`` 过滤开销**与文件总消息数成正比**
+    ——实测 1.86GB / 419 万条消息的文件：
+
+        - 遍历全部消息（不过滤）：32.8 秒
+        - 只取单个 topic：       16 秒（哪怕该 topic 只有 1199 条）
+
+    即"逐 topic 过滤"是 O(全部消息) × topic 数。26 个 topic 逐个取 = 431 秒；
+    而一次遍历 + 内存分桶 = **约 33 秒**（与消息总数同阶，与 topic 数无关）。
+
+    Args:
+        path: .mcap 文件路径。
+        topics: 需要的 topic 列表；None 表示"文件内出现的全部 topic"。
+
+    Returns:
+        {topic: {"log_time_ns": ndarray, "publish_time_ns": ndarray, "n_rows": int}}。
+        读取失败返回空 dict（调用方按"无时间戳"处理，不抛异常）。
+    """
+    import numpy as np
+
+    reader_mod = _import_mcap()
+    wanted = set(topics) if topics else None
+    log_buf: dict[str, list[int]] = {}
+    pub_buf: dict[str, list[int]] = {}
+    try:
+        with Path(path).open("rb") as f:
+            reader = reader_mod.make_reader(f)
+            # 不传 topics 过滤器：遍历一次并自行分桶（过滤是性能瓶颈所在）。
+            for _schema, channel, message in reader.iter_messages():
+                name = getattr(channel, "topic", None)
+                if name is None:
+                    continue
+                if wanted is not None and name not in wanted:
+                    continue
+                log_buf.setdefault(name, []).append(int(message.log_time))
+                pub_buf.setdefault(name, []).append(int(message.publish_time))
+    except Exception:  # noqa: BLE001
+        return {}
+
+    return {
+        name: {
+            "log_time_ns": np.asarray(log_buf[name], dtype=np.int64),
+            "publish_time_ns": np.asarray(pub_buf[name], dtype=np.int64),
+            "n_rows": len(log_buf[name]),
+        }
+        for name in log_buf
+    }
+
+
 def read_mcap_topic(
     path: str,
     topic: str,
@@ -304,7 +435,6 @@ UNPACK_FORMATS: dict[str, str] = {
     "json": ".json",
     "csv": ".csv",
 }
-
 
 def _safe_filename(topic: str) -> str:
     """把 topic 名转成安全的文件名（去掉前导斜杠、替换路径分隔符）。"""
