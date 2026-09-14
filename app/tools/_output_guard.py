@@ -65,12 +65,48 @@ def measure_tokens(obj: Any) -> int:
     return estimate_tokens(text)
 
 
+def _quick_size_probe(obj: Any, max_nodes: int = 200_000) -> int | None:
+    """廉价探测对象规模（节点计数），用于**跳过**明显的巨物。
+
+    为什么需要（2026-09-14 性能事故）：`enforce_output_limit` 内部会多次调用
+    `_measure_data`（档 1 每丢一个字段一次、档 2 自适应 6 档各一次）。每次都要
+    `json.dumps` 整个对象 + 逐字符遍历——对真实事故里的 4718 万字符返回，单次
+    约 1.4 秒，多次累计到 14.5 秒，用户侧表现为卡死。
+
+    本函数只做**计数**不做字符串化，遇到超过 ``max_nodes`` 的对象立即返回
+    （提前退出），使超大对象的判定成本从"秒级"降到"微秒级"。返回 None 表示
+    "规模大到无需精确测量，必然超预算"。
+
+    Args:
+        obj: 待探测对象。
+        max_nodes: 节点数上限；超过即返回 None。
+
+    Returns:
+        节点数（未超上限时）；超上限返回 None。
+    """
+    count = 0
+    stack: list[Any] = [obj]
+    while stack:
+        item = stack.pop()
+        count += 1
+        if count > max_nodes:
+            return None
+        if isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return count
+
+
 def _measure_data(obj: Any) -> int:
     """测量**数据体积**（排除护栏自身追加的 truncation_note 元信息）。
 
     为什么排除 note：note 是护栏加的说明文本（固定几十 token）。若计入达标判定，
     会出现"加了说明反而超预算"的降级螺旋——本已达标的结果因 note 超限而被迫
     多降一档，信息损失更大却只为容纳一句说明。
+
+    性能：先做廉价规模探测，明显超大（>20 万节点）时直接返回一个**远超任何
+    预算**的估算值，避免对巨物做 json.dumps + 逐字符遍历（见 _quick_size_probe）。
 
     Args:
         obj: 任意对象。
@@ -79,7 +115,11 @@ def _measure_data(obj: Any) -> int:
         数据部分的估算 token 数。
     """
     if isinstance(obj, dict) and "truncation_note" in obj:
-        return measure_tokens({k: v for k, v in obj.items() if k != "truncation_note"})
+        obj = {k: v for k, v in obj.items() if k != "truncation_note"}
+    if _quick_size_probe(obj) is None:
+        # 规模已远超任何合理预算（单工具上限万级 token）——无需精确值，
+        # 直接给一个必然触发压缩的大数即可。
+        return 10**9
     return measure_tokens(obj)
 
 

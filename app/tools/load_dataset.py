@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -309,17 +310,230 @@ def _load_hdf5_native(path: str) -> pd.DataFrame | None:
         return None
 
 
+# "每帧一组"布局的识别与合并（2026-09-14 真实事故修复）。
+#
+# 事故：目录内 aligned_joints.h5（513MB）的结构是 14135 个**数字命名的顶层组**
+# （0/、1/、2/…），每组下是与帧内各部位对应的同名叶子数据集
+# （action/end/orientation、state/end/arm_orientation 等，每个 shape 仅 (2,4) 或
+# (14,)）。此前的实现把"每个叶子数据集"都登记为一条独立流 → **84,810 条流**，
+# 带来三重后果：
+#   1. `context.meta` 常驻 3600 万字符（估算 1200 万 token）；
+#   2. `inspect_streams` 返回 4718 万字符，护栏为测量体积要反复序列化（实测 14.5s）；
+#   3. 用户在界面上表现为"卡死"（实际是纯计算耗时数十秒到分钟级，非死循环）。
+#
+# 语义上，这种布局是**同一批字段按帧索引分片**，正确理解是"一组多帧序列"而非
+# "N 万条独立流"。故合并：按"去掉顶层帧号后的相对路径"分组，每组登记为一条流，
+# 并把帧号作为索引维度记录在 n_frames 上。
+#
+# 识别条件（必须同时满足，避免误合并正常的多节点文件）：
+#   - 顶层条目**全部**是纯数字名（帧号形态）；
+#   - 顶层条目数 ≥ _FRAME_LAYOUT_MIN_GROUPS（少于此不值得合并）；
+#   - 各帧下相对路径集合一致（同一批字段逐帧重复）。
+_FRAME_LAYOUT_MIN_GROUPS = 50
+# 合并后单条流记录的帧号样例上限（记录范围而非全部帧号，控制元数据体积）。
+_MAX_RECORDED_FRAME_IDS = 20
+
+# 单容器登记的流数硬上限（兜底护栏，2026-09-14）。
+# 正常容器：h5 节点数在个位到数十；MCAP topic 数十到数百（实测 26）。
+# 取 500 留足余量，同时把"异常布局导致上万条流"这类事故挡在源头。
+_MAX_STREAMS_PER_CONTAINER = 500
+
+# 帧布局下扫描的样本帧数（2026-09-14 性能事故）。
+# 全量遍历 88 万节点耗时约 57 秒；帧布局下各帧结构按语义必然一致，
+# 扫 3 帧即可完整还原字段清单，把成本从 O(全部节点) 降到 O(3 帧)。
+_FRAME_SCAN_SAMPLE_FRAMES = 3
+
+
+def _is_frame_number(name: str) -> bool:
+    """判断顶层条目名是否为帧号（纯数字，可带前导零）。"""
+    return str(name).strip().isdigit()
+
+
+def _rel_node_path(node: str) -> str:
+    """取节点路径去掉首个（帧号）段后的相对路径。"""
+    s = str(node)
+    return s.split("/", 1)[1] if "/" in s else ""
+
+
+def _finalize_frame_layout(
+    sampled: list[dict[str, Any]], all_top_keys: list[str]
+) -> list[dict[str, Any]]:
+    """把"抽样帧扫描结果"整理为全部帧的合并条目（供 :func:`_merge_frame_layout`）。
+
+    背景：为避开 88 万节点的全量遍历（约 57 秒），帧布局只扫描前
+    ``_FRAME_SCAN_SAMPLE_FRAMES`` 帧。本函数以**首帧**的字段清单为准，
+    并把样本条目的帧号前缀替换为"全部帧数"，避免中间态占用内存。
+
+    **诚实标注**：抽样各帧的字段集合若不一致，字段清单只能以首帧为准——
+    此时在每条目上标 ``inconsistent_frames=True`` 并给出不一致的样例帧号，
+    供用户判断（不静默掩盖）。
+
+    Args:
+        sampled: 抽样帧扫描出的条目（node 形如 ``0/action/end/position``）。
+        all_top_keys: 文件的所有顶层键（帧号）。
+
+    Returns:
+        整理后的条目列表：每条对应一个字段（相对路径），``n_frames`` 为全部帧数。
+    """
+    frame_ids = sorted(all_top_keys, key=int)
+    if not frame_ids:
+        return []
+    first = frame_ids[0]
+    # 按帧分组抽样结果，用于核对字段集合是否一致。
+    by_frame: dict[str, set[str]] = {}
+    for e in sampled:
+        node = str(e.get("node", ""))
+        head, _, rel = node.partition("/")
+        if rel:
+            by_frame.setdefault(head, set()).add(rel)
+    base_fields = by_frame.get(first, set())
+    inconsistent = any(fields != base_fields for fields in by_frame.values())
+    bad_frames = [f for f, fields in by_frame.items() if fields != base_fields] \
+        if inconsistent else []
+
+    out: list[dict[str, Any]] = []
+    for e in sampled:
+        node = str(e.get("node", ""))
+        head, _, rel = node.partition("/")
+        if head != first or not rel:
+            continue
+        entry: dict[str, Any] = {
+            "node": f"{first}/{rel}",   # 占位前缀，合并时按 rel 折叠
+            "rows": int(e.get("rows") or 0),
+            "cols": int(e.get("cols") or 0),
+            "fields": e.get("fields", []),
+            "n_frames": len(frame_ids),
+            "frame_ids_sample": frame_ids[:_MAX_RECORDED_FRAME_IDS],
+            "frame_layout": True,
+        }
+        if inconsistent:
+            entry["inconsistent_frames"] = True
+            entry["inconsistent_sample"] = bad_frames[:_MAX_RECORDED_FRAME_IDS]
+        out.append(entry)
+    return out
+
+
+def _merge_frame_layout(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把"每帧一组"布局的节点清单合并为按字段分组的少量流。
+
+    Args:
+        entries: 原始节点清单（每条含 node / rows / cols / fields）。
+
+    Returns:
+        合并后的条目清单；不符合帧布局特征时**原样返回**（零回归）。
+        合并条目额外带 ``n_frames`` / ``frame_ids_sample`` / ``frame_layout``。
+    """
+    # 已完成抽样整理的条目（带 frame_layout 标记）：按相对路径折叠，行数 × 帧数。
+    # 注意：此分支必须在"条目数下限"检查**之前**——抽样整理后的条目数等于
+    # 字段数（本例 6 条），远小于 _FRAME_LAYOUT_MIN_GROUPS，若先做下限检查会
+    # 直接返回未合并的条目（真实踩坑：路径仍带 "0/" 前缀、n_rows 未乘帧数）。
+    if entries and all(e.get("frame_layout") for e in entries):
+        merged_sampled: list[dict[str, Any]] = []
+        for e in entries:
+            rel = _rel_node_path(e.get("node", ""))
+            if not rel:
+                continue
+            n_frames = int(e.get("n_frames") or 1)
+            item: dict[str, Any] = {
+                "node": rel,
+                "rows": int(e.get("rows") or 0) * n_frames,
+                "cols": int(e.get("cols") or 0),
+                "fields": e.get("fields", []),
+                "n_frames": n_frames,
+                "frame_ids_sample": e.get("frame_ids_sample", []),
+                "frame_layout": True,
+            }
+            # 帧结构不一致的标注必须透传（不得在合并时丢失）。
+            for key in ("inconsistent_frames", "inconsistent_sample"):
+                if e.get(key):
+                    item[key] = e[key]
+            merged_sampled.append(item)
+        if merged_sampled:
+            merged_sampled.sort(
+                key=lambda c: (-(c["rows"] * max(1, c["cols"])), c["node"])
+            )
+            return merged_sampled
+        return entries
+
+    if len(entries) < _FRAME_LAYOUT_MIN_GROUPS:
+        return entries
+    frame_groups: dict[str, list[dict[str, Any]]] = {}
+    for e in entries:
+        head = str(e.get("node", "")).split("/", 1)[0]
+        if not _is_frame_number(head):
+            return entries  # 有非数字顶层条目 → 不是帧布局，保守不合并
+        frame_groups.setdefault(head, []).append(e)
+    if len(frame_groups) < _FRAME_LAYOUT_MIN_GROUPS:
+        return entries
+
+    first_key = next(iter(frame_groups))
+    baseline = {_rel_node_path(e.get("node", "")) for e in frame_groups[first_key]}
+    baseline.discard("")
+    if not baseline:
+        return entries
+    # 抽样核对若干帧的路径集合是否一致（全量核对代价高）。
+    checked = 0
+    for fid, items in frame_groups.items():
+        if fid == first_key:
+            continue
+        if {_rel_node_path(e.get("node", "")) for e in items} - {""} != baseline:
+            return entries  # 各帧结构不一致 → 不合并
+        checked += 1
+        if checked >= 5:
+            break
+
+    merged: dict[str, dict[str, Any]] = {}
+    for fid, items in frame_groups.items():
+        for e in items:
+            rel = _rel_node_path(e.get("node", ""))
+            if not rel:
+                continue
+            slot = merged.setdefault(rel, {
+                "node": rel,
+                "rows": 0,
+                "cols": int(e.get("cols") or 0),
+                "fields": e.get("fields", []),
+                "_frame_ids": [],
+            })
+            slot["rows"] += int(e.get("rows") or 0)
+            if len(slot["_frame_ids"]) < _MAX_RECORDED_FRAME_IDS:
+                slot["_frame_ids"].append(fid)
+    if not merged:
+        return entries
+
+    frame_ids = sorted(frame_groups, key=lambda x: int(x))
+    out: list[dict[str, Any]] = []
+    for rel, slot in merged.items():
+        out.append({
+            "node": rel,
+            "rows": slot["rows"],
+            "cols": slot["cols"],
+            "fields": slot["fields"],
+            "n_frames": len(frame_ids),
+            "frame_ids_sample": slot["_frame_ids"],
+            "frame_layout": True,
+        })
+    # 与未合并路径保持同一排序口径：行×列降序，路径字母序。
+    out.sort(key=lambda c: (-(c["rows"] * max(1, c["cols"])), c["node"]))
+    return out
+
+
 def _list_hdf5_native_nodes(path: str) -> list[dict[str, Any]]:
     """列出 h5py 原生层级文件的全部候选数据节点（供流登记）。
 
     候选与 _load_hdf5_native 同口径：compound dtype（字段名即列名）或
     2D 数值数组；object 标量与 1D 标量数组不算表。
 
+    **"每帧一组"布局会被合并**（见 :func:`_merge_frame_layout`）：真实数据集
+    aligned_joints.h5 的 14135 帧 × 6 字段会被登记为 6 条流而非 84,810 条——
+    否则 `context.meta` 常驻上千万 token、下游工具返回上千万字符，表现为界面卡死。
+
     Args:
         path: 文件路径。
 
     Returns:
         节点清单 [{node, rows, cols, fields}]，按 行×列 降序（主表在首）；
+        帧布局合并后的条目另带 n_frames / frame_ids_sample / frame_layout。
         非 HDF5/h5py 不可用返回 []。
     """
     try:
@@ -329,28 +543,66 @@ def _list_hdf5_native_nodes(path: str) -> list[dict[str, Any]]:
     try:
         out: list[dict[str, Any]] = []
         with h5py.File(path, "r") as f:
-            def _visit(name: str, node: Any) -> None:
-                if not isinstance(node, h5py.Dataset):
-                    return
-                dtype = node.dtype
-                if node.dtype == object and node.shape == (1,):
-                    return
-                if dtype.names:
-                    ncols = len(dtype.names)
-                    fields = list(dtype.names)
-                elif node.ndim == 2:
-                    ncols = int(node.shape[1])
-                    fields = []
-                else:
-                    return
-                out.append({
-                    "node": name,
-                    "rows": int(node.shape[0]),
-                    "cols": ncols,
-                    "fields": fields,
-                })
-            f.visititems(_visit)
-        out.sort(key=lambda c: (-(c["rows"] * c["cols"]), c["node"]))
+            # 早剪枝（2026-09-14 性能事故）：真实数据集 88 万节点时，
+            # 全量 visititems 耗时约 57 秒（为每个节点构造 Python 包装对象），
+            # 用户侧表现为卡死。这里先探测**是否为"每帧一组"布局**（顶层全数字
+            # 且数量很大），若是则只扫描前若干帧——帧间结构按该布局的语义必然
+            # 一致，扫 3 帧即可完整还原字段清单，成本从 O(全部节点) 降到 O(帧数)。
+            top_keys = list(f.keys())
+            frame_layout = (
+                len(top_keys) >= _FRAME_LAYOUT_MIN_GROUPS
+                and all(_is_frame_number(k) for k in top_keys)
+            )
+            scan_roots: list[str] = []
+            if frame_layout:
+                scan_roots = sorted(top_keys, key=int)[:_FRAME_SCAN_SAMPLE_FRAMES]
+            else:
+                scan_roots = [""]  # 空串 = 扫描全树
+
+            def _scan(root_node: Any, prefix: str) -> None:
+                def _visit(name: str, node: Any) -> None:
+                    if not isinstance(node, h5py.Dataset):
+                        return
+                    dtype = node.dtype
+                    if dtype == object and node.shape == (1,):
+                        return
+                    if dtype.names:
+                        ncols = len(dtype.names)
+                        nrows = int(node.shape[0])
+                        fields = list(dtype.names)
+                    elif node.ndim == 2:
+                        # 2D 数值：行×列（如 orientation 的 (2,4)）。
+                        nrows = int(node.shape[0])
+                        ncols = int(node.shape[1])
+                        fields = []
+                    elif node.ndim == 1 and node.shape[0] > 1:
+                        # 1D 数值向量（如 joint position 的 (14,)）：帧布局下
+                        # 每帧一个观测向量，**必须保留**——此前被排除，导致
+                        # 真实数据集里 action/joint/position 这类流完全不可见
+                        # （2026-09-14 修复）。按"1 行 × N 列"理解，N 为向量维度；
+                        # 维度 1 的 1D 数组（单标量）仍排除，避免把逐帧标量当表。
+                        nrows = 1
+                        ncols = int(node.shape[0])
+                        fields = []
+                    else:
+                        return
+                    full = f"{prefix}/{name}" if prefix else name
+                    out.append({
+                        "node": full,
+                        "rows": nrows,
+                        "cols": ncols,
+                        "fields": fields,
+                    })
+                root_node.visititems(_visit)
+
+            for root in scan_roots:
+                _scan(f[root] if root else f, root)
+        # "每帧一组"布局合并（真实事故：14135 帧 × 6 字段 → 84,810 条流）。
+        if frame_layout:
+            # 抽样帧扫描出的条目：把帧号前缀补成完整帧数，供合并统计。
+            out = _finalize_frame_layout(out, top_keys)
+        out = _merge_frame_layout(out)
+        out.sort(key=lambda c: (-(c["rows"] * max(1, c["cols"])), c["node"]))
         return out
     except Exception:  # noqa: BLE001
         return []
@@ -381,9 +633,88 @@ def _classify_h5_node(fields: list[str], node_path: str) -> tuple[str, str]:
     return "unknown", "未知（无法分类）"
 
 
+def _dataset_to_frame(data: Any) -> pd.DataFrame | None:
+    """把 h5py 数据集内容转为 DataFrame（含 compound 子数组字段的降级处理）。"""
+    try:
+        return pd.DataFrame(data)
+    except ValueError:
+        # compound 含子数组字段（如 value <f4 (7,)）时整体转 DataFrame
+        # 会抛 "must be 1-dimensional"——逐字段转，子数组字段保持
+        # object 列（每行一个 ndarray，与嵌套向量处理路径一致）。
+        names = getattr(data.dtype, "names", None)
+        if not names:
+            return None
+        cols: dict[str, Any] = {}
+        for name in names:
+            col = data[name]
+            cols[name] = (
+                list(col) if col.ndim > 1 else col
+            )  # 子数组字段 → object 列（每行一个 ndarray）
+        return pd.DataFrame(cols)
+
+
+def _read_frame_layout_node(f: Any, node: str) -> pd.DataFrame | None:
+    """读取"每帧一组"布局中的合并节点（如 ``action/end/orientation``）。
+
+    合并节点（见 :func:`_merge_frame_layout`）在文件里**并不存在**——它是
+    "帧号/相对路径"的集合。读取时按帧号升序遍历同名叶子数据集、纵向拼接为
+    一张表，并附 ``frame_index`` 列标明每行来源帧。
+
+    每帧数据可能是 1D（如 joint position (14,)）或 2D（如 orientation (2,4)）。
+    对 1D，每帧贡献「1 行 × N 列」；对 2D，每帧贡献若干行（如 2×4 → 2 行 4 列，
+    用于双手这种"同一字段含两条手臂"的情形）。两种都保留数值，不做语义解释。
+
+    Args:
+        f: 已打开且模式为只读的 h5py 文件对象。
+        node: 合并后的相对路径（不含帧号前缀）。
+
+    Returns:
+        纵向拼接后的 DataFrame（含 frame_index 列）；无匹配返回 None。
+    """
+    import h5py
+
+    frames: list[pd.DataFrame] = []
+    for fid in sorted((k for k in f.keys() if _is_frame_number(k)), key=int):
+        grp = f[fid]
+        if not isinstance(grp, h5py.Group):
+            continue
+        leaf = grp.get(node)
+        if leaf is None or not isinstance(leaf, h5py.Dataset):
+            continue
+        data = leaf[()]
+        # 1D 数值数组是**一帧一条向量观测**（如 joint position (14,)），
+        # 应理解为「1 行 × N 列」。直接 pd.DataFrame(data) 会得到 N 行 1 列
+        # （把向量当成了时间序列），使每帧贡献 N 行、行数与语义都不对。
+        if getattr(data, "ndim", 0) == 1 and getattr(data, "shape", (0,))[0] > 1:
+            data = np.asarray(data).reshape(1, -1)
+        frame_df = _dataset_to_frame(data)
+        if frame_df is None:
+            continue
+        # 列名语义化：裸 ndarray 转 DataFrame 后列名是 0/1/2… 序号，
+        # 对用户与模型毫无意义。用"字段名_序号"命名（如 position 的 (14,)
+        # → position_0…position_13），既保留原始字段语义又标明维度。
+        field_name = node.rsplit("/", 1)[-1]
+        if all(isinstance(c, (int, np.integer)) for c in frame_df.columns):
+            frame_df.columns = [
+                f"{field_name}_{i}" for i in range(frame_df.shape[1])
+            ]
+        frame_df.insert(0, "frame_index", int(fid))
+        frames.append(frame_df)
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
 def read_hdf5_node(path: str, node: str) -> pd.DataFrame | None:
     """按节点路径读取 h5py 层级文件的单个数据节点为 DataFrame（公开接口，
-    供 _data_access / sync / propose 等工具按流登记表读取 h5 节点流）。"""
+    供 _data_access / sync / propose 等工具按流登记表读取 h5 节点流）。
+
+    支持两类节点名：
+    - **普通节点**：文件里真实存在的路径（如 ``meta/camera_model``）——直接读；
+    - **合并节点**：``_merge_frame_layout`` 产出的相对路径（如
+      ``action/end/orientation``）——文件里不存在该路径，改按帧号纵向拼接
+      （见 :func:`_read_frame_layout_node`）。
+    """
     try:
         import h5py
     except ImportError:
@@ -391,26 +722,20 @@ def read_hdf5_node(path: str, node: str) -> pd.DataFrame | None:
     try:
         with h5py.File(path, "r") as f:
             node_obj = f.get(node)
-            if node_obj is None or not isinstance(node_obj, h5py.Dataset):
-                return None
-            data = node_obj[()]
-            try:
-                return pd.DataFrame(data)
-            except ValueError:
-                # compound 含子数组字段（如 value <f4 (7,)）时整体转 DataFrame
-                # 会抛 "must be 1-dimensional"——逐字段转，子数组字段保持
-                # object 列（每行一个 ndarray，与嵌套向量处理路径一致）。
-                names = getattr(data.dtype, "names", None)
-                if not names:
-                    return None
-                cols: dict[str, Any] = {}
-                for name in names:
-                    col = data[name]
-                    cols[name] = (
-                        list(col) if col.ndim > 1 else col
-                    )  # 子数组字段 → object 列（每行一个 ndarray）
-                return pd.DataFrame(cols)
-    except Exception:  # noqa: BLE001
+            if isinstance(node_obj, h5py.Dataset):
+                return _dataset_to_frame(node_obj[()])
+            # 不是真实节点：可能是合并后的帧布局路径，尝试纵向拼接。
+            return _read_frame_layout_node(f, node)
+    except Exception as exc:  # noqa: BLE001
+        # 不抛异常（工具契约），但**记录**原因——此前这里是静默 return None，
+        # 导致"合并节点读取失败"毫无线索（真实踩坑：帧布局读取函数里一个未导入
+        # 的 np 被这个兜底吞掉，表现为"流登记成功但读不出数据"）。
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "读取 h5 节点失败 path=%s node=%s: %s: %s",
+            path, node, type(exc).__name__, exc,
+        )
         return None
 
 
@@ -428,13 +753,25 @@ def register_h5_node_streams(
         h5_path: h5 文件路径。
 
     Returns:
-        登记的流条目列表。
+        登记的流条目列表（**最多 _MAX_STREAMS_PER_CONTAINER 条**，超出时截断并
+        在 context.meta 中标注）。
     """
     nodes = _list_hdf5_native_nodes(str(h5_path))
+    # 兜底护栏（第二道）：即便某个陌生布局没被 _merge_frame_layout 识别，
+    # 单容器也绝不登记超过上限的流数——否则 context.meta 可达上千万 token，
+    # 下游工具返回体积爆炸，界面表现为卡死（2026-09-14 真实事故）。
+    if len(nodes) > _MAX_STREAMS_PER_CONTAINER:
+        truncated_count = len(nodes) - _MAX_STREAMS_PER_CONTAINER
+        nodes = nodes[:_MAX_STREAMS_PER_CONTAINER]
+        context.meta.setdefault("stream_registration_notes", []).append(
+            f"{h5_path.name} 的节点数超出单容器上限 "
+            f"{_MAX_STREAMS_PER_CONTAINER}，已截断 {truncated_count} 条"
+            "（该文件可能是非常规布局；如需完整节点清单请用 h5py 直接查看）。"
+        )
     entries: list[dict[str, Any]] = []
     for nd in nodes:
         kind, label = _classify_h5_node(nd.get("fields", []), nd["node"])
-        entries.append({
+        entry: dict[str, Any] = {
             "path": f"{h5_path}::{nd['node']}",
             "format": "h5",
             "kind": kind,
@@ -448,7 +785,18 @@ def register_h5_node_streams(
             "n_rows": nd["rows"],
             "n_cols": nd["cols"],
             "is_main": nd is nodes[0] if nodes else False,
-        })
+        }
+        # 帧布局合并条目：透出帧数与帧号样例，让模型知道该流是"按帧分片"的
+        # （读取时按帧纵向拼接，含 frame_index 列）。
+        if nd.get("frame_layout"):
+            entry["frame_layout"] = True
+            entry["n_frames"] = nd.get("n_frames")
+            entry["frame_ids_sample"] = nd.get("frame_ids_sample", [])
+            entry["label_evidence"] = (
+                f"HDF5 每帧一组布局（{nd.get('n_frames')} 帧 × 同名叶子节点，"
+                f"读取时按帧纵向拼接）"
+            )
+        entries.append(entry)
     if entries:
         context.meta.setdefault("streams", []).extend(entries)
     return entries
