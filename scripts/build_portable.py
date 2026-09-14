@@ -45,7 +45,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app.config.env_io import read_env_file  # type: ignore[import]
-# python-build-standalone 的发布信息（install_only 版，Windows x64）。
+
+# python-build-standalone 内嵌 Python 资产（Windows x64 install_only）。
+# 首选固定 URL（实测可用、稳定可预测），避免每次调用 GitHub API 触发匿名限流
+# （真实踩坑：HTTP 403 rate limit exceeded 导致构建中断）。API 查询仅作回退。
+_PYBS_RELEASE_BASE = (
+    "https://github.com/astral-sh/python-build-standalone/releases/download"
+)
+_PYBS_KNOWN_ASSET = (
+    f"{_PYBS_RELEASE_BASE}/20260901/"
+    "cpython-3.12.14+20260901-x86_64-pc-windows-msvc-install_only.tar.gz"
+)
+# 回退：GitHub API 查询最新 release（限流时失败，仅在固定 URL 不可用时用）。
 _PYBS_INDEX = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest"
 
 # 打包进分发包的代码路径（不含 tests/outputs/data/reference/.git/.env）。
@@ -70,6 +81,57 @@ def _detect_lan_ipv4() -> str | None:
         return None
 
 
+def _resolve_pybs_asset_url() -> str:
+    """定位 python-build-standalone 的 Windows x64 install_only 资产 URL。
+
+    优先返回固定已知 URL（实测可用，不受 API 限流影响）；仅在固定 URL
+    不可用时回退查询 GitHub API 最新 release。
+
+    Returns:
+        资产下载 URL。
+
+    Raises:
+        RuntimeError: 固定 URL 与 API 查询均无法定位到可用资产。
+    """
+    # 优先：固定 URL（无网络请求开销、不触发限流）。
+    if _url_reachable(_PYBS_KNOWN_ASSET):
+        return _PYBS_KNOWN_ASSET
+
+    # 回退：GitHub API（匿名调用可能 403 限流，此处兜住异常继续尝试）。
+    print("固定资产 URL 不可用，回退查询 GitHub API ...")
+    try:
+        with urllib.request.urlopen(_PYBS_INDEX, timeout=30) as resp:  # noqa: S310
+            release = json.load(resp)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"无法获取内嵌 Python（固定 URL 不可用，且 GitHub API 失败：{exc}）。"
+            "请检查网络，或在 _PYBS_KNOWN_ASSET 中改用可达的资产 URL。"
+        ) from exc
+    for asset in release.get("assets", []):
+        name = asset["name"]
+        if name.startswith("cpython-3.12") and "x86_64-pc-windows" in name \
+                and name.endswith("install_only.tar.gz"):
+            return asset["browser_download_url"]
+    raise RuntimeError("未能从 python-build-standalone 定位 3.12 Windows x64 install_only 包")
+
+
+def _url_reachable(url: str) -> bool:
+    """探测 URL 是否可访问（HEAD 请求，失败即返回 False，不抛异常）。
+
+    Args:
+        url: 待探测的 URL。
+
+    Returns:
+        True 表示可访问（状态码 2xx/3xx）。
+    """
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=15):  # noqa: S310
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _download_python_install_only(dest: Path) -> None:
     """下载并解包 python-build-standalone 的 Windows x64 install_only 版到 dest。
 
@@ -77,20 +139,9 @@ def _download_python_install_only(dest: Path) -> None:
         dest: 目标目录（作为 runtime/ 的上层，解包后含 python.exe）。
 
     Raises:
-        RuntimeError: 无法从 GitHub API 定位到匹配的发布资产。
+        RuntimeError: 无法定位或下载到可用资产。
     """
-    with urllib.request.urlopen(_PYBS_INDEX, timeout=30) as resp:  # noqa: S310
-        release = json.load(resp)
-    asset_url = None
-    for asset in release.get("assets", []):
-        name = asset["name"]
-        # 例：cpython-3.12.8+20250115-x86_64-pc-windows-shared_install_only.tar.gz
-        if name.startswith("cpython-3.12") and "x86_64-pc-windows" in name \
-                and name.endswith("install_only.tar.gz"):
-            asset_url = asset["browser_download_url"]
-            break
-    if not asset_url:
-        raise RuntimeError("未能从 python-build-standalone 定位 3.12 Windows x64 install_only 包")
+    asset_url = _resolve_pybs_asset_url()
 
     print(f"[1/4] 下载内嵌 Python: {Path(asset_url).name}")
     with tempfile.TemporaryDirectory() as td:
@@ -228,11 +279,15 @@ _README_TEMPLATE = """\
 """
 
 
-_LAUNCH_PY = r'''"""launch.py —— 分发包启动器：探测空闲端口后启动 streamlit，自动开浏览器。
+_LAUNCH_PY = r'''"""launch.py —— 分发包启动器：探测空闲端口后启动 streamlit，服务就绪再开浏览器。
 
-固定 8501 端口在用户机器上可能已被占用（真实事故：双击闪退、无浏览器）。
-故先探测 8501，被占则顺延找第一个空闲端口，再以该端口运行 streamlit 并
-自动打开浏览器；进程退出前暂停窗口以便用户看到报错。
+两个真实事故驱动了当前实现：
+1. 固定 8501 在用户机器上可能已被占用 → 双击闪退：故探测空闲端口后顺延；
+2. 固定 sleep 后开浏览器，但首次冷启动常需 10~30 秒，服务未就绪 → 页面白屏：
+   改为**轮询等待服务真正返回 200 再打开浏览器**（最多等 120 秒）。
+
+另：显式写 credentials.toml 抑制 streamlit 首次运行的 email 欢迎页；同时用
+--server.headless true 让 streamlit 不自己抢开页面（由本脚本在就绪后打开）。
 """
 from __future__ import annotations
 
@@ -241,14 +296,32 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PORT = 8501
 MAX_PORT = 8600
+READY_TIMEOUT_S = 120  # 冷启动最坏情况（首次解压后）等待上限
 
 
 def _port_free(port: int) -> bool:
+    """判断端口是否可用于新服务。
+
+    用**尝试连接**探测：能连上说明已有服务在监听（不可用）；连不上再补一次
+    bind 校验（排除被系统占用但未监听的情况）。仅用 bind 会漏判——真实踩坑：
+    本机已有服务监听时 bind 仍可能成功，导致误选端口、浏览器连到旧服务。
+    """
+    # 1) 能连上 = 已有人在监听。
+    c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    c.settimeout(0.5)
+    try:
+        if c.connect_ex(("127.0.0.1", port)) == 0:
+            return False
+    finally:
+        c.close()
+    # 2) 连不上再试 bind（排除被占用但未监听）。
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("127.0.0.1", port))
@@ -259,22 +332,49 @@ def _port_free(port: int) -> bool:
         s.close()
 
 
-def main() -> None:
-    port = DEFAULT_PORT
+def _pick_port() -> int:
     for p in range(DEFAULT_PORT, MAX_PORT):
         if _port_free(p):
-            port = p
-            break
+            return p
+    return DEFAULT_PORT
+
+
+def _wait_ready(url: str, proc: "subprocess.Popen", timeout_s: int) -> bool:
+    """轮询直到服务返回 2xx/3xx 或进程退出/超时。"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False  # 进程已退出（启动失败）
+        try:
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                if 200 <= resp.status < 400:
+                    return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(1)
+    return False
+
+
+def main() -> None:
+    port = _pick_port()
     if port != DEFAULT_PORT:
         print(f"端口 {DEFAULT_PORT} 被占用，改用 {port}。")
+    # 显式关闭用量统计与首启欢迎流程（配合包内 .streamlit/credentials.toml）。
+    os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
     python = os.path.join(BASE, "runtime", "python.exe")
+    # headless true：不让 streamlit 自己开一个可能未就绪的页面；由本脚本就绪后开。
     cmd = [python, "-m", "streamlit", "run", "streamlit_app.py",
-           "--server.port", str(port), "--server.headless", "false"]
+           "--server.port", str(port), "--server.headless", "true",
+           "--browser.gatherUsageStats", "false"]
     url = f"http://localhost:{port}"
-    # 稍候浏览器打开（等服务就绪）。
+    print(f"正在启动分析服务（首次启动可能需要十几秒），请稍候……\n  {url}")
     proc = subprocess.Popen(cmd, cwd=BASE)
-    time.sleep(4)
-    webbrowser.open(url)
+    if _wait_ready(url, proc, READY_TIMEOUT_S):
+        print("服务已就绪，正在打开浏览器……")
+        webbrowser.open(url)
+        print(f"若浏览器未自动打开，请手动访问：{url}")
+    else:
+        print("服务启动失败或超时。请查看窗口中的错误信息并反馈给发布者。")
     proc.wait()
     print("\n服务已停止。按任意键关闭窗口。")
     input()

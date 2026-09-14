@@ -66,6 +66,10 @@ def test_launch_py_probes_port_and_runs_streamlit() -> None:
     assert "webbrowser" in content and "open(" in content  # 自动开浏览器
     # 端口被占时顺延而非崩溃。
     assert "MAX_PORT" in content or "range(" in content
+    # 关键：轮询等待服务就绪再开浏览器（修复首次冷启动白屏）。
+    assert "_wait_ready" in content
+    assert "READY_TIMEOUT_S" in content
+    assert "headless" in content and "true" in content  # 不让 streamlit 抢先开页面
 
 
 # --- _read_deploy_env：从部署机 .env 读配置 ------------------------------------
