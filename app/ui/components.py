@@ -12,6 +12,64 @@ import streamlit as st
 
 from app.config import get_settings
 from app.services.chat_service import ChatTurn
+from app.ui.constants import REASONING_BOX_HEIGHT, REASONING_BOX_TITLE
+
+
+def _harmonize_steps(steps: list) -> list[str]:
+    """把过程时间线渲染为若干"文字块"（思考片段与工具播报）。
+
+    规则（docs/思考过程展示与流式过程持久化设计.md 4.4）：
+    - 思考片段走**小字**（``st.caption``），与正文区分；
+    - 工具播报加"▸ "前缀以示"动作"，同样小字；
+    - 相邻同类块已在采集层合并（见 agent._append_step），此处只需按序输出。
+
+    Args:
+        steps: StreamStep 列表（可能来自旧数据，元素属性缺失时容忍）。
+
+    Returns:
+        逐块的 Markdown 文本（已按 kind 加前缀）。
+    """
+    blocks: list[str] = []
+    for s in steps or []:
+        kind = getattr(s, "kind", "") or (s.get("kind") if isinstance(s, dict) else "")
+        text = getattr(s, "text", "") or (s.get("text") if isinstance(s, dict) else "")
+        if not text:
+            continue
+        if kind == "reasoning":
+            blocks.append(text.strip())
+        elif kind == "tool":
+            blocks.append(f"▸ {text.strip()}")
+    return [b for b in blocks if b]
+
+
+def render_reasoning_and_steps(steps: list, *, streaming: bool = False) -> None:
+    """渲染"过程区"：思考摘要（小字）+ 工具播报，可折叠、固定高度内滚动。
+
+    设计见 docs/思考过程展示与流式过程持久化设计.md 4.4。逐项对应需求：
+    - **历史保留**：steps 随 ChatTurn 存入 messages，因此历史轮次也能回看；
+    - **思考中与输出后都在**：流式时经 ``streaming=True`` 实时累积渲染；
+    - **小箭头隐藏/展开**：``st.expander``（流式进行中默认展开，历史默认收起）；
+    - **独立框 + 滑动约束**：``st.container(height=...)`` 固定高度内滚动
+      （``autoscroll=True`` 使新增内容自动贴底，看到最新思考）；
+    - **小字区分**：思考与工具播报都用 ``st.caption``。
+
+    **优雅降级（硬性要求，见设计 5 节）**：无思考且无工具播报时**整块不渲染**
+    （不显示空框）；旧会话消息无 steps 字段时同理（缺省空列表）。
+
+    Args:
+        steps: 过程时间线（StreamStep 列表；可为空）。
+        streaming: 是否流式进行中（True → 默认展开；历史轮次 False → 收起）。
+    """
+    blocks = _harmonize_steps(steps)
+    if not blocks:
+        return  # 降级：无过程内容则整块不渲染。
+
+    with st.expander(REASONING_BOX_TITLE, expanded=streaming):
+        # 固定高度 + 自动贴底：长摘要内部滚动，不挤占正文空间；新增内容贴底。
+        with st.container(height=REASONING_BOX_HEIGHT, autoscroll=streaming):
+            for block in blocks:
+                # 小字（st.caption）：与正文的 st.markdown 形成字号/透明度区分。
+                st.caption(block)
 
 
 def render_tool_activity(turn: ChatTurn) -> None:

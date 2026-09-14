@@ -18,6 +18,7 @@ from app.ui.components import (
     render_charts,
     render_dataset_overview,
     render_findings_and_report,
+    render_reasoning_and_steps,
     render_token_stats,
     render_tool_activity,
 )
@@ -137,48 +138,85 @@ def _open_chart_dialog() -> None:
     _dialog()
 
 
-def _run_agent_turn(service, prompt: str, placeholder) -> ChatTurn:
-    """执行一轮 agent（流式或非流式），把正文渲染进 placeholder。
+def _run_agent_turn(service, prompt: str, body_placeholder,
+                    process_placeholder=None) -> ChatTurn:
+    """执行一轮 agent（流式或非流式），正文与过程写入**各自独立**的占位符。
 
-    统一入口：流式开启时逐块更新 placeholder（首字节可见 + 工具播报），
+    统一入口：流式开启时逐块更新占位符（首字节可见 + 过程可见），
     关闭或异常时回退到非流式 reply()。两条路径返回的 ChatTurn 同构，
     调用方的收尾逻辑（_record_turn）无需区分。
+
+    **为什么正文与过程要分开占位符**（docs/思考过程展示与流式过程持久化设计.md 3.1）：
+    此前二者共用一个 placeholder，正文增量会把工具播报**整体覆写**，
+    导致过程在界面上完全消失。分离后过程（思考摘要 + 工具播报）与正文并存，
+    互不覆盖。
 
     Args:
         service: 当前会话的 ChatService。
         prompt: 用户本轮输入。
-        placeholder: ``st.empty()`` 占位符（流式逐块写入正文）。
+        body_placeholder: 正文占位符（``st.empty()``）。
+        process_placeholder: 过程区占位符（``st.empty()``）；为 None 时
+            过程只在收尾后由调用方渲染（如编辑重发路径）。
 
     Returns:
-        本轮 ChatTurn（含 usage/metrics/error）。
+        本轮 ChatTurn（含 usage/metrics/steps/reasoning/error）。
     """
     from app.config.settings import get_settings
+    from app.ui.components import render_reasoning_and_steps
     from app.ui.constants import STREAM_CURSOR
 
     if not getattr(get_settings(), "stream_output_enabled", True):
         # 非流式回退路径（配置关闭，或流式实现出问题时的一键回退）。
         with st.spinner("分析中……"):
             turn = service.reply(prompt)
-        placeholder.markdown(turn.reply)
+        body_placeholder.markdown(turn.reply)
+        if process_placeholder is not None:
+            with process_placeholder.container():
+                render_reasoning_and_steps(getattr(turn, "steps", []) or [])
         return turn
 
     acc = ""
     final_turn = None
+    # 流式期间累积的过程快照（供实时渲染"思考中"）。
+    live_steps: list = []
     for chunk in service.reply_stream(prompt):
-        if chunk.kind == "tool":
-            # 工具播报：斜体 + 与正文区分（不阻塞后续正文写入）。
-            placeholder.markdown(f"_{chunk.text}…_")
+        if chunk.kind == "reasoning":
+            _merge_live_step(live_steps, "reasoning", chunk.text)
+            if process_placeholder is not None:
+                with process_placeholder.container():
+                    render_reasoning_and_steps(live_steps, streaming=True)
+        elif chunk.kind == "tool":
+            _merge_live_step(live_steps, "tool", chunk.text)
+            if process_placeholder is not None:
+                with process_placeholder.container():
+                    render_reasoning_and_steps(live_steps, streaming=True)
         elif chunk.kind == "delta":
             acc += chunk.text
-            placeholder.markdown(acc + STREAM_CURSOR)
+            body_placeholder.markdown(acc + STREAM_CURSOR)
         elif chunk.kind == "final":
             final_turn = chunk.turn
     if final_turn is None:
         # 理论上不会发生（reply_stream 必 yield final）；兜底为空轮。
         final_turn = service.reply(prompt)
     # 收尾：去掉光标；失败轮保留已产出的部分正文（诚实降级）。
-    placeholder.markdown(final_turn.reply)
+    body_placeholder.markdown(final_turn.reply)
+    # 过程区收尾：改用持久 steps 渲染（默认收起），保证与历史轮次一致。
+    if process_placeholder is not None:
+        with process_placeholder.container():
+            render_reasoning_and_steps(getattr(final_turn, "steps", []) or [])
     return final_turn
+
+
+def _merge_live_step(steps: list, kind: str, text: str) -> None:
+    """流式期间把片段合并进过程快照（相邻同类合并，与采集层规则一致）。"""
+    from app.agent.agent import StreamStep
+
+    if not text:
+        return
+    if steps and getattr(steps[-1], "kind", None) == kind:
+        steps[-1].text += text
+    else:
+        steps.append(StreamStep(kind=kind, text=text))
 
 
 def _is_failed(turn) -> bool:
@@ -210,8 +248,9 @@ def _retry_turn(service, messages: list[dict], cumulative: dict, user_idx: int) 
     user_text = messages[user_idx]["content"]
     service.truncate_history_to_turn(user_idx)
     del messages[user_idx + 1:]
-    placeholder = st.empty()
-    turn = _run_agent_turn(service, user_text, placeholder)
+    process_ph = st.empty()
+    body_ph = st.empty()
+    turn = _run_agent_turn(service, user_text, body_ph, process_ph)
     _record_turn(cumulative, turn, messages)
 
 
@@ -420,9 +459,10 @@ def _main() -> None:
                                 {"role": "user", "content": new_text.strip()}
                             ]
                             _stt["editing_index"] = None
-                            placeholder = st.empty()
+                            process_ph = st.empty()
+                            body_ph = st.empty()
                             turn = _run_agent_turn(service, new_text.strip(),
-                                                   placeholder)
+                                                   body_ph, process_ph)
                             _record_turn(cumulative, turn, messages)
                             st.rerun()
                 else:
@@ -431,6 +471,14 @@ def _main() -> None:
                         if (msg["role"] == "assistant" and msg.get("turn")
                                 and _is_failed(msg["turn"])):
                             st.caption("⚠️ 本轮未完成")
+                        # 历史轮次的过程区（思考摘要 + 工具播报）：默认**收起**
+                        # （回顾时按需展开）；无过程时组件自身降级为不渲染。
+                        # 旧会话消息无 steps 字段 → 缺省空列表，安全降级。
+                        if msg["role"] == "assistant" and msg.get("turn"):
+                            render_reasoning_and_steps(
+                                getattr(msg["turn"], "steps", []) or [],
+                                streaming=False,
+                            )
                         st.markdown(msg["content"])
                         # 用户消息旁的编辑入口（最近一条才显示，避免历史深处
                         # 编辑造成大面积重生成；与主流对话 UI 一致）。
@@ -465,8 +513,11 @@ def _main() -> None:
 
                 # 只有新输入才调用 agent（页面重跑时 prompt 为空，不触发）。
                 with st.chat_message("assistant"):
-                    placeholder = st.empty()
-                    turn = _run_agent_turn(service, prompt, placeholder)
+                    # 过程区（思考摘要 + 工具播报）与正文区**各自独立占位符**：
+                    # 二者互不覆盖，过程得以保留（此前共用一个会被覆写的格子）。
+                    process_ph = st.empty()
+                    body_ph = st.empty()
+                    turn = _run_agent_turn(service, prompt, body_ph, process_ph)
                     render_tool_activity(turn)
 
             # 累计本轮统计并追加 assistant 消息（集中入口，防漏加）。

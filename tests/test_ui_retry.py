@@ -49,11 +49,17 @@ class _FakeService:
 
 
 def _patch_ui_run(monkeypatch, turn: ChatTurn) -> None:
-    """让 streamlit_app._run_agent_turn 不真的跑 agent，直接返回给定 turn。"""
+    """让 streamlit_app._run_agent_turn 不真的跑 agent，直接返回给定 turn。
+
+    签名需与现实现一致（body_placeholder + process_placeholder）；
+    process 占位符为可选参数，故用默认值兼容旧调用。
+    """
     import streamlit_app
 
-    monkeypatch.setattr(streamlit_app, "_run_agent_turn",
-                        lambda service, prompt, placeholder: turn)
+    monkeypatch.setattr(
+        streamlit_app, "_run_agent_turn",
+        lambda service, prompt, body_ph, process_ph=None: turn,
+    )
 
 
 def test_is_failed_detection() -> None:

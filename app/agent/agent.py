@@ -623,13 +623,34 @@ def describe_tool_call(tool_name: str) -> str:
 
 
 @dataclass
+class StreamStep:
+    """流式过程中的一条记录（供 UI 分层渲染与**持久展示**）。
+
+    为什么需要结构化记录（docs/思考过程展示与流式过程持久化设计.md 4.1）：
+    此前过程只体现为一个被反复覆写的 UI 占位符，既留不住、也无法分层
+    （思考小字 / 工具播报）。结构化为 steps 后，可随 ChatTurn 持久到
+    messages，使**历史轮次也能回看过程**。
+
+    kind 取值：
+    - ``"reasoning"``：思考摘要片段（text 为增量文本）；
+    - ``"tool"``：工具调用播报（tool_name 为工具名，text 为功能描述）。
+    """
+
+    kind: str
+    text: str = ""
+    tool_name: str = ""
+
+
+@dataclass
 class TurnEvent:
     """流式单轮的单个事件。
 
     kind 取值：
     - ``"delta"``：正文增量（text 为新增片段）；
     - ``"tool"``：工具调用播报（tool_name 为工具名，text 为功能描述）；
-    - ``"done"``：收尾（final 为完整正文，next_input/result 供下一轮与统计）。
+    - ``"reasoning"``：思考摘要增量（text 为新增片段）；
+    - ``"done"``：收尾（final 为完整正文；reasoning 为思考摘要全文；
+      steps 为过程时间线；next_input/result 供下一轮与统计）。
     """
 
     kind: str
@@ -639,6 +660,10 @@ class TurnEvent:
     next_input: list[TResponseInputItem] | None = None
     result: RunResult | None = None
     error: str | None = None
+    # 思考摘要全文（kind="done" 时填充；不可得为空串）。
+    reasoning: str = ""
+    # 过程时间线（思考片段与工具播报按发生顺序交错；kind="done" 时填充）。
+    steps: list[StreamStep] | None = None
 
 
 def _is_tool_call_item(item: Any) -> bool:
@@ -650,6 +675,21 @@ def _is_tool_call_item(item: Any) -> bool:
         or "toolcall" in class_name
         or "function_call" in str(item_type).lower()
     )
+
+
+def _append_step(steps: list[StreamStep], kind: str, text: str) -> None:
+    """向过程时间线追加一个片段；**相邻同类片段合并**（避免每 token 一条）。
+
+    思考摘要是逐 token 增量到达的（实测 35 个 raw 事件/轮），若每个增量都生成
+    一条 step，steps 会膨胀到成百上千条、徒增内存与渲染成本。故相邻同类合并：
+    只有遇到"工具播报"这种类型切换时才真正新开一条。
+    """
+    if not text:
+        return
+    if steps and steps[-1].kind == kind:
+        steps[-1].text += text
+    else:
+        steps.append(StreamStep(kind=kind, text=text))
 
 
 async def stream_turn(
@@ -683,7 +723,7 @@ async def stream_turn(
         metrics: 可选，回填本轮耗时与模型往返次数（含异常分支）。
 
     Yields:
-        TurnEvent：若干 delta/tool 事件，最后一个为 done。
+        TurnEvent：若干 delta/tool/reasoning 事件，最后一个为 done。
     """
     _t0 = time.perf_counter()
     _m = metrics if metrics is not None else RunMetrics()
@@ -696,18 +736,37 @@ async def stream_turn(
     input_items = _build_input_items(history_input, user_input)
 
     acc = ""
+    reasoning_acc = ""  # 思考摘要全文
+    steps: list[StreamStep] = []  # 过程时间线（持久化用）
     try:
         result = Runner.run_streamed(
             agent, input=input_items, context=context, max_turns=max_turns,
         )
         async for ev in result.stream_events():
             etype = getattr(ev, "type", "") or ""
-            # 正文增量。
             if etype == "raw_response_event":
                 data = getattr(ev, "data", None)
                 delta = getattr(data, "delta", None) if data is not None else None
-                dtype = getattr(data, "type", "") or ""
-                if isinstance(delta, str) and delta and "output_text" in str(dtype):
+                dtype = str(getattr(data, "type", "") or "")
+                # 思考摘要**新分段**边界：插入空行，使长摘要分段可读
+                # （实测事件序列含 reasoning_summary_part.added/done）。
+                # 注意：该事件可能**不带** delta，故必须在"空 delta 跳过"之前判断。
+                if "reasoning_summary_part" in dtype:
+                    if reasoning_acc and not reasoning_acc.endswith("\n\n"):
+                        sep = "\n\n"
+                        reasoning_acc += sep
+                        _append_step(steps, "reasoning", sep)
+                    continue
+                if not isinstance(delta, str) or not delta:
+                    continue
+                # 思考摘要增量。
+                if "reasoning_summary_text" in dtype:
+                    reasoning_acc += delta
+                    _append_step(steps, "reasoning", delta)
+                    yield TurnEvent(kind="reasoning", text=delta)
+                    continue
+                # 正文增量。
+                if "output_text" in dtype:
                     acc += delta
                     yield TurnEvent(kind="delta", text=delta)
                 continue
@@ -716,8 +775,10 @@ async def stream_turn(
                 item = getattr(ev, "item", None)
                 if item is not None and _is_tool_call_item(item):
                     name = _extract_tool_name(item)
-                    yield TurnEvent(kind="tool", tool_name=name,
-                                    text=describe_tool_call(name))
+                    desc = describe_tool_call(name)
+                    steps.append(StreamStep(kind="tool", text=desc,
+                                            tool_name=name))
+                    yield TurnEvent(kind="tool", tool_name=name, text=desc)
     except MaxTurnsExceeded:
         _m.duration_ms = int((time.perf_counter() - _t0) * 1000)
         _m.n_model_calls = max(_m.n_model_calls, max_turns)
@@ -729,17 +790,19 @@ async def stream_turn(
             + "请尝试更明确地描述需求，或分步提问。"
         )
         yield TurnEvent(kind="done", final=acc, error=msg,
+                        reasoning=reasoning_acc, steps=steps,
                         next_input=_fallback_input(history_input, user_input))
         return
     except BaseException as exc:  # noqa: BLE001
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         # 注意：流式下异常可能发生在已 yield 若干 delta 之后——保留 acc（部分正文），
-        # 不丢已展示内容（诚实降级）。
+        # 不丢已展示内容（诚实降级）；已收到的思考/工具过程同样保留。
         _m.duration_ms = int((time.perf_counter() - _t0) * 1000)
         _m.completed = False
         _m.error_kind = classify_model_error(exc)
         yield TurnEvent(kind="done", final=acc, error=_describe_model_error(exc),
+                        reasoning=reasoning_acc, steps=steps,
                         next_input=_fallback_input(history_input, user_input))
         return
 
@@ -752,4 +815,6 @@ async def stream_turn(
     _m.n_tool_calls = _count_tool_calls(result)
     _m.n_model_calls = max(1, _m.n_tool_calls + 1)
     _m.completed = True
-    yield TurnEvent(kind="done", final=final, next_input=next_input, result=result)
+    yield TurnEvent(kind="done", final=final, next_input=next_input,
+                    result=result, reasoning=reasoning_acc.strip(),
+                    steps=steps)

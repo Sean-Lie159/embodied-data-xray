@@ -112,6 +112,12 @@ class ChatTurn:
     # 流式轮的错误提示（未正常完成时非空）；非流式（reply）路径为 None。
     # 与 metrics["completed"] 配合，供 UI 渲染"本轮未完成"与重试入口。
     error: str | None = None
+    # 过程时间线（思考摘要片段与工具播报按发生顺序交错）；供 UI **持久**展示
+    # 过程（此前只有一个被覆写的占位符，留不住过程）。
+    # 缺省空列表——**旧会话消息无此字段时必须容忍缺失**（向后兼容）。
+    steps: list = field(default_factory=list)
+    # 思考摘要全文（与 steps 中 reasoning 片段一致，便于整体取用/测试）；不可得为 ""。
+    reasoning: str = ""
 
 
 @dataclass
@@ -121,12 +127,17 @@ class StreamChunk:
     kind 取值：
     - ``"delta"``：正文增量（text 为新增片段）；
     - ``"tool"``：工具调用播报（text 为功能描述）；
-    - ``"final"``：收尾块（turn 为完整 ChatTurn，含 findings/usage/metrics）。
+    - ``"reasoning"``：思考摘要增量（text 为新增片段）；
+    - ``"final"``：收尾块（turn 为完整 ChatTurn，含 findings/usage/metrics/
+      steps/reasoning）。
     """
 
     kind: str
     text: str = ""
     turn: "ChatTurn | None" = None
+    # 流式进行中的过程快照（kind 为 tool/reasoning 时可选携带）：
+    # 让 UI 能"边生成边累积渲染"过程时间线，而不是自己重新拼接。
+    steps: "list | None" = None
 
 
 def extract_usage(result: RunResult | None) -> dict[str, int] | None:
@@ -396,13 +407,16 @@ class ChatService:
                     yield StreamChunk(kind="delta", text=item.text)
                 elif kind == "tool":
                     yield StreamChunk(kind="tool", text=item.text)
+                elif kind == "reasoning":
+                    yield StreamChunk(kind="reasoning", text=item.text)
                 elif kind == "done":
                     done_event = item
         finally:
             thread.join(timeout=5)
 
         turn = self._finalize_stream_turn(done_event, metrics)
-        yield StreamChunk(kind="final", text=turn.reply, turn=turn)
+        yield StreamChunk(kind="final", text=turn.reply, turn=turn,
+                          steps=turn.steps)
 
     def _finalize_stream_turn(self, done_event, metrics: RunMetrics) -> ChatTurn:
         """把 stream_turn 的收尾事件整理为 ChatTurn（并写回历史）。"""
@@ -431,6 +445,8 @@ class ChatService:
                 "error_kind": metrics.error_kind,
             },
             error=done_event.error,
+            steps=list(done_event.steps or []),
+            reasoning=done_event.reasoning or "",
         )
 
     def truncate_history_to_turn(self, turn_index: int) -> dict[str, Any]:
