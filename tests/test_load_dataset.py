@@ -93,8 +93,15 @@ def test_load_unsupported_format_returns_error(tmp_path: Path) -> None:
     assert "user_message" in result
     # user_message 应明确转达支持格式。
     assert "csv" in result["user_message"]
+    # 格式清单须与 _SUPPORTED_FORMATS 同源（新增格式时此处同步更新，
+    # 避免出现"实际支持但提示里没列"的信息缺口）。
+    from app.tools.load_dataset import _SUPPORTED_FORMATS
+
+    assert result["supported_formats"] == list(_SUPPORTED_FORMATS.keys())
+    # 显式锁定当前清单（变更须有意为之）：含 2026-09-14 新增的文本格式。
     assert result["supported_formats"] == [
         ".csv", ".json", ".jsonl", ".parquet", ".h5", ".mcap",
+        ".txt", ".info", ".log",
     ]
     # 错误返回不应附带文件内容预览。
     assert "x" not in result

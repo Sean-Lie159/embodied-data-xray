@@ -180,10 +180,17 @@ def _normalize_to_ns(ts: np.ndarray, unit: str) -> tuple[np.ndarray, dict[str, A
 
 
 def _nominal_rate(stream: dict[str, Any]) -> float | None:
-    """从流登记表/meta 读取标称采样率；缺省返回 None。"""
+    """从流登记表/meta 读取标称采样率；缺省返回 None。
+
+    注意 ``measured_rate`` 可能是 **None** 而非 dict（如日志流无采样率概念，
+    登记时显式写 None）——此前直接 .get 会抛 AttributeError 打断整个检查，
+    故此处做类型判定（真实缺陷，2026-09-14 由文本流接入暴露）。
+    """
     rate = stream.get("nominal_rate_hz")
     if rate is None:
-        rate = stream.get("measured_rate", {}).get("sample_rate_hz")
+        measured = stream.get("measured_rate")
+        if isinstance(measured, dict):
+            rate = measured.get("sample_rate_hz")
     return float(rate) if isinstance(rate, (int, float)) and rate > 0 else None
 
 

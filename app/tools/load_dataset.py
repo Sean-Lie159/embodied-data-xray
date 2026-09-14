@@ -37,6 +37,11 @@ _SUPPORTED_FORMATS: dict[str, str] = {
     ".parquet": "Parquet 列式存储",
     ".h5": "HDF5 表",
     ".mcap": "MCAP 容器（JSON 编码消息；单文件多 topic）",
+    # 纯文本数据（2026-09-14 起）：``.txt`` 为"数值首列 + 等宽列"的时间戳清单
+    # （真实形态：相机逐帧时间戳），``.INFO``/``.log`` 为 glog 风格日志。
+    ".txt": "纯文本数据清单（数值首列 + 等宽列，如逐帧时间戳）",
+    ".info": "运行日志（glog 风格：[IWEF]MMDD hh:mm:ss.uuuuuu ...）",
+    ".log": "运行日志（glog 风格）",
 }
 
 # 尝试解码文本文件时使用的编码回退链。
@@ -800,6 +805,121 @@ def register_h5_node_streams(
     if entries:
         context.meta.setdefault("streams", []).extend(entries)
     return entries
+
+
+def register_text_data_streams(
+    context: RunContext, probe: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """把目录内的文本数据文件登记为流（``.txt`` 时间戳清单 / ``.INFO`` 日志）。
+
+    为什么需要（2026-09-14 真实能力缺口）：用户数据集的时间戳**就在**
+    ``camera/<相机>/<相机>.txt`` 里（每行 ``<纳秒时间戳> <帧状态/序号>``，
+    14142 行、30 Hz），但 ``.txt`` 不在支持格式内，目录加载只把路径放进
+    ``others`` 且从不打开——agent 因此只能回答"工具根本没读这些文件"。
+
+    识别策略（**先打开确认、再登记**，避免把说明文本/配置误登记为数据流）：
+    经统一读取器 ``read_stream`` 尝试解析，解析成功（首列数值、行等宽）才登记。
+    这保证"登记即意味着真的能读"，与 h5/mcap 的登记口径一致。
+
+    Args:
+        context: 运行时上下文（streams 追加到 meta["streams"]）。
+        probe: probe_directory 的返回（从中取 others 分组的**完整路径清单**）。
+
+    Returns:
+        登记的流条目列表（可能为空）。
+    """
+    from app.tools._readers import ReadRequest, read_stream
+
+    candidates: list[str] = []
+    for p in probe_full_paths(probe, "others"):
+        if Path(p).suffix.lower() in (".txt", ".text", ".info", ".log"):
+            candidates.append(p)
+    entries: list[dict[str, Any]] = []
+    # 安全的解析上限：仅用于"确认可读 + 取列名与采样率"，不读全量（避免大目录
+    # 下把几十个日志全量解析）。真正的数据分析由各工具按需读取。
+    probe_limit = 20_000
+    for p_str in candidates:
+        try:
+            result = read_stream(ReadRequest(
+                path_spec=p_str, want="frame", limit=probe_limit))
+        except Exception:  # noqa: BLE001 - 单文件失败不阻塞目录加载
+            continue
+        if not result.ok or result.frame is None or result.frame.empty:
+            continue
+        df = result.frame
+        # 必须含可识别的时间列才登记为"数据流"（纯日志无时间列时仍登记，
+        # 因为它有 message 可检索，但语义标签不同）。
+        ts_col = None
+        for cand in ("timestamp", "time", "ts", "time_of_day_us"):
+            if cand in df.columns:
+                ts_col = cand
+                break
+        is_log = result.fmt == "log"
+        if ts_col is None and not is_log:
+            continue
+        measured_rate = _measure_rate_hz(df, ts_col)
+        kind = "log" if is_log else "timestamp_index"
+        label = "运行日志（含时间与消息）" if is_log else "时间戳清单（帧采集记录）"
+        entries.append({
+            "path": p_str,
+            "format": result.fmt,
+            "kind": kind,
+            "semantic_label": label,
+            "label_evidence": (
+                f"文本解析确认：{df.shape[0]:,} 行 × {df.shape[1]} 列，"
+                + (f"时间列 {ts_col}" if ts_col else "含消息列")
+            ),
+            "label_confidence": "medium",
+            "label_source": "text_probe",
+            "role": {"role": label, "confidence": "medium",
+                     "evidence": "文本解析确认"},
+            "channels": [str(c) for c in df.columns],
+            "n_rows": int(df.shape[0]),
+            "n_cols": int(df.shape[1]),
+            "time_column": ts_col,
+            "measured_rate": (
+                {"sample_rate_hz": round(measured_rate, 3)}
+                if measured_rate else None
+            ),
+            "is_main": False,
+        })
+    if entries:
+        context.meta.setdefault("streams", []).extend(entries)
+    return entries
+
+
+def _measure_rate_hz(df: pd.DataFrame, ts_col: str | None) -> float | None:
+    """从时间列估算采样率（Hz）；无法估算返回 None。
+
+    仅用于给流登记表标注"这条流大约多快"（供 UI 与对齐分析参考），
+    不做单位强判——量级明显不符合时间语义时直接返回 None（宁缺勿错）。
+    """
+    if not ts_col or ts_col not in df.columns:
+        return None
+    try:
+        ts = pd.to_numeric(df[ts_col], errors="coerce").to_numpy(dtype=float)
+    except Exception:  # noqa: BLE001
+        return None
+    ts = ts[np.isfinite(ts)]
+    if len(ts) < 3:
+        return None
+    from app.tools.timestamp_units import to_ns
+
+    # 用既有单位推断（量级）换算到 ns 再算速率——与 check_temporal_sync 同口径。
+    from app.tools.timestamp_units import infer_unit
+
+    unit = infer_unit(ts)["unit"]
+    if unit not in ("ns", "us", "ms", "s"):
+        return None
+    ns = to_ns(ts, unit)
+    diffs = np.diff(ns)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return None
+    mean_ns = float(np.mean(diffs))
+    if mean_ns <= 0:
+        return None
+    return 1e9 / mean_ns
 
 
 def register_mcap_topic_streams(
@@ -1569,6 +1689,12 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             except Exception:  # noqa: BLE001 - 单个 mcap 登记失败不阻塞目录加载
                 pass
 
+    # 目录内的文本数据文件（.txt 时间戳清单 / .INFO 日志）：此前一律归入 others
+    # 且**从不打开**，导致 agent 只能回答"工具根本没看这些文件"——而时间戳实际
+    # 就在其中（真实案例 2026-09-14：14 个相机 .txt 各含 14142 行纳秒时间戳，
+    # 但因为 .txt 不在支持格式内而被完全忽略）。现在经统一读取器识别并登记为流。
+    register_text_data_streams(context, probe)
+
     file_survey: dict[str, Any] = {
         "total_files": probe["total_files"],
         "ext_dist": probe["ext_dist"],
@@ -1765,6 +1891,26 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
             df = _load_hdf5(path)
         elif ext == ".mcap":
             df = _load_mcap_main(path)
+        elif ext in (".txt", ".text"):
+            from app.tools._text_readers import parse_timestamp_lines
+
+            parsed = parse_timestamp_lines(path)
+            if parsed is None:
+                raise ValueError(
+                    "该文本文件不符合数据表形态（需要每行以数值开头、列数一致）；"
+                    "它可能是说明文档或配置文件，不是数据。"
+                )
+            df = parsed
+        elif ext in (".info", ".log"):
+            from app.tools._text_readers import parse_log_lines
+
+            parsed = parse_log_lines(path)
+            if parsed is None:
+                raise ValueError(
+                    "该文件不符合可识别的日志格式（glog 风格："
+                    "[IWEF]MMDD hh:mm:ss.uuuuuu ...），无法解析为结构化数据。"
+                )
+            df = parsed
         else:  # pragma: no cover - 防御性分支
             raise ValueError(f"未实现格式：{ext}")
     except MissingDependencyError as exc:

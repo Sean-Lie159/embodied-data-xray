@@ -83,6 +83,19 @@ def _read_timestamp_only(
             from app.tools._data_access import read_nested_time_column
 
             return read_nested_time_column(path, fmt, column_hint)
+        # **统一读取器优先**（2026-09-14）：csv/parquet/json/jsonl 已有既有分支，
+        # 而新接入的格式（txt / log 等）不该在此处再加分支——经 read_stream 的
+        # want="timestamp" 由各 reader 自行实现，新格式自动可用（这正是 _readers
+        # 模块"新增格式=注册一次"的设计目标）。
+        if fmt not in ("csv", "parquet", "json", "jsonl"):
+            from app.tools._readers import ReadRequest, read_stream
+
+            result = read_stream(ReadRequest(
+                path_spec=path, want="timestamp", fmt=fmt, column=column_hint))
+            if result.ok and result.timestamp is not None:
+                series = pd.Series(result.timestamp, name=result.timestamp_column)
+                return series
+            return None
         if fmt == "csv":
             encoding = _detect_encoding(Path(path).read_bytes())
             df_head = pd.read_csv(path, encoding=encoding, nrows=0, engine="python")

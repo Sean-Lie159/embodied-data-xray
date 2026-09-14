@@ -598,11 +598,120 @@ class _McapReader:
         return (series, field)
 
 
+class _TxtReader:
+    """纯文本数据清单读取器（``每个<行: 数值首列 + 等宽列>``）。
+
+    真实形态：具身智能采集把各相机的时间戳清单导成 ``.txt``，每行
+    ``<纳秒时间戳> <帧状态或帧序号>``。此前该扩展名不受支持，工具直接拒读，
+    agent 只能回答"找不到时间戳"——而时间戳实际就在这些文件里。
+    """
+
+    fmt = "txt"
+    extensions = [".txt", ".text"]
+
+    def frame(self, path: str, *, sub: str | None, limit: int | None) -> pd.DataFrame | None:
+        from app.tools._text_readers import parse_timestamp_lines
+
+        return parse_timestamp_lines(path, limit)
+
+    def columns(self, path: str, *, sub: str | None) -> list[str] | None:
+        df = self.frame(path, sub=None, limit=5)
+        return [str(c) for c in df.columns] if df is not None else None
+
+    def nrows(self, path: str, *, sub: str | None) -> int | None:
+        # 只数行数即可（比全量解析轻）；文件过大时仍用流式计数。
+        try:
+            with Path(path).open("rb") as f:
+                return sum(1 for ln in f if ln.strip())
+        except OSError:
+            return None
+
+    def sub_streams(self, path: str) -> list[str]:
+        return []
+
+    def timestamp(self, path: str, *, sub: str | None, column: str | None):
+        """读时间戳列。
+
+        解析器已把"符合时间戳量级的首列"命名为 ``timestamp``，故此处只需按名
+        取列（``column`` 指定时优先）；这正是让该格式**无需各工具特判**即接入
+        时间对齐链路的关键。
+        """
+        from app.tools._text_readers import parse_timestamp_lines
+
+        df = parse_timestamp_lines(path)
+        if df is None or df.empty:
+            return (None, None)
+        field = column if (column and column in df.columns) else None
+        if field is None:
+            for cand in ("timestamp", "time", "ts"):
+                if cand in df.columns:
+                    field = cand
+                    break
+        if field is None:
+            return (None, None)
+        series = df[field]
+        series.name = field
+        return (series, field)
+
+
+class _LogReader:
+    """glog 风格日志读取器（``.INFO`` / ``.log``）。
+
+    真实形态：``I0320 09:37:20.200228 610336 file.cc:641] msg``。日志里有
+    微秒级时间信息与事件流，是排查"某时刻发生了什么"的关键证据。
+    注意年份缺失（glog 的 MMDD），读取器只给 ``time_of_day_us`` 并标注
+    ``clock_scope="time_of_day"``，不合成绝对时间戳。
+    """
+
+    fmt = "log"
+    extensions = [".info", ".log"]
+
+    def frame(self, path: str, *, sub: str | None, limit: int | None) -> pd.DataFrame | None:
+        from app.tools._text_readers import parse_log_lines
+
+        return parse_log_lines(path, limit)
+
+    def columns(self, path: str, *, sub: str | None) -> list[str] | None:
+        df = self.frame(path, sub=None, limit=50)
+        return [str(c) for c in df.columns] if df is not None else None
+
+    def nrows(self, path: str, *, sub: str | None) -> int | None:
+        try:
+            with Path(path).open("rb") as f:
+                return sum(1 for ln in f if ln.strip())
+        except OSError:
+            return None
+
+    def sub_streams(self, path: str) -> list[str]:
+        return []
+
+    def timestamp(self, path: str, *, sub: str | None, column: str | None):
+        """读日志的时间键（``time_of_day_us``，当日微秒数）。
+
+        注意：glog 时间戳不含年份，**不是绝对时间**——读取器把它命名为
+        ``time_of_day_us`` 而非 timestamp，正是为避免被误当作绝对时钟参与
+        跨流对齐（否则会与 ns epoch 时间戳混算出无意义的残差）。
+        """
+        from app.tools._text_readers import parse_log_lines
+
+        df = parse_log_lines(path)
+        if df is None or df.empty:
+            return (None, None)
+        field = column if (column and column in df.columns) else None
+        if field is None:
+            field = "time_of_day_us" if "time_of_day_us" in df.columns else None
+        if field is None:
+            return (None, None)
+        series = df[field]
+        series.name = field
+        return (series, field)
+
+
 def _install_default_readers() -> None:
-    """注册内置六类 reader（模块导入时执行一次）。"""
+    """注册内置 reader（模块导入时执行一次）。"""
     for reader in (
         _CsvReader(), _ParquetReader(), _JsonReader(), _JsonlReader(),
-        _H5Reader(), _McapReader(),
+        _H5Reader(), _McapReader(), _TxtReader(), _LogReader(),
     ):
         register_reader(reader)
 
