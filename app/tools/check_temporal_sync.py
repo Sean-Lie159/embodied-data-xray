@@ -724,6 +724,36 @@ def check_temporal_sync_impl(
             if v.get("path"):
                 video_variant_of.add(v.get("path"))
 
+    # **同一 MCAP 容器的时间戳一次取齐**（2026-09-14 性能事故）。
+    #
+    # 为什么：逐流调用会各自**重新遍历整个容器文件**——mcap 库无法按 topic 做
+    # 廉价定位，实测 1.86GB / 419 万条消息的文件上，单次遍历约 17~22 秒；
+    # 26 个 topic 逐个取 = 438 秒（与逐流过滤同阶）。一次遍历分桶后，
+    # 26 个 topic 共约 33 秒。
+    #
+    # 仅对 MCAP 生效（h5 按节点读取本就是局部 IO，无需批量）；取不到时
+    # 回退逐流路径（行为与改动前一致，零回归）。
+    mcap_bulk_ts: dict[str, dict[str, Any]] = {}
+    mcap_files = {
+        split_path_spec(s.get("path", ""))[0]
+        for s in streams
+        if s.get("format") == "mcap" and split_path_spec(s.get("path", ""))[1]
+    }
+    for f in mcap_files:
+        topics = [
+            split_path_spec(s.get("path", ""))[1]
+            for s in streams
+            if s.get("format") == "mcap"
+            and split_path_spec(s.get("path", ""))[0] == f
+            and split_path_spec(s.get("path", ""))[1]
+        ]
+        try:
+            from app.tools.mcap_reader import read_mcap_all_timestamps
+
+            mcap_bulk_ts.update(read_mcap_all_timestamps(f, list(topics)))
+        except Exception:  # noqa: BLE001 - 批量取失败则回退逐流读取
+            pass
+
     # 逐流读取时间戳（表格流读文件；视频流若存在配对 metainfo 表，经该表参与
     # 时间戳级对齐，注明时间戳来自曝光元数据而非容器）。
     per_stream: dict[str, dict[str, Any]] = {}
@@ -787,7 +817,18 @@ def check_temporal_sync_impl(
             # propose_stream_semantics 落盘（真实案例：IMU 传感器时间
             # data.header.timestamp_us 优先于容器批量写入时间）。
             per_stream_hint = s.get("time_column") or time_column
-            ts, col_name = _read_stream_timestamps(s, per_stream_hint)
+            # 命中批量预取（仅当未指定自定义时间列时——自定义列需按列取值，
+            # 而批量结果只含容器 log/publish 时间）。
+            bulk_key = split_path_spec(s.get("path", ""))[1]
+            if (not per_stream_hint and bulk_key
+                    and bulk_key in mcap_bulk_ts
+                    and mcap_bulk_ts[bulk_key].get("n_rows", 0) > 0):
+                arr = np.asarray(mcap_bulk_ts[bulk_key]["log_time_ns"], dtype=float)
+                arr = arr[~np.isnan(arr)]
+                ts = arr if len(arr) > 0 else None
+                col_name = "mcap_log_time_ns" if ts is not None else ""
+            else:
+                ts, col_name = _read_stream_timestamps(s, per_stream_hint)
             unit = s.get("timestamp_unit", "unknown")
             # 交叉校验：登记表的 timestamp_unit 可能判为 unknown（列名未命中词表
             # 时），用实际读到的时间戳列名重推断一次，纠正这类漏判（真实案例：

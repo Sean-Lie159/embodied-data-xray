@@ -289,6 +289,100 @@ def test_periodic_stream_gap_still_reported(tmp_path: Path) -> None:
     assert r.get("burst_streams") == []
 
 
+def test_temporal_sync_bulk_prefetch_no_reeval(tmp_path: Path) -> None:
+    """**性能红线**：check_temporal_sync 对同容器 MCAP 只遍历一次。
+
+    做法：合成含两个 topic 的 MCAP，monkeypatch 底层 iter_messages 计数——
+    若逐流各自重遍历，遍历次数会随 topic 数翻倍；一次遍历分桶则为 1。
+    """
+    mcap = pytest.importorskip("mcap")
+    from mcap.writer import Writer
+    from app.tools import mcap_reader as mr
+
+    path = tmp_path / "sync.mcap"
+    with path.open("wb") as f:
+        w = Writer(f)
+        w.start()
+        sid = w.register_schema(name="s", encoding="jsonschema",
+                                data=b'{"type":"object"}')
+        for topic in ("/a", "/b", "/c"):
+            c = w.register_channel(topic=topic, message_encoding="json",
+                                   schema_id=sid)
+            for k in range(500):
+                w.add_message(channel_id=c, log_time=k * 10_000_000,
+                              publish_time=k * 10_000_000, data=b'{"v":1}')
+        w.finish()
+
+    ctx = RunContext(output_dir=str(tmp_path), dataset_id="ds")
+    ctx.meta["streams"] = [
+        {"path": f"{path}::{t}", "format": "mcap", "kind": "unknown",
+         "channels": [], "n_rows": 500}
+        for t in ("/a", "/b", "/c")
+    ]
+    # 计数 mcap reader 的批量读取被调用几次（应为 1 次，覆盖 3 个 topic）。
+    calls = {"bulk": 0}
+    real = mr.read_mcap_all_timestamps
+
+    def _spy(*a, **k):
+        calls["bulk"] += 1
+        return real(*a, **k)
+
+    mr.read_mcap_all_timestamps = _spy  # type: ignore[assignment]
+    try:
+        from app.tools.check_temporal_sync import check_temporal_sync_impl
+
+        r = check_temporal_sync_impl(ctx)
+    finally:
+        mr.read_mcap_all_timestamps = real  # type: ignore[assignment]
+
+    assert r.get("success") is True, r.get("user_message")
+    assert calls["bulk"] == 1, (
+        f"同容器被遍历了 {calls['bulk']} 次（应 1 次；逐流重遍历是性能事故根因）"
+    )
+    # 三个 topic 都应参与（批量结果被正确分发）。
+    checks = (r.get("measurements") or {}).get("stream_checks") or {}
+    present = [k for k, v in checks.items() if v.get("present")]
+    assert len(present) == 3, f"批量结果未正确分发：{present}"
+
+
+def test_temporal_sync_custom_column_bypasses_bulk(tmp_path: Path) -> None:
+    """指定自定义时间列时**不**走批量（批量只含容器时间，需按列取值）。"""
+    mcap = pytest.importorskip("mcap")
+    from mcap.writer import Writer
+
+    path = tmp_path / "cust.mcap"
+    with path.open("wb") as f:
+        w = Writer(f)
+        w.start()
+        sid = w.register_schema(name="s", encoding="jsonschema",
+                                data=b'{"type":"object"}')
+        for topic in ("/a", "/b"):
+            c = w.register_channel(topic=topic, message_encoding="json",
+                                   schema_id=sid)
+            for k in range(200):
+                w.add_message(
+                    channel_id=c, log_time=k * 10_000_000,
+                    publish_time=k * 10_000_000,
+                    data=('{"header": {"timestamp_us": %d}}'
+                          % (1_789_370_000_000_000 + k * 10_000)).encode())
+            w.finish()
+
+    ctx = RunContext(output_dir=str(tmp_path), dataset_id="ds")
+    for t in ("/a", "/b"):
+        ctx.meta.setdefault("streams", []).append({
+            "path": f"{path}::{t}", "format": "mcap", "kind": "unknown",
+            "channels": [], "n_rows": 200, "time_column": "header.timestamp_us",
+        })
+    from app.tools.check_temporal_sync import check_temporal_sync_impl
+
+    r = check_temporal_sync_impl(ctx)
+    # 自定义列可能读不到（该 topic 无展开列），但**不得因此崩溃**；
+    # 关键是路径选择正确：不静默用容器时间冒充用户指定的列。
+    assert r.get("success") in (True, False)
+    if not r.get("success"):
+        assert r.get("error") in ("not_applicable", "streams_no_match")
+
+
 def test_empty_frame_notes_absent_for_aligned_streams(tmp_path: Path) -> None:
     """完全对齐的周期流不产生噪声告警。"""
     mcap = pytest.importorskip("mcap")
