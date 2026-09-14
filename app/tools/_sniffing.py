@@ -26,7 +26,15 @@ from typing import Any
 import pandas as pd
 
 # 视频扩展名（用于视频嗅探）。
-_VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm"}
+#
+# 含**裸码流**扩展名（2026-09-14 新增）：具身智能采集常把相机录成无容器的
+# HEVC 裸流（`.h265`/`.hevc`），此时 ffprobe 读不到 duration（N/A），
+# 且**不支持输入侧 -ss 跳转**（无索引）——但内容完整、可正常抽帧与数帧。
+# 真实案例：数据集 2655849 的 8 路相机各一个 563~592 MB 的 .h265。
+_VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".h265", ".hevc", ".h264"}
+
+# 无容器索引的裸视频流扩展名（决定抽帧策略与时长获取方式）。
+_RAW_VIDEO_EXTS = {".h265", ".hevc", ".h264"}
 
 # 音频扩展名（仅登记路径与格式，不做深度嗅探）。
 _AUDIO_EXTS = {".m4a", ".wav", ".mp3", ".flac", ".aac", ".ogg"}
@@ -1286,13 +1294,24 @@ def probe_video(path: str) -> dict[str, Any]:
         (s for s in data.get("streams", []) if s.get("codec_type") == "video"), {}
     )
     fmt = data.get("format", {})
-    fps: Any = None
-    try:
-        r = video_stream.get("avg_frame_rate", "0/1")
-        num, den = r.split("/")
-        fps = round(float(num) / float(den), 3) if float(den) else None
-    except (ValueError, ZeroDivisionError):
-        fps = None
+    is_raw_stream = Path(path).suffix.lower() in _RAW_VIDEO_EXTS
+
+    def _parse_rate(value: Any) -> float | None:
+        try:
+            num, den = str(value).split("/")
+            return round(float(num) / float(den), 3) if float(den) else None
+        except (ValueError, ZeroDivisionError, TypeError):
+            return None
+
+    # **裸流用 r_frame_rate 而非 avg_frame_rate**（2026-09-14 实测）：裸 HEVC
+    # 无容器索引，ffprobe 报 avg=25/1 而 r=30/1——报称的 30 fps 才是真实值
+    # （实测解码帧数 14142 ÷ 471.4 s ≈ 30.0 Hz，与相机 .txt 的 30 Hz 吻合）。
+    if is_raw_stream:
+        fps = _parse_rate(video_stream.get("r_frame_rate")) or _parse_rate(
+            video_stream.get("avg_frame_rate"))
+    else:
+        fps = _parse_rate(video_stream.get("avg_frame_rate")) or _parse_rate(
+            video_stream.get("r_frame_rate"))
 
     nb_frames_raw = video_stream.get("nb_frames")
     duration_raw = fmt.get("duration")
@@ -1300,6 +1319,13 @@ def probe_video(path: str) -> dict[str, Any]:
         duration_s = float(duration_raw) if duration_raw is not None else None
     except (ValueError, TypeError):
         duration_s = None
+
+    # **裸流的时长不在探测阶段实测**（2026-09-14 性能事故）：`-count_frames`
+    # 需全量解码，实测 8 路 563 MB 裸流共耗时 **742 秒**——加载一个目录要十几
+    # 分钟，等同于卡死。改为：探测阶段只给"由估算帧数 × 帧率"的时长（标注
+    # estimated），真正的精确帧数由用户在需要时用专门的计数工具触发（见
+    # inspect_video_frame 的 count_frames 参数）。
+    raw_measured: dict[str, Any] = {}
 
     # 帧数可信度甄别：ffprobe 对部分 mp4 会返回 nb_frames=1（明显错误），或缺失、
     # 或与 duration×fps 推算值偏差超过一个数量级。不可信时改用 duration×fps 估算，
@@ -1310,7 +1336,7 @@ def probe_video(path: str) -> dict[str, Any]:
     nb_frames_basis = estimated["basis"]
     nb_frames_trusted = estimated["trusted"]
 
-    return {
+    result: dict[str, Any] = {
         "ffprobe_available": True,
         "fps": fps,
         "width": video_stream.get("width"),
@@ -1320,8 +1346,66 @@ def probe_video(path: str) -> dict[str, Any]:
         "nb_frames_basis": nb_frames_basis,
         "nb_frames_trusted": nb_frames_trusted,
         "duration": duration_raw,
+        "duration_s": duration_s,
         "codec": video_stream.get("codec_name"),
+        # 裸流的"帧数"在探测阶段不可知（需要全量解码，代价见下方说明），
+        # 故显式标 None + 给出获取途径，而不是给一个编造的数字。
+        "nb_frames_unavailable": bool(is_raw_stream and nb_frames is None),
     }
+    if is_raw_stream:
+        # 裸流标注：让下游（抽帧/对齐）知道"该文件无索引、不支持输入侧 seek"。
+        result["raw_stream"] = True
+        result["raw_stream_note"] = (
+            "无容器裸码流：ffprobe 读不到时长与帧数（两者都需全量解码才能得到），"
+            "且**不支持输入侧 -ss 跳转**（抽帧走输出侧 seek）。"
+            "需要精确帧数时调用 inspect_video_frame(count_frames=True) 实测"
+            "（代价：全量解码，563MB/14142 帧实测约 90 秒）。"
+        )
+        # 时长的兜底：无 duration 但有帧数时用帧数/帧率；裸流两者皆无则保持 None。
+        if duration_s is None and nb_frames and fps:
+            duration_s = round(nb_frames / fps, 3)
+            result["duration_s"] = duration_s
+            result["duration_source"] = "estimated_from_frames"
+    if raw_measured:
+        result["nb_frames_measured"] = raw_measured["nb_frames"]
+    return result
+
+
+def _count_frames_raw(path: str, timeout_s: int = 600) -> dict[str, Any] | None:
+    """实测裸视频流的解码帧数（`ffprobe -count_frames`，需全量解码）。
+
+    为什么必须实测：裸码流无容器索引，``nb_frames`` 与 ``format.duration``
+    均为 N/A；帧数是判断"视频是否与时间戳逐帧对应"的关键（真实案例：
+    14142 帧恰好等于相机 .txt 的 14142 行时间戳）。
+
+    代价提示：需全量解码（563 MB / 14142 帧实测约 3~10 秒），故仅在裸流
+    且缺少时长信息时调用，并给足超时。
+
+    Args:
+        path: 视频文件路径。
+        timeout_s: 超时（秒）。
+
+    Returns:
+        {"nb_frames": int} 或 None（失败/超时——不阻塞加载，宁缺勿错）。
+    """
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=timeout_s,
+            encoding="utf-8", errors="replace",
+        )
+        if proc.returncode != 0:
+            return None
+        streams = json.loads(proc.stdout).get("streams") or []
+        raw = streams[0].get("nb_read_frames") if streams else None
+        if raw in (None, "", "N/A"):
+            return None
+        return {"nb_frames": int(raw)}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _estimate_frame_count(
