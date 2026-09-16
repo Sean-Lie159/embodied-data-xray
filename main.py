@@ -33,6 +33,7 @@ from app.llm.context_window import derive_budget
 from app.services.chat_service import extract_usage
 from app.tools import (
     align_container_streams,
+    check_dataset_quality,
     check_sensor_sanity,
     compare_datasets,
     check_temporal_sync,
@@ -109,7 +110,8 @@ def _format_cost(usage: dict[str, int] | None, cumulative: dict[str, int]) -> st
 # 真实注册以 _build_main_agent 的返回为准）。
 _CLI_TOOL_NAMES = [
     "load_dataset", "profile_data", "inspect_streams", "check_temporal_sync",
-    "check_sensor_sanity", "compute_stats", "plot_chart", "generate_report",
+    "check_sensor_sanity", "check_dataset_quality", "compute_stats",
+    "plot_chart", "generate_report",
     "propose_stream_semantics", "unpack_mcap", "align_container_streams",
     "inspect_video_frame", "compare_datasets",
 ]
@@ -141,6 +143,7 @@ def _build_main_agent() -> tuple[Agent[RunContext], list[str]]:
         align_container_streams,
         inspect_video_frame,
         compare_datasets,
+        check_dataset_quality,
     ]
     # 与 chat_service 一致：套上工具返回体积护栏（第 2 层防御）。
     # CLI 自行组装工具（不经 chat_service），故此处必须补上，否则 CLI 路径

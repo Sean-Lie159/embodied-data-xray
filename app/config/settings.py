@@ -130,6 +130,53 @@ class Settings(BaseSettings):
     # 离群 episode 检测（IQR 法）的 k 值：Q1 - k*IQR / Q3 + k*IQR 之外视为离群。
     stats_outlier_k: float = Field(default=1.5, ge=0.0)
 
+    # --- 数据集质检（check_dataset_quality）阈值 -----------------------------
+    # 设计依据：docs/标注与质检能力设计.md §5.3。**分层语义是本组配置的核心**：
+    # gate_* 属 L1 硬门禁（确定性错误，可判 fail）；diagnostic_* 属 L2/L3
+    # 诊断（启发式，仅 warn，**永不自动升级为 fail**）。
+    #
+    # 为什么必须分层：RDA 作者披露早期版本让 idle_ratio 自动升级为判定，在
+    # libero_10 上产生 65% 误报；改成"只有硬门禁能 EXCLUDE"后误报降 97-100%。
+    # 根因是阈值与任务相关——70% 空闲比对 push 类任务正常、对 lift 类可疑。
+    #
+    # L1 硬门禁（确定性）：
+    # NaN/Inf 比例超过该值 → fail（与 sanity_nan_ratio 同口径）。
+    quality_gate_nan_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
+    # 帧计数缺口比例（实际行数 vs 时间戳推算应有行数）超过该值 → fail。
+    quality_gate_frame_loss_ratio: float = Field(default=0.02, ge=0.0, le=1.0)
+    # 跨 episode 的 feature/dtype 一致性：不一致列数超过该值时 → fail。
+    quality_gate_schema_mismatch_max: int = Field(default=0, ge=0)
+    #
+    # L2/L3 诊断（启发式，仅 warn）——数值全部可配置且**默认值未经数据集验证**：
+    # 动作突波/碰撞判定倍数：θ > 该倍数 × median(|a|)（HF GIGO 公开公式）。
+    quality_diagnostic_spike_multiplier: float = Field(default=15.0, gt=1.0)
+    # 致动器饱和判定：|a_t - q_{t+1}| 超过该角度（度）视为饱和（HF GIGO 公开公式）。
+    quality_diagnostic_saturation_deg: float = Field(default=7.0, gt=0.0)
+    # 低速/空闲判定阈值（归一化速度，与 HF GIGO 同口径）。
+    quality_diagnostic_idle_speed: float = Field(default=0.1, ge=0.0)
+    # 空闲比 warn 阈值（**必须按数据集调整**：高空闲比对 push 类任务可能完全正常）。
+    quality_diagnostic_idle_ratio_warn: float = Field(default=0.60, ge=0.0, le=1.0)
+    # 视频过暗惩罚阈值（灰度均值 0-255；HF GIGO 刻意只罚过暗、不罚过曝以免误报）。
+    quality_diagnostic_dark_mean: float = Field(default=50.0, ge=0.0, le=255.0)
+    # 视频模糊度：拉普拉斯方差低于该值判 warn（核 [0,1,0;1,-4,1;0,1,0]）。
+    quality_diagnostic_blur_variance: float = Field(default=100.0, ge=0.0)
+    # 路径效率 warn 阈值：clip(D/L, 0, 1)，D 为直线距离、L 为实际路径长度；
+    # 低于该值提示"犹豫/绕路"（HF GIGO 公开公式）。
+    quality_diagnostic_path_efficiency: float = Field(default=0.30, ge=0.0, le=1.0)
+    # 动作抖动判定：**高频残差能量占总能量的比例**超过该值判 warn（0.30=30%）。
+    # **注意**："Consistency Matters"(arXiv:2412.14309) 明确反对用绝对值判定
+    # 抖动，主张按数据分布分组判断；此处用无量纲的方差比例，且只 warn。
+    # **不用 P95/median 比值的原因**（实现时实测发现）：平滑的高频正弦其
+    # jerk 处处均匀，P95/median ≈ 1.2，该判据完全无法发现平滑高频运动，
+    # 而那正是"抖动"的典型形态。改用"低频趋势（5 点滑均）+ 高频残差"分解。
+    quality_diagnostic_jerk_ratio: float = Field(default=0.30, ge=0.0, le=1.0)
+    # 轨迹停顿（robot-induced pause）判定：连续低速步数超过该值判 warn。
+    quality_diagnostic_pause_steps: int = Field(default=30, ge=1)
+    # 高频振动（arm shaking）判定：加速度二阶差分的高频能量占比超过该值判 warn。
+    quality_diagnostic_shake_ratio: float = Field(default=0.30, ge=0.0, le=1.0)
+    # 诊断明细每项最多列出的 episode 数（控制上下文体积）。
+    quality_diagnostic_report_limit: int = Field(default=10, ge=1)
+
     # --- 可选：Token 成本估算（美元/百万 token）------------------------------
     # 两项都 >0 时才启用成本估算；默认 0 = 未配置，不显示成本。价格是易变信息，
     # 不硬编码，由用户在 .env 按当前服务商定价填写。

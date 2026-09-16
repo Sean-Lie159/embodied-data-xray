@@ -183,6 +183,17 @@ inspect_video_frame 抽单帧——**画面含义需用户判读，不得凭文�
 **仅在概览显示某条流确有疑点、或用户明确要求逐帧细节时**，才对该流做深入调用。\
 不要为了"更稳妥"而对已通过的工具重复调用；不要把一次调用能回答的问题拆成\
 多轮追问；用户问题范围含糊时，先按当前数据集全量执行一次再报告，而非逐条试探。
+16. 质检表述纪律（check_dataset_quality 专用，违反即误导用户）：该工具的返回\
+分两层，**必须分别转述**。gate（硬门禁）是确定性错误（NaN/Inf、时间戳非单调、\
+丢帧、schema 不一致、fps 非法、episode 边界矛盾），只有它能判 fail；\
+diagnostics（诊断项）是启发式提示（空闲比、动作突波、饱和、抖动、停顿、振动、\
+路径效率、视频元信息），**其 warn 不等于"数据有问题"**——阈值与任务相关，\
+70% 空闲比对 push/放置类任务可能完全正常。因此：不得把 diagnostics 的 warn \
+说成"质检未通过"或"数据有质量缺陷"，须说明它只是提示、需结合任务类型判断；\
+not_audited 中的项是**未检查**，不得笼统说"通过了质检"或"视频质量已检查"\
+（逐帧过暗/模糊当前版本未做）；所有阈值均为默认值、未经该数据集验证，\
+如实说明并建议按数据集调整配置。引用具体数值时须连同 threshold 一起给出，\
+不得只报数值让用户误以为是绝对标准。
 
 【表述】
 1. 全程用中文回答。
@@ -232,6 +243,8 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "inspect_streams": ("streams", "video_streams", "table_streams"),
     "check_temporal_sync": ("streams_status", "per_stream", "gaps"),
     "check_sensor_sanity": ("checks", "skipped_checks"),
+    # 数据集质检：gate/diagnostics 的逐项明细最易膨胀；result 与计数保留。
+    "check_dataset_quality": ("gate", "diagnostics", "affected_episodes"),
     "compute_stats": ("per_episode", "episodes"),
     "plot_chart": (),
     "generate_report": ("report_markdown", "content"),
@@ -606,6 +619,7 @@ _TOOL_FUNCTION_TEXT: dict[str, str] = {
     "inspect_streams": "正在探测设备清单",
     "check_temporal_sync": "正在检查时间同步",
     "check_sensor_sanity": "正在检查传感器合理性",
+    "check_dataset_quality": "正在执行数据集质检",
     "compute_stats": "正在计算统计指标",
     "plot_chart": "正在绘图",
     "generate_report": "正在生成报告",

@@ -19,6 +19,10 @@ from app.tools.annotation_store import (
     resolve_anchors,
     snapshot_annotations,
 )
+from app.tools.check_dataset_quality import (
+    check_dataset_quality,
+    check_dataset_quality_impl,
+)
 from app.tools.check_sensor_sanity import check_sensor_sanity, check_sensor_sanity_impl
 from app.tools.compare_datasets import compare_datasets, compare_datasets_impl
 from app.tools.check_temporal_sync import check_temporal_sync, check_temporal_sync_impl
@@ -57,6 +61,8 @@ __all__ = [
     "check_temporal_sync_impl",
     "check_sensor_sanity",
     "check_sensor_sanity_impl",
+    "check_dataset_quality",
+    "check_dataset_quality_impl",
     "compute_stats",
     "compute_stats_impl",
     "plot_chart",

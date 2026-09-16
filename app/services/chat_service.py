@@ -40,6 +40,7 @@ from app.llm.context_window import derive_budget
 from app.llm.factory import build_model_settings
 from app.tools import (
     align_container_streams,
+    check_dataset_quality,
     check_sensor_sanity,
     compare_datasets,
     check_temporal_sync,
@@ -61,6 +62,7 @@ _ALL_TOOLS = [
     inspect_streams,
     check_temporal_sync,
     check_sensor_sanity,
+    check_dataset_quality,
     compute_stats,
     plot_chart,
     generate_report,
