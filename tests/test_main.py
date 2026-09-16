@@ -25,10 +25,11 @@ def _run_chat_loop_with_inputs(monkeypatch, capsys, inputs, fake_run_turn):
     monkeypatch.setattr(main_module, "run_turn", fake_run_turn)
 
     # 避免真实构建模型/访问网络，替换为假 agent。
+    # 契约：_build_main_agent 返回 (agent, 工具名列表)；测试替身给出空清单。
     monkeypatch.setattr(
         main_module,
         "_build_main_agent",
-        lambda: SimpleNamespace(name="fake_agent"),
+        lambda: (SimpleNamespace(name="fake_agent"), []),
     )
 
     asyncio.run(main_module.chat_loop())

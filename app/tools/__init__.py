@@ -4,6 +4,21 @@ from app.tools.align_container import (
     align_container_streams,
     align_container_streams_impl,
 )
+from app.tools.annotation_store import (
+    EpisodeAnchor,
+    append_annotations,
+    check_source_for_use,
+    delete_annotation,
+    diff_snapshots,
+    format_timestamp,
+    list_snapshots,
+    load_annotation_history,
+    load_annotations,
+    normalize_record,
+    parse_timestamp,
+    resolve_anchors,
+    snapshot_annotations,
+)
 from app.tools.check_sensor_sanity import check_sensor_sanity, check_sensor_sanity_impl
 from app.tools.compare_datasets import compare_datasets, compare_datasets_impl
 from app.tools.check_temporal_sync import check_temporal_sync, check_temporal_sync_impl
@@ -59,4 +74,18 @@ __all__ = [
     "compare_datasets_impl",
     "inspect_video_frame",
     "inspect_video_frame_impl",
+    # 标注存储与规范化层（格式无关锚点 + 读写 + 版本管理）。
+    "EpisodeAnchor",
+    "resolve_anchors",
+    "normalize_record",
+    "check_source_for_use",
+    "load_annotations",
+    "append_annotations",
+    "delete_annotation",
+    "snapshot_annotations",
+    "list_snapshots",
+    "load_annotation_history",
+    "diff_snapshots",
+    "format_timestamp",
+    "parse_timestamp",
 ]

@@ -16,6 +16,8 @@ import asyncio
 import sys
 from typing import Any
 
+from agents import Agent
+
 from app.agent.agent import (
     build_agent,
     configure_history_compaction,
@@ -42,6 +44,7 @@ from app.tools import (
     plot_chart,
     profile_data,
     propose_stream_semantics,
+    unpack_mcap,
 )
 
 _EXIT_COMMANDS = {"exit", "quit", "q", "退出", "再见"}
@@ -102,7 +105,24 @@ def _format_cost(usage: dict[str, int] | None, cumulative: dict[str, int]) -> st
     return f"≈${cost:.4f} / 累计 ${cost_acc:.4f}"
 
 
-def _build_main_agent():
+# CLI 工具名的静态快照（仅作 _build_main_agent 不可用时的展示兜底；
+# 真实注册以 _build_main_agent 的返回为准）。
+_CLI_TOOL_NAMES = [
+    "load_dataset", "profile_data", "inspect_streams", "check_temporal_sync",
+    "check_sensor_sanity", "compute_stats", "plot_chart", "generate_report",
+    "propose_stream_semantics", "unpack_mcap", "align_container_streams",
+    "inspect_video_frame", "compare_datasets",
+]
+
+
+def _build_main_agent() -> tuple[Agent[RunContext], list[str]]:
+    """构建 CLI 的主 Agent。
+
+    Returns:
+        (agent, 已注册工具名列表)。返回工具名是为了让 CLI 横幅**从实际注册
+        结果生成**——此前横幅是硬编码字符串，与真实注册不同步（`unpack_mcap`
+        长期缺失却无人察觉的根因）。
+    """
     settings = get_settings()
     model = build_model(settings)
     tools = [
@@ -115,6 +135,9 @@ def _build_main_agent():
         plot_chart,
         generate_report,
         propose_stream_semantics,
+        # unpack_mcap 此前遗漏（CLI 仅 12 个工具、UI 13 个），导致 CLI 无法
+        # 解包容器（行为不一致）。本次补齐——与 chat_service._ALL_TOOLS 对齐。
+        unpack_mcap,
         align_container_streams,
         inspect_video_frame,
         compare_datasets,
@@ -135,11 +158,17 @@ def _build_main_agent():
         ),
         keep_recent_turns=settings.history_keep_recent_turns,
     )
-    return build_agent(model, guard_tools(tools, budget_tokens=budget.tool_output_budget))
+    agent = build_agent(
+        model, guard_tools(tools, budget_tokens=budget.tool_output_budget)
+    )
+    return agent, [t.name for t in tools]
 
 
 async def chat_loop() -> None:
-    agent = _build_main_agent()
+    # _build_main_agent 返回 (agent, 工具名列表)。工具名用 getattr 兜底取
+    # （测试替身可能只给 agent），拿不到时退回静态清单，仅供横幅展示。
+    built = _build_main_agent()
+    agent, tool_names = built
     context = RunContext()
     history_input: list[Any] | None = None
     # 会话累计 token（CLI 进程内维护，不持久化）。
@@ -147,7 +176,11 @@ async def chat_loop() -> None:
 
     print("=" * 56)
     print("🩻 Embodied-data-Xray — 具身智能数据结构透视")
-    print("已加载工具: load_dataset, profile_data, inspect_streams, check_temporal_sync, check_sensor_sanity, compute_stats, plot_chart, generate_report")
+    # 工具清单从实际注册结果生成（此前是硬编码字符串，与真实注册不同步——
+    # 正是 unpack_mcap 长期缺失却无人发现的根因）。测试替身无此信息时退回
+    # 静态清单（_CLI_TOOL_NAMES 有专门测试守护其与真实注册一致）。
+    shown = tool_names or _CLI_TOOL_NAMES
+    print(f"已加载工具({len(shown)}): " + ", ".join(shown))
     print("输入 exit / quit / 退出 结束对话；/compact 压缩历史，/history 查看历史体积。")
     print("=" * 56)
 
