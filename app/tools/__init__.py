@@ -19,6 +19,7 @@ from app.tools.annotation_store import (
     resolve_anchors,
     snapshot_annotations,
 )
+from app.tools.segment_actions import segment_actions, segment_actions_impl
 from app.tools.check_dataset_quality import (
     check_dataset_quality,
     check_dataset_quality_impl,
@@ -63,6 +64,8 @@ __all__ = [
     "check_sensor_sanity_impl",
     "check_dataset_quality",
     "check_dataset_quality_impl",
+    "segment_actions",
+    "segment_actions_impl",
     "compute_stats",
     "compute_stats_impl",
     "plot_chart",

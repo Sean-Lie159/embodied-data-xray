@@ -52,6 +52,7 @@ from app.tools import (
     plot_chart,
     profile_data,
     propose_stream_semantics,
+    segment_actions,
     unpack_mcap,
 )
 
@@ -71,6 +72,7 @@ _ALL_TOOLS = [
     align_container_streams,
     inspect_video_frame,
     compare_datasets,
+    segment_actions,
 ]
 
 

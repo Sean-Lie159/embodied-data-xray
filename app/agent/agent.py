@@ -194,6 +194,17 @@ not_audited 中的项是**未检查**，不得笼统说"通过了质检"或"视�
 （逐帧过暗/模糊当前版本未做）；所有阈值均为默认值、未经该数据集验证，\
 如实说明并建议按数据集调整配置。引用具体数值时须连同 threshold 一起给出，\
 不得只报数值让用户误以为是绝对标准。
+17. 动作切片纪律（segment_actions 专用，违反即产生虚假标注）：该工具只产出\
+**时间边界**，不产出动作名称。因此：① 你**不得**为切片编造 atomic_action 或 \
+action_description——当前模型不支持视觉输入，你无法看到画面，凭上下文猜测\
+动作名就是编造（违反纪律 1、9）；若用户要求命名，须说明需要人工提供或先\
+接入支持视觉的模型，并且由模型提出的名称一律标为"待确认的推测"。② 时间边界\
+**只能引用 segment_actions 的确定性输出**，不得自行推算、微调或补齐。③ 该\
+工具返回 success=False 且 error="no_motion_signal" 时，说明数据里找不到可用\
+的运动信号——**严禁**自行按固定时长等分来"补上"切片（等分边界无物理依据，\
+公开基准显示其标注 F1 仅 0.070，等价于无信息），须如实告知用户缺少哪些信号\
+并给出建议。④ 片段时长阈值（min/max_segment_s）是默认值、未经该数据集验证，\
+且业界对"原子动作合理时长"无公认标准，须如实说明。
 
 【表述】
 1. 全程用中文回答。
@@ -245,6 +256,8 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "check_sensor_sanity": ("checks", "skipped_checks"),
     # 数据集质检：gate/diagnostics 的逐项明细最易膨胀；result 与计数保留。
     "check_dataset_quality": ("gate", "diagnostics", "affected_episodes"),
+    # 动作切片：逐 episode 的片段明细最易膨胀；计数与所用信号保留。
+    "segment_actions": ("episodes",),
     "compute_stats": ("per_episode", "episodes"),
     "plot_chart": (),
     "generate_report": ("report_markdown", "content"),
@@ -620,6 +633,7 @@ _TOOL_FUNCTION_TEXT: dict[str, str] = {
     "check_temporal_sync": "正在检查时间同步",
     "check_sensor_sanity": "正在检查传感器合理性",
     "check_dataset_quality": "正在执行数据集质检",
+    "segment_actions": "正在检测动作片段边界",
     "compute_stats": "正在计算统计指标",
     "plot_chart": "正在绘图",
     "generate_report": "正在生成报告",

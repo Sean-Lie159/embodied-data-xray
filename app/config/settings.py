@@ -130,6 +130,23 @@ class Settings(BaseSettings):
     # 离群 episode 检测（IQR 法）的 k 值：Q1 - k*IQR / Q3 + k*IQR 之外视为离群。
     stats_outlier_k: float = Field(default=1.5, ge=0.0)
 
+    # --- 动作切片（segment_actions）阈值 -------------------------------------
+    # 设计依据：docs/标注与质检能力设计.md §5.2.2。
+    # **重要**：以下粒度阈值均为**占位建议值，未经任何数据集验证**——业界对
+    # "原子动作的合理时长"无公认标准（DROID 5-20s / AgiBot 30-60s / OXE 多
+    # <5s 均指**整段演示**而非原子片段）。必须按数据集实际情况调整。
+    # 最小片段时长（秒）：短于此的相邻片段合并（消除无意义碎片）。
+    annotation_min_segment_s: float = Field(default=0.5, gt=0.0)
+    # 最大片段时长（秒）：超过则在速度谷值处再切（不按固定时长硬切，避免切断动作）。
+    annotation_max_segment_s: float = Field(default=60.0, gt=0.0)
+    # 速度变化点的灵敏度：相邻速度差超过该倍数 × median(|Δspeed|) 视为切换点。
+    # 用相对比值而非绝对值，避免不同数据集量纲/尺度差异导致阈值失效。
+    annotation_change_point_ratio: float = Field(default=3.0, gt=1.0)
+    # 低速/停顿判定阈值（归一化速度，与 HF GIGO 同口径）。
+    annotation_idle_speed: float = Field(default=0.1, ge=0.0)
+    # 判定为"停顿段"所需的最少连续低速步数。
+    annotation_min_pause_steps: int = Field(default=5, ge=1)
+
     # --- 数据集质检（check_dataset_quality）阈值 -----------------------------
     # 设计依据：docs/标注与质检能力设计.md §5.3。**分层语义是本组配置的核心**：
     # gate_* 属 L1 硬门禁（确定性错误，可判 fail）；diagnostic_* 属 L2/L3
