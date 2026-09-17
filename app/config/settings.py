@@ -146,6 +146,9 @@ class Settings(BaseSettings):
     annotation_idle_speed: float = Field(default=0.1, ge=0.0)
     # 判定为"停顿段"所需的最少连续低速步数。
     annotation_min_pause_steps: int = Field(default=5, ge=1)
+    # 标注质检：允许的相邻片段间隙上限（秒）——超过视为可能漏标（仅 warn）。
+    # 也用作"片段是否超出 episode 时长"的比较容差。
+    annotation_max_gap_s: float = Field(default=0.1, ge=0.0)
 
     # --- 数据集质检（check_dataset_quality）阈值 -----------------------------
     # 设计依据：docs/标注与质检能力设计.md §5.3。**分层语义是本组配置的核心**：

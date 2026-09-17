@@ -205,6 +205,19 @@ action_description——当前模型不支持视觉输入，你无法看到画�
 公开基准显示其标注 F1 仅 0.070，等价于无信息），须如实告知用户缺少哪些信号\
 并给出建议。④ 片段时长阈值（min/max_segment_s）是默认值、未经该数据集验证，\
 且业界对"原子动作合理时长"无公认标准，须如实说明。
+18. 标注落盘纪律（annotate_task / save_annotations / check_annotation_qc）：\
+① 任务描述**不得由你编造**——annotate_task 会在数据中确定性查找任务线索，\
+找不到时（no_task_signal）须请用户提供，不得凭数据形态猜任务。\
+② 落盘前必须获用户明确同意；未确认的内容来源标 llm_proposed，**并明确告知\
+用户"这是未经确认的推测标注，不能用于训练真值"**。\
+③ save_annotations 的 use="training" 会拒绝 llm_proposed/signal_derived 来源\
+——这是有意设计的闸门，**不得试图绕开**（如先落盘再改用途）；须如实告知用户\
+需先人工复核。\
+④ 用途与来源须分别说清：user_confirmed 可用于训练真值；signal_derived 为\
+机械切分、需复核；llm_proposed 禁止进训练真值；imported 取决于外部质量。\
+⑤ check_annotation_qc 的 failures（重叠/超界/序号/噪声无原因/来源用途不兼容）\
+是**必须修正**的问题，warnings 是提示（如片段间隙可能确实不属于任何动作）\
+——两者须分别转述，不要一律说成"标注有问题"。
 
 【表述】
 1. 全程用中文回答。
@@ -258,6 +271,10 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "check_dataset_quality": ("gate", "diagnostics", "affected_episodes"),
     # 动作切片：逐 episode 的片段明细最易膨胀；计数与所用信号保留。
     "segment_actions": ("episodes",),
+    # 标注工具：逐条明细与质检清单最易膨胀；计数与判定保留。
+    "annotate_task": ("discovered", "results"),
+    "save_annotations": ("results", "post_save_qc"),
+    "check_annotation_qc": ("failures", "warnings", "per_episode"),
     "compute_stats": ("per_episode", "episodes"),
     "plot_chart": (),
     "generate_report": ("report_markdown", "content"),
@@ -634,6 +651,9 @@ _TOOL_FUNCTION_TEXT: dict[str, str] = {
     "check_sensor_sanity": "正在检查传感器合理性",
     "check_dataset_quality": "正在执行数据集质检",
     "segment_actions": "正在检测动作片段边界",
+    "annotate_task": "正在登记任务标注",
+    "save_annotations": "正在保存标注",
+    "check_annotation_qc": "正在检查标注质量",
     "compute_stats": "正在计算统计指标",
     "plot_chart": "正在绘图",
     "generate_report": "正在生成报告",

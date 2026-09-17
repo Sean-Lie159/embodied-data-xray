@@ -560,3 +560,128 @@ def test_metadata_columns_excluded_from_motion(settings) -> None:
     res = segment_actions_impl(_ctx(_segmented_df()), settings=settings)
     # 元数据列不应导致误检（片段数应合理，而非爆量）。
     assert res["n_segments"] < 100
+
+
+# ---------------------------------------------------------------------------
+# 阶段四联调暴露的三个检测器缺陷（回归守护）
+# ---------------------------------------------------------------------------
+
+
+def test_merge_short_segments_does_not_cascade(settings) -> None:
+    """**短片段合并不得级联吞噬**（阶段四发现的最严重缺陷）。
+
+    初版"过短则并入前一段"在连续短片段串上会级联：吸收一个后仍"短"，
+    于是继续吸收，最终 19 个片段压成 1 个（用户失去全部切片结果）。
+    修正为"连续短串整体并入后一个正常片段"，合并一次且有界。
+    """
+    from app.tools.segment_actions import _merge_short_segments
+
+    segs = [
+        {"start_frame": 0, "end_frame": 200, "n_frames": 201,
+         "start_s": 0.0, "end_s": 4.0},                       # 正常
+        {"start_frame": 201, "end_frame": 210, "n_frames": 10,
+         "start_s": 4.0, "end_s": 4.2},                       # 短
+        {"start_frame": 211, "end_frame": 220, "n_frames": 10,
+         "start_s": 4.2, "end_s": 4.4},                       # 短
+        {"start_frame": 221, "end_frame": 420, "n_frames": 200,
+         "start_s": 4.4, "end_s": 8.4},                       # 正常
+    ]
+    out = _merge_short_segments(segs, 0.5, 50.0)
+    # 两个正常片段应当保留（短串被吸收，而非全部塌缩成 1 个）。
+    assert len(out) == 2, f"合并发生级联：{out}"
+    assert out[0]["start_frame"] == 0
+    assert out[1]["end_frame"] == 420
+
+
+def test_merge_short_segments_all_short_keeps_original(settings) -> None:
+    """全部片段都过短时保留原样（不塌缩为一个巨大片段）。"""
+    from app.tools.segment_actions import _merge_short_segments
+
+    segs = [
+        {"start_frame": i * 10, "end_frame": i * 10 + 9, "n_frames": 10,
+         "start_s": float(i), "end_s": float(i) + 0.2}
+        for i in range(5)
+    ]
+    out = _merge_short_segments(segs, 0.5, 50.0)
+    assert len(out) == 5
+
+
+def test_discrete_channels_excluded_from_motion_analysis(settings) -> None:
+    """**离散/二值通道不得参与连续信号分析**（阶段四发现的缺陷 1）。
+
+    二值夹爪列的加速度是脉冲，会污染突波检测（实测产出 153 个虚假事件）。
+    """
+    from app.tools.segment_actions import _motion_cols
+
+    n = 200
+    df = pd.DataFrame({
+        "timestamp": np.arange(n) * 0.02,
+        "action_joint0": np.sin(np.arange(n) * 0.2),          # 连续
+        "gripper_position": np.concatenate([                # 二值（离散）
+            np.zeros(100), np.ones(100)]),
+    })
+    cols = _motion_cols(df)
+    assert "action_joint0" in cols
+    assert "gripper_position" not in cols, "二值通道不得参与连续信号分析"
+
+
+def test_spike_detector_does_not_flood_on_smooth_high_freq(settings) -> None:
+    """**突波判据不得在平滑高频信号上泛滥**（阶段四发现的缺陷 2）。
+
+    纯 median 基线判据会把 38% 的采样点标为突波；改用 IQR 稳健离群后应接近 0。
+    """
+    from app.tools.segment_actions import _spike_points
+
+    n = 400
+    df = pd.DataFrame({
+        "timestamp": np.arange(n) * 0.02,
+        "action_joint0": np.concatenate([
+            np.sin(np.arange(200) * 0.3),
+            np.sin(np.arange(200) * 1.5) * 2]),
+    })
+    events, _used = _spike_points(
+        df, ["action_joint0"], settings.quality_diagnostic_spike_multiplier)
+    assert len(events) < n * 0.05, (
+        f"突波事件泛滥（{len(events)}/{n}）——判据基线选错了"
+    )
+
+
+def test_pause_detector_does_not_flood_on_slow_oscillation(settings) -> None:
+    """**停顿判据不得把慢速振荡的每个波谷都当停顿**（阶段四发现的缺陷 2 同类）。"""
+    from app.tools.segment_actions import _pause_boundaries, _speed_profile
+
+    n = 400
+    df = pd.DataFrame({
+        "timestamp": np.arange(n) * 0.02,
+        "action_joint0": np.concatenate([
+            np.sin(np.arange(200) * 0.3),
+            np.sin(np.arange(200) * 1.5) * 2]),
+    })
+    speed, _used = _speed_profile(df, ["action_joint0"])
+    bounds = _pause_boundaries(
+        speed, settings.annotation_idle_speed,
+        settings.annotation_min_pause_steps)
+    assert len(bounds) <= 4, (
+        f"假停顿泛滥（{len(bounds)} 个边界）——慢速振荡被误判为停顿"
+    )
+
+
+def test_gripper_boundary_survives_merge_pipeline(settings) -> None:
+    """夹爪边界必须能穿过完整流水线存活（端到端，防被合并淹没）。"""
+    n = 600
+    quiet = np.zeros(100)
+    df = pd.DataFrame({
+        "episode_index": [0] * n,
+        "timestamp": np.arange(n) * 0.02,
+        "fps": [50.0] * n,
+        "action_joint0": np.concatenate([
+            np.sin(np.arange(200) * 0.4), quiet,
+            np.sin(np.arange(200) * 0.4) * 1.5, quiet,
+        ]),
+        "gripper_position": np.concatenate([
+            np.zeros(200), np.zeros(100), np.ones(200), np.ones(100),
+        ]),
+    })
+    res = segment_actions_impl(_ctx(df), settings=settings)
+    assert res["success"] is True
+    assert res["n_segments"] >= 2, f"夹爪边界被淹没：{res['n_segments']} 个片段"

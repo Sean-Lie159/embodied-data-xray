@@ -19,6 +19,14 @@ from app.tools.annotation_store import (
     resolve_anchors,
     snapshot_annotations,
 )
+from app.tools.annotate import (
+    annotate_task,
+    annotate_task_impl,
+    check_annotation_qc,
+    check_annotation_qc_impl,
+    save_annotations,
+    save_annotations_impl,
+)
 from app.tools.segment_actions import segment_actions, segment_actions_impl
 from app.tools.check_dataset_quality import (
     check_dataset_quality,
@@ -66,6 +74,12 @@ __all__ = [
     "check_dataset_quality_impl",
     "segment_actions",
     "segment_actions_impl",
+    "annotate_task",
+    "annotate_task_impl",
+    "save_annotations",
+    "save_annotations_impl",
+    "check_annotation_qc",
+    "check_annotation_qc_impl",
     "compute_stats",
     "compute_stats_impl",
     "plot_chart",

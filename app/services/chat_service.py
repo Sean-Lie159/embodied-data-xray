@@ -40,6 +40,8 @@ from app.llm.context_window import derive_budget
 from app.llm.factory import build_model_settings
 from app.tools import (
     align_container_streams,
+    annotate_task,
+    check_annotation_qc,
     check_dataset_quality,
     check_sensor_sanity,
     compare_datasets,
@@ -52,6 +54,7 @@ from app.tools import (
     plot_chart,
     profile_data,
     propose_stream_semantics,
+    save_annotations,
     segment_actions,
     unpack_mcap,
 )
@@ -73,6 +76,9 @@ _ALL_TOOLS = [
     inspect_video_frame,
     compare_datasets,
     segment_actions,
+    annotate_task,
+    save_annotations,
+    check_annotation_qc,
 ]
 
 

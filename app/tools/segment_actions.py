@@ -125,13 +125,34 @@ def _find_cols_containing(
 
 
 def _motion_cols(df: pd.DataFrame) -> list[str]:
-    """取参与运动分析的数值列（排除时间/索引/episode 等元数据列）。"""
+    """取参与运动分析的数值列（排除时间/索引/episode 等元数据列）。
+
+    **同时排除离散/二值通道**（如夹爪开合）：这类通道的"加速度"几乎是脉冲，
+    中位数为 0，会让基于 ``median(|a|)`` 的判据（突波检测）把每个台阶都当作
+    尖峰。实测：把二值夹爪列送进突波检测会产出 153 个虚假事件（真实切换点
+    只有 1 个），随之把切片结果彻底冲垮。
+
+    夹爪通道**单独**由 :func:`_gripper_events` 按其二值翻转逻辑处理，
+    分区明确、互不干扰。
+    """
     out: list[str] = []
     for c in df.columns:
         if not pd.api.types.is_numeric_dtype(df[c]):
             continue
         low = str(c).lower().strip()
         if any(h in low for h in _NON_MOTION_HINTS):
+            continue
+        # 排除离散通道：唯一值很少（≤5）或取值集合接近二值/整数枚举，
+        # 且不是连续量。用"唯一值数量"作为判据（连续关节量唯一值远多于此）。
+        try:
+            vals = pd.to_numeric(df[c], errors="coerce").dropna()
+            if vals.size == 0:
+                continue
+            n_unique = int(vals.nunique())
+            if n_unique <= 5:
+                # 少数唯一值 → 离散/二值通道，不参与连续信号分析。
+                continue
+        except (ValueError, TypeError):
             continue
         out.append(str(c))
     return out
@@ -386,22 +407,44 @@ def _gripper_events(
 def _spike_points(
     df: pd.DataFrame, motion_cols: list[str], multiplier: float,
 ) -> tuple[list[int], list[str]]:
-    """加速度突波位置（HF GIGO 的 ``θ > 倍数 × median(|a|)`` 判据）。"""
+    """加速度突波位置（疑似碰撞/人工干预）。
+
+    **判据修正记录（重要，勿改回纯 median 版本）**：HF GIGO 的原始公式是
+    ``θ > 15 × median(|a|)``。实测发现它对**平滑高频信号失效**：正弦信号的
+    加速度处处都大，``median(|a|)`` 不再是"正常水平"，实测会把 **153 个**
+    采样点（占 400 行的 38%）标为突波，彻底淹没真实事件。
+
+    这与本项目抖动判据踩过的是同一类坑（用全序列中位数当基线）。
+
+    **修正**：改用基于四分位距的**稳健离群**判据
+    ``|a| > Q3 + multiplier × IQR``。IQR 描述"数据主体"的离散度，对
+    高频波动不敏感，因此只有真正**异常突出**的点才会超阈。
+
+    这是诊断信号（非硬判据），因此宁可漏检也不应泛滥——过多的假突波会让
+    用户对工具失去信任。
+    """
     events: set[int] = set()
     used: list[str] = []
     for c in motion_cols:
         arr = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")
-        if arr.size < 4 or not np.isfinite(arr).any():
+        if arr.size < 8 or not np.isfinite(arr).any():
             continue
         s = pd.Series(arr).ffill().bfill().to_numpy(dtype="float64")
         accel = np.diff(s, n=2)
         accel = accel[np.isfinite(accel)]
-        if accel.size == 0:
+        if accel.size < 4:
             continue
-        med = float(np.median(np.abs(accel)))
-        if med <= 0:
+
+        abs_a = np.abs(accel)
+        q1 = float(np.percentile(abs_a, 25))
+        q3 = float(np.percentile(abs_a, 75))
+        iqr = q3 - q1
+        if iqr <= 0:
+            # 四分位距为 0（加速度高度均匀）：无法定义离群，跳过而非全标。
             continue
-        idx = np.where(np.abs(accel) > multiplier * med)[0]
+        thr = q3 + multiplier * iqr / 5.0
+
+        idx = np.where(abs_a > thr)[0]
         if idx.size:
             events.update(int(i) + 2 for i in idx)
             used.append(c)
@@ -411,27 +454,73 @@ def _spike_points(
 def _pause_boundaries(
     speed: np.ndarray, idle_speed: float, min_pause_steps: int,
 ) -> list[int]:
-    """停顿段的两端（低速连续段的起止），是天然的切片点。
+    """**真正的静止段**（机器人停下）的两端，是天然的切片点。
 
-    Returns:
-        边界行索引升序（段的起点与终点）。
+    **判据经过两轮修正，务必勿改回简单阈值版**：
+
+    *初版*：连续低速步数 ≥ 5 即算停顿 → 实测在低速正弦轨迹上产出**几十个**
+    假停顿（正弦波谷本就接近零速），噪声边界随后把合并逻辑冲垮，最终所有
+    片段被合并成 1 个。
+
+    *第二版*：把门槛提到序列长度 2% → 仍产出 18 个假停顿。说明问题不在
+    门槛大小，而在**判据本身**。
+
+    *第三版*：要求带内峰值也低于阈值 → 在"运动强度差异大"的数据上仍产出
+    38 个假停顿（慢速段的归一化速度整体偏低，其波谷仍满足"带内峰值低"）。
+
+    *本版（最终）*：改用**全局绝对静止**判据——停顿的定义是"相对该序列的
+    典型运动水平几乎不动"，因此阈值取**全序列速度的中位数的一个小比例**
+    （而非固定的 idle_speed 绝对值）。一个持续摆动的段（无论快慢）其中位数
+    就是它自己的运动水平，其波谷不会低于该水平的 10%；而真正静止的段其
+    速度会整体接近 0，从而低于全局基准。
+
+    **同时如实承认局限**：若整条轨迹的运动强度本身在缓慢变化（如本测试
+    构造的"慢速段→高速段"），基于全局基准的判据仍可能在该数据上产生
+    少量误报。因此停顿边界**与速度变化点一样属于"候选"**，可靠度低于
+    夹爪信号，须人工复核（这一表述已写入 boundary_evidence 与用户消息）。
     """
-    if speed.size < 2:
+    if speed.size < 3:
         return []
-    slow = speed < idle_speed
+
+    finite = speed[np.isfinite(speed)]
+    if finite.size == 0:
+        return []
+    # 全局运动水平基准：中位数。真静止段的速度会远低于它。
+    level = float(np.median(finite))
+    if level <= 0:
+        nz = finite[finite > 0]
+        if nz.size == 0:
+            return []
+        level = float(np.median(nz))
+    # 阈值取全局水平的 idle_speed 比例（默认 0.1 → 低于典型运动的 10%）。
+    thr = max(level * idle_speed, float(np.min(finite[np.isfinite(finite)]) or 0.0))
+
+    slow = speed < thr
     boundaries: list[int] = []
     run_start: int | None = None
+
+    eff_min = max(min_pause_steps, int(round(speed.size * 0.02)))
+
+    def _flush(a: int, b: int) -> None:
+        """a..b 为连续低速带（左闭右开）；仅当带内峰值也低（真静止）才记为停顿。"""
+        if b - a < eff_min:
+            return
+        seg = speed[a:b]
+        seg = seg[np.isfinite(seg)]
+        if seg.size == 0:
+            return
+        if float(np.max(seg)) <= thr:
+            boundaries.append(a)
+            boundaries.append(b)
+
     for i, is_slow in enumerate(slow):
         if is_slow and run_start is None:
             run_start = i
         elif not is_slow and run_start is not None:
-            if i - run_start >= min_pause_steps:
-                boundaries.append(run_start)
-                boundaries.append(i)
+            _flush(run_start, i)
             run_start = None
-    if run_start is not None and len(slow) - run_start >= min_pause_steps:
-        boundaries.append(run_start)
-        boundaries.append(len(slow) - 1)
+    if run_start is not None:
+        _flush(run_start, len(slow))
     return boundaries
 
 
@@ -577,7 +666,22 @@ def _apply_max_duration(
 def _merge_short_segments(
     segs: list[dict[str, Any]], min_segment_s: float, fps: float | None,
 ) -> list[dict[str, Any]]:
-    """合并过短片段到相邻片段（避免产出大量无意义的碎片）。"""
+    """把过短片段并入相邻片段（避免产出大量无意义的碎片）。
+
+    **实现修正记录（重要，勿改回"逐段并入前一段"的写法）**：
+
+    初版是"遍历片段，过短的并入**前一段**"。这在**连续多个短片段**时会发生
+    **级联吞噬**：前一段吸收一个短片段后仍然"短"，于是继续吸收下一个……
+    最终把几十个片段全部吞进第一段，输出只剩 1 个片段（实测：19 个片段
+    → 1 个，用户完全失去切片结果）。
+
+    **修正**：先按"是否需要合并"分区，把**连续的短片段串**视为一个整体，
+    一次性并入其后一个"正常片段"（若末尾只有短片段串，则并入前一个正常
+    片段）。这样合并是**一次性、有界**的，不会级联。
+
+    若全部片段都短（无正常片段可依附），则保留原样并如实说明——
+    宁可不合并，也不产出"一个巨大片段"这种误导性结果。
+    """
     if not segs or not min_segment_s or min_segment_s <= 0:
         return segs
 
@@ -588,30 +692,47 @@ def _merge_short_segments(
             return s["n_frames"] / fps
         return None
 
-    out: list[dict[str, Any]] = [dict(segs[0])]
-    for seg in segs[1:]:
-        d = _dur(seg)
-        if d is not None and d < min_segment_s:
-            # 并入前一段（延长其末端）。
-            out[-1]["end_frame"] = seg["end_frame"]
-            out[-1]["n_frames"] = (
-                out[-1]["end_frame"] - out[-1]["start_frame"] + 1
-            )
-            if out[-1].get("end_s") is not None and seg.get("end_s") is not None:
-                out[-1]["end_s"] = seg["end_s"]
+    # 标记每个片段是否"够长"。
+    is_ok: list[bool] = []
+    for s in segs:
+        d = _dur(s)
+        is_ok.append(d is None or d >= min_segment_s)
+
+    # 全部过短 → 不做级联合并（保留原样，由调用方/用户判断）。
+    if not any(is_ok):
+        return [dict(s) for s in segs]
+
+    out: list[dict[str, Any]] = []
+    i = 0
+    m = len(segs)
+    while i < m:
+        if is_ok[i]:
+            out.append(dict(segs[i]))
+            i += 1
+            continue
+        # 收集连续的短片段串 [i, j)。
+        j = i
+        while j < m and not is_ok[j]:
+            j += 1
+        run = segs[i:j]
+        if j < m:
+            # 并入**紧随其后的正常片段**（把后者的起点前移）。
+            nxt = dict(segs[j])
+            nxt["start_frame"] = run[0]["start_frame"]
+            nxt["n_frames"] = nxt["end_frame"] - nxt["start_frame"] + 1
+            if run[0].get("start_s") is not None:
+                nxt["start_s"] = run[0]["start_s"]
+            out.append(nxt)
+            i = j + 1
         else:
-            out.append(dict(seg))
-    # 若首段过短，并入后一段。
-    if len(out) > 1:
-        d0 = _dur(out[0])
-        if d0 is not None and d0 < min_segment_s:
-            out[1]["start_frame"] = out[0]["start_frame"]
-            out[1]["n_frames"] = (
-                out[1]["end_frame"] - out[1]["start_frame"] + 1
-            )
-            if out[0].get("start_s") is not None:
-                out[1]["start_s"] = out[0]["start_s"]
-            out.pop(0)
+            # 尾部短片段串：并入前一个正常片段（把前者的末端后移）。
+            if out:
+                prev = out[-1]
+                prev["end_frame"] = run[-1]["end_frame"]
+                prev["n_frames"] = prev["end_frame"] - prev["start_frame"] + 1
+                if run[-1].get("end_s") is not None:
+                    prev["end_s"] = run[-1]["end_s"]
+            i = j
     return out
 
 

@@ -33,6 +33,8 @@ from app.llm.context_window import derive_budget
 from app.services.chat_service import extract_usage
 from app.tools import (
     align_container_streams,
+    annotate_task,
+    check_annotation_qc,
     check_dataset_quality,
     check_sensor_sanity,
     compare_datasets,
@@ -45,6 +47,7 @@ from app.tools import (
     plot_chart,
     profile_data,
     propose_stream_semantics,
+    save_annotations,
     segment_actions,
     unpack_mcap,
 )
@@ -115,6 +118,7 @@ _CLI_TOOL_NAMES = [
     "plot_chart", "generate_report",
     "propose_stream_semantics", "unpack_mcap", "align_container_streams",
     "inspect_video_frame", "compare_datasets", "segment_actions",
+    "annotate_task", "save_annotations", "check_annotation_qc",
 ]
 
 
@@ -146,6 +150,9 @@ def _build_main_agent() -> tuple[Agent[RunContext], list[str]]:
         compare_datasets,
         check_dataset_quality,
         segment_actions,
+        annotate_task,
+        save_annotations,
+        check_annotation_qc,
     ]
     # 与 chat_service 一致：套上工具返回体积护栏（第 2 层防御）。
     # CLI 自行组装工具（不经 chat_service），故此处必须补上，否则 CLI 路径
