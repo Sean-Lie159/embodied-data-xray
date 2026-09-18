@@ -116,18 +116,16 @@ def _resolve_pybs_asset_url() -> str:
 
 
 def _url_reachable(url: str) -> bool:
-    """探测 URL 是否可访问（HEAD 请求，失败即返回 False，不抛异常）。
+    """探测 URL 是否可访问（GET 只读首字节，失败即返回 False，不抛异常）。
 
-    Args:
-        url: 待探测的 URL。
-
-    Returns:
-        True 表示可访问（状态码 2xx/3xx）。
+    注意：不用 HEAD 探测——GitHub release 下载地址对 HEAD 响应不稳定，
+    会误判"固定资产不可用"（真实踩坑：误判后回退 API 又遭 IncompleteRead
+    中断，构建失败）。改用 GET 并只读极小一段即关闭连接。
     """
     try:
-        req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=15):  # noqa: S310
-            return True
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
+            return 200 <= getattr(resp, "status", 200) < 400
     except Exception:  # noqa: BLE001
         return False
 
@@ -404,8 +402,39 @@ def _make_zip(build_dir: Path, out_dir: Path) -> Path:
     return zip_path
 
 
-def build(base_url: str, model: str | None, temp: str | None) -> Path:
-    """执行完整构建流程，返回产出 zip 路径。"""
+def _find_reusable_runtime() -> Path | None:
+    """在 dist_portable 下寻找可复用的已构建 runtime（含 python.exe）。
+
+    Returns:
+        可复用的 runtime 目录；未找到返回 None。
+    """
+    dist = REPO_ROOT / "dist_portable"
+    if not dist.is_dir():
+        return None
+    # 取最近修改的候选（目录名含日期，直接按 mtime 排序最稳）。
+    cands = [
+        p / "runtime" for p in dist.iterdir()
+        if p.is_dir() and (p / "runtime" / "python.exe").exists()
+    ]
+    return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+
+def build(
+    base_url: str,
+    model: str | None,
+    temp: str | None,
+    reuse_runtime: bool = False,
+) -> Path:
+    """执行完整构建流程，返回产出 zip 路径。
+
+    Args:
+        base_url: 分发包预填的模型接口地址。
+        model: 模型名（None 时读部署机 .env）。
+        temp: 温度（None 时读部署机 .env）。
+        reuse_runtime: True 时复用 dist_portable 下已有的 runtime（不重新下载），
+            仍会按当前 requirements.txt 做增量依赖安装——网络受限或重复构建时
+            更快（真实踩坑：GitHub 下载不稳导致构建中断）。
+    """
     deploy = _read_deploy_env()
     if not deploy["key"]:
         raise SystemExit("部署机 .env 缺 OPENAI_API_KEY，无法构建分发包（key 需预置）。")
@@ -418,9 +447,21 @@ def build(base_url: str, model: str | None, temp: str | None) -> Path:
         shutil.rmtree(build_dir)
     (build_dir / "runtime").mkdir(parents=True)
 
-    _download_python_install_only(build_dir / "runtime")
+    runtime_dst = build_dir / "runtime"
+    cached_runtime = _find_reusable_runtime() if reuse_runtime else None
+    if cached_runtime is not None:
+        print(f"[1/4] 复用已有 runtime：{cached_runtime.parent.name}/runtime")
+        # 复制 runtime 内容（保留目录结构）。
+        for item in cached_runtime.iterdir():
+            dst = runtime_dst / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst)
+    else:
+        _download_python_install_only(runtime_dst)
 
-    python_exe = build_dir / "runtime" / "python.exe"
+    python_exe = runtime_dst / "python.exe"
     if not python_exe.exists():
         raise RuntimeError("内嵌 Python 解包后未找到 python.exe")
     _install_deps(python_exe, REPO_ROOT / "requirements.txt")
@@ -473,6 +514,11 @@ def main() -> None:
     )
     parser.add_argument("--model", default=None, help="模型名（缺省读部署机 .env）")
     parser.add_argument("--temp", default=None, help="温度（缺省读部署机 .env）")
+    parser.add_argument(
+        "--reuse-runtime", action="store_true",
+        help="复用 dist_portable 下已有的 runtime（不重新下载内嵌 Python，"
+             "仅做增量依赖安装），网络受限或重复构建时更快",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url
@@ -484,7 +530,7 @@ def main() -> None:
             )
         base_url = f"http://{ip}:8787/v1"
         print(f"自动检测内网 IP：{ip}，预填 {base_url}")
-    build(base_url, args.model, args.temp)
+    build(base_url, args.model, args.temp, reuse_runtime=args.reuse_runtime)
 
 
 if __name__ == "__main__":
