@@ -507,16 +507,45 @@ class _H5Reader:
         return df.head(limit) if limit is not None else df
 
     def columns(self, path: str, *, sub: str | None) -> list[str] | None:
-        df = self.frame(path, sub=sub, limit=1)
-        return [str(c) for c in df.columns] if df is not None else None
+        """只读列名（**不读数据内容**）。
 
-    def nrows(self, path: str, *, sub: str | None) -> int | None:
-        from app.tools.load_dataset import read_hdf5_node
-
+        2026-09-18 性能修复：此前实现是 ``self.frame(path, sub=sub, limit=1)``
+        ——``limit=1`` 只截取**结果**，内部仍会把"每帧一组"布局的 14135 个帧组
+        全部读取并拼接（实测单节点约 4.2 秒）。改走元信息接口后只读首帧的
+        dtype/shape。
+        """
         if not sub:
             return None
-        df = read_hdf5_node(path, sub)
-        return int(df.shape[0]) if df is not None else None
+        from app.tools.load_dataset import read_hdf5_nodes_metadata
+
+        meta = read_hdf5_nodes_metadata(path, [sub]).get(sub)
+        return list(meta["columns"]) if meta else None
+
+    def all_columns(self, path: str, subs: list[str]) -> dict[str, list[str]]:
+        """**一次遍历**取齐多个节点的列名（供 inspect_streams 批量调用）。
+
+        非 Reader 协议的可选扩展方法：只为 h5 提供（其"每帧一组"布局下逐节点
+        遍历代价高昂，见 :meth:`columns`）。其他格式无此方法，调用方需探测。
+
+        Args:
+            path: 文件路径。
+            subs: 节点名列表。
+
+        Returns:
+            {node: [列名]}；取不到的节点不在结果中。
+        """
+        from app.tools.load_dataset import read_hdf5_nodes_metadata
+
+        meta = read_hdf5_nodes_metadata(path, list(subs))
+        return {k: list(v["columns"]) for k, v in meta.items()}
+
+    def nrows(self, path: str, *, sub: str | None) -> int | None:
+        if not sub:
+            return None
+        from app.tools.load_dataset import read_hdf5_nodes_metadata
+
+        meta = read_hdf5_nodes_metadata(path, [sub]).get(sub)
+        return int(meta["shape"][0]) if meta else None
 
     def sub_streams(self, path: str) -> list[str]:
         from app.tools.load_dataset import _list_hdf5_native_nodes
@@ -524,17 +553,27 @@ class _H5Reader:
         return [n["node"] for n in _list_hdf5_native_nodes(path)]
 
     def timestamp(self, path: str, *, sub: str | None, column: str | None):
-        """读 h5 节点的时间戳列（compound 字段；缺省 timestamp 字段）。"""
+        """读 h5 节点的时间戳列（compound 字段或 <leaf>_<i> 分量）。
+
+        **轻量路径**（2026-09-18）：只读该字段在各帧的值，不构建整表——此前
+        经 ``read_h5_node_field`` → ``read_hdf5_node`` 会把 14135 个帧组的全部
+        字段读出来再取一列（实测单节点 4.2 秒、27 节点 113 秒）。
+        """
         if not sub:
             return (None, None)
-        from app.tools._data_access import read_h5_node_field
+        import pandas as pd
+
+        from app.tools.load_dataset import read_hdf5_node_field_fast
 
         field = column or "timestamp"
-        series = read_h5_node_field(f"{path}{_SUB_SEP}{sub}", field)
-        if series is None and field != "timestamp":
+        arr = read_hdf5_node_field_fast(path, sub, field)
+        if arr is None and field != "timestamp":
             field = "timestamp"
-            series = read_h5_node_field(f"{path}{_SUB_SEP}{sub}", field)
-        return (series, field if series is not None else None)
+            arr = read_hdf5_node_field_fast(path, sub, field)
+        if arr is None or len(arr) == 0:
+            return (None, None)
+        series = pd.Series(arr, name=field)
+        return (series, field)
 
 
 class _McapReader:

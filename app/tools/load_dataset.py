@@ -638,6 +638,179 @@ def _classify_h5_node(fields: list[str], node_path: str) -> tuple[str, str]:
     return "unknown", "未知（无法分类）"
 
 
+def read_hdf5_node_field_fast(
+    path: str, node: str, field: str
+) -> np.ndarray | None:
+    """**只读单个字段**的列值（不构建整表、不做列名语义化）。
+
+    为什么需要（2026-09-18 性能事故）：`inspect_streams` 为每条流实测采样率，
+    只需该流的时间戳列；而 :func:`read_hdf5_node` 会把"每帧一组"布局的 14135
+    个帧组的**全部字段**读出来并拼成 DataFrame（实测单节点约 4.2 秒），随后
+    只取其中一列。本函数仍须遍历各帧（数据按帧分散存放，无法避免），但
+    **不构造 DataFrame、不做列名映射、不 concat**，省去建表开销。
+
+    字段解析规则（与 :func:`read_hdf5_node` 的列名口径一致）：
+    - 字段名形如 ``<leaf>_<i>``（如 ``position_3``）→ 取该帧 1D/2D 数据的第 i 个
+      分量（1D 取 [i]；2D 扁平化后取 [i]）；
+    - 字段名恰为叶子名（如 ``timestamp``）→ 尝试 compound 的该字段名；失败则
+      视作单列数值数组的第 0 分量。
+
+    Args:
+        path: h5 文件路径。
+        node: 节点名（合并节点用相对路径，如 ``action/joint/position``）。
+        field: 目标字段名。
+
+    Returns:
+        值数组（float，NaN 已剔除非数值项）；取不到返回 None。
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+    try:
+        with h5py.File(path, "r") as f:
+            top = list(f.keys())
+            frame_layout = (
+                len(top) >= _FRAME_LAYOUT_MIN_GROUPS
+                and all(_is_frame_number(k) for k in top)
+            )
+            values: list[float] = []
+            if frame_layout:
+                roots = sorted((k for k in top if _is_frame_number(k)), key=int)
+            else:
+                roots = [None]
+
+            # 字段 → 取值方式：判定是"复合字段名"还是"分量索引"。
+            compound_field: str | None = None
+            comp_index: int | None = None
+            if "_" in field:
+                suffix = field.rsplit("_", 1)[-1]
+                if suffix.isdigit():
+                    comp_index = int(suffix)
+                else:
+                    compound_field = field
+            else:
+                compound_field = field
+
+            for root in roots:
+                container = f[root] if root is not None else f
+                if not isinstance(container, h5py.Group):
+                    continue
+                leaf = container.get(node)
+                if leaf is None or not isinstance(leaf, h5py.Dataset):
+                    continue
+                if compound_field and leaf.dtype.names:
+                    if compound_field not in leaf.dtype.names:
+                        return None
+                    data = leaf[compound_field]
+                    num = np.asarray(data, dtype=float).reshape(-1)
+                else:
+                    data = leaf[()]
+                    arr = np.asarray(data)
+                    if comp_index is not None:
+                        # **按"行内列索引"取值**（与读取口径一致）：1D 帧数据
+                        # (N,) 视为「1 行 × N 列」，取 [k]；2D 帧数据 (R, C)
+                        # 视为「R 行 × C 列」，取**第 k 列的全部 R 行**。
+                        # 不能按扁平化索引取——真实缺陷：orientation 的 (2,4)
+                        # 扁平化后第 0 个元素只对应 (0,0)，会丢掉 (1,0)，
+                        # 导致该列行数少一半（28270 vs 14135）。
+                        if arr.ndim <= 1:
+                            flat = arr.reshape(-1)
+                            if comp_index >= flat.size:
+                                return None
+                            num = np.asarray([flat[comp_index]], dtype=float)
+                        else:
+                            if comp_index >= arr.shape[-1]:
+                                return None
+                            num = np.asarray(arr[..., comp_index], dtype=float).reshape(-1)
+                    else:
+                        num = np.asarray(arr, dtype=float).reshape(-1)
+                values.extend(float(v) for v in num)
+            if not values:
+                return None
+            return np.asarray(values, dtype=float)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def read_hdf5_nodes_metadata(
+    path: str, nodes: list[str]
+) -> dict[str, dict[str, Any]]:
+    """**一次遍历**取齐多个节点的列名与形状（不读数据内容）。
+
+    为什么需要（2026-09-18 性能事故）：`inspect_streams` 要对每条流实测采样率，
+    需先知道该流的列名（判断有无时间戳列）。而"每帧一组"布局下，逐节点读取
+    都要**重新遍历 14135 个帧组**并构造 Python 包装对象——实测单节点约 4.2 秒，
+    27 个节点共 **113 秒**；更糟的是该数据集的节点**全都没有时间戳列**，这 113
+    秒全花在"逐个确认没有时间戳"上。
+
+    本函数只取**首帧**的叶子数据集读取列名与形状（帧布局下各帧结构一致，首帧
+    即代表全貌），把 O(节点数 × 帧数) 的遍历降为 O(帧数) 一次 + O(节点数) 查表。
+
+    非帧布局（普通层级文件）同样支持：节点名直接对应真实路径，取该数据集的
+    dtype/shape 即可，无需遍历。
+
+    Args:
+        path: h5 文件路径。
+        nodes: 需要元信息的节点名列表（合并节点用相对路径，如
+            ``action/joint/position``；普通节点用真实路径）。
+
+    Returns:
+        {node: {"columns": [...], "shape": (rows, cols)}}；取不到的节点不在结果中。
+        columns 对 1D 数值节点形如 ``["position_0", ...]``（与
+        :func:`_read_frame_layout_node` 的命名口径一致）。
+    """
+    try:
+        import h5py
+    except ImportError:
+        return {}
+    wanted = list(dict.fromkeys(nodes))  # 去重保序
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        with h5py.File(path, "r") as f:
+            top = list(f.keys())
+            frame_layout = (
+                len(top) >= _FRAME_LAYOUT_MIN_GROUPS
+                and all(_is_frame_number(k) for k in top)
+            )
+            first_frame = sorted(top, key=int)[0] if frame_layout else None
+            n_frames = len(top) if frame_layout else None
+            for node in wanted:
+                if frame_layout:
+                    grp = f[first_frame]
+                    leaf = grp.get(node) if isinstance(grp, h5py.Group) else None
+                    if leaf is None or not isinstance(leaf, h5py.Dataset):
+                        continue
+                else:
+                    leaf = f.get(node)
+                    if leaf is None or not isinstance(leaf, h5py.Dataset):
+                        continue
+                shape = tuple(int(x) for x in leaf.shape)
+                field_name = node.rsplit("/", 1)[-1]
+                dtype = leaf.dtype
+                if dtype.names:
+                    cols = [str(n) for n in dtype.names]
+                elif leaf.ndim == 2:
+                    cols = [f"{field_name}_{i}" for i in range(shape[1])]
+                elif leaf.ndim == 1 and shape[0] > 1:
+                    # 1D 向量：与读取口径一致（1 行 × N 列）。
+                    cols = [f"{field_name}_{i}" for i in range(shape[0])]
+                else:
+                    cols = [field_name]
+                rows = shape[0] if len(shape) >= 1 else 0
+                if frame_layout and n_frames:
+                    # 帧布局：总行数 = **单帧行数** × 帧数。
+                    # 1D (N,) 是"一帧一条向量观测" → 单帧 1 行；
+                    # 2D (R,C) 每帧贡献 R 行（如 orientation 的 (2,4) 是双手
+                    # 两条观测）。列数取末维（C）。
+                    per_frame_rows = rows if len(shape) == 2 else 1
+                    rows = per_frame_rows * n_frames
+                out[node] = {"columns": cols, "shape": (rows, len(cols))}
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
 def _dataset_to_frame(data: Any) -> pd.DataFrame | None:
     """把 h5py 数据集内容转为 DataFrame（含 compound 子数组字段的降级处理）。"""
     try:
