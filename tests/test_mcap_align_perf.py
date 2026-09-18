@@ -289,6 +289,118 @@ def test_periodic_stream_gap_still_reported(tmp_path: Path) -> None:
     assert r.get("burst_streams") == []
 
 
+def _count_iter(tmp_path: Path) -> Path:
+    """合成一个三 topic 的 MCAP，供"遍历次数"类测试使用。"""
+    mcap = pytest.importorskip("mcap")
+    from mcap.writer import Writer
+
+    path = tmp_path / "iter.mcap"
+    with path.open("wb") as f:
+        w = Writer(f)
+        w.start()
+        sid = w.register_schema(name="s", encoding="jsonschema",
+                                data=b'{"type":"object"}')
+        for topic in ("/a", "/b", "/c"):
+            c = w.register_channel(topic=topic, message_encoding="json",
+                                   schema_id=sid)
+            for k in range(200):
+                w.add_message(channel_id=c, log_time=k * 10_000_000,
+                              publish_time=k * 10_000_000, data=b'{"v":1}')
+        w.finish()
+    return path
+
+
+def test_timestamp_cache_shared_across_topics(tmp_path: Path) -> None:
+    """**性能回归（第三次同类问题）**：逐 topic 取时间戳只遍历文件一次。
+
+    真实事故：inspect_streams 对每个流各调一次 ``read_mcap_topic_timestamps``，
+    每次都重新遍历 1.86GB 文件——26 个 topic 实测 **1074 秒**（期间其他工具
+    等待）。缓存必须在读取器层共享，而不是在各调用点各打补丁（此前
+    align_container 与 check_temporal_sync 分别打了补丁，漏掉了 inspect_streams）。
+    """
+    path = _count_iter(tmp_path)
+    mr_mod = _mr
+    mr_mod.clear_mcap_timestamp_cache()
+
+    calls = {"n": 0}
+    real = mr_mod._import_mcap
+
+    class _Wrap:
+        def __init__(self, mod):
+            self._mod = mod
+
+        def make_reader(self, f):
+            calls["n"] += 1
+            return self._mod.make_reader(f)
+
+    import functools
+
+    @functools.lru_cache(maxsize=1)
+    def _cached_mod():
+        return _Wrap(real())
+
+    orig = mr_mod._import_mcap
+    mr_mod._import_mcap = _cached_mod  # type: ignore[assignment]
+    try:
+        for t in ("/a", "/b", "/c"):
+            r = mr_mod.read_mcap_topic_timestamps(str(path), t)
+            assert r["success"] is True and r["n_rows"] == 200
+    finally:
+        mr_mod._import_mcap = orig  # type: ignore[assignment]
+
+    assert calls["n"] == 1, (
+        f"文件被遍历 {calls['n']} 次（应 1 次，缓存未在读取器层共享）"
+    )
+
+
+def test_cache_does_not_lose_topics(tmp_path: Path) -> None:
+    """**缓存正确性**：先取一个 topic，再取另一个，不得返回"无数据"。
+
+    真实踩坑：早期实现把"带 topics 过滤的结果"也当全量缓存，导致先查 /a 后
+    查 /b 时缓存命中但缺 /b，误判为"该 topic 无时间戳"并退化成慢路径。
+    """
+    path = _count_iter(tmp_path)
+    _mr.clear_mcap_timestamp_cache()
+    first = _mr.read_mcap_topic_timestamps(str(path), "/a")
+    second = _mr.read_mcap_topic_timestamps(str(path), "/b")
+    third = _mr.read_mcap_topic_timestamps(str(path), "/c")
+    assert first["n_rows"] == 200
+    assert second["n_rows"] == 200, "第二个 topic 丢失（缓存不完整）"
+    assert third["n_rows"] == 200, "第三个 topic 丢失（缓存不完整）"
+
+
+def test_cache_invalidated_on_file_change(tmp_path: Path) -> None:
+    """文件被覆盖写入后缓存失效（按 mtime+size 指纹）。"""
+    path = _count_iter(tmp_path)
+    _mr.clear_mcap_timestamp_cache()
+    r1 = _mr.read_mcap_topic_timestamps(str(path), "/a")
+    assert r1["n_rows"] == 200
+
+    # 重写一个更短的文件（mtime 与 size 都变）。
+    from mcap.writer import Writer
+
+    with path.open("wb") as f:
+        w = Writer(f)
+        w.start()
+        sid = w.register_schema(name="s", encoding="jsonschema",
+                                data=b'{"type":"object"}')
+        c = w.register_channel(topic="/a", message_encoding="json", schema_id=sid)
+        for k in range(50):
+            w.add_message(channel_id=c, log_time=k, publish_time=k, data=b'{"v":1}')
+        w.finish()
+
+    r2 = _mr.read_mcap_topic_timestamps(str(path), "/a")
+    assert r2["n_rows"] == 50, f"缓存未随文件变更失效（仍报 {r2['n_rows']}）"
+
+
+def test_clear_cache_is_idempotent(tmp_path: Path) -> None:
+    """清空缓存可重复调用（测试隔离用）。"""
+    _mr.clear_mcap_timestamp_cache()
+    _mr.clear_mcap_timestamp_cache()
+    path = _count_iter(tmp_path)
+    assert _mr.read_mcap_topic_timestamps(str(path), "/a")["n_rows"] == 200
+
+
 def test_temporal_sync_bulk_prefetch_no_reeval(tmp_path: Path) -> None:
     """**性能红线**：check_temporal_sync 对同容器 MCAP 只遍历一次。
 

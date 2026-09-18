@@ -217,6 +217,12 @@ def _iter_decoded_messages(
             )
 
 
+# 容器时间戳缓存：{(绝对路径, mtime_ns, size): {topic: {log/publish/n_rows}}}。
+# 为什么按文件指纹而非仅路径：同一路径的文件可能被重新录制覆盖，仅用路径会
+# 返回过期数据；mtime+size 变化即失效（无需 TTL，也不怕长会话）。
+_TS_CACHE: dict[tuple[str, int, int], dict[str, dict[str, Any]]] = {}
+
+
 def read_mcap_topic_timestamps(
     path: str, topic: str, max_messages: int | None = None
 ) -> dict[str, Any]:
@@ -243,6 +249,24 @@ def read_mcap_topic_timestamps(
         n_rows、topic；topic 不存在时 success=False 且 error="topic_not_found"。
     """
     import numpy as np  # 局部导入：保持模块导入期轻量
+
+    # **优先命中容器级缓存**（2026-09-18 统一修复）：本函数被读取器的
+    # timestamp() 调用，而 inspect_streams 等工具会对**每条流各调一次**——
+    # 若每次都开新遍历，代价是 O(topic 数) × 1.86GB（实测 365 秒）。
+    # 命中缓存后，同容器所有 topic 只付一次遍历成本。
+    if max_messages is None:
+        # 取**全量**批量结果（不传 topics 过滤）：这样既命中已有全量缓存，
+        # 首次调用时也会建立**完整的**全量缓存供后续所有 topic 复用。
+        cached = read_mcap_all_timestamps(path)
+        if topic in cached:
+            entry = cached[topic]
+            return {
+                "success": True,
+                "topic": topic,
+                "log_time_ns": entry["log_time_ns"],
+                "publish_time_ns": entry["publish_time_ns"],
+                "n_rows": entry["n_rows"],
+            }
 
     reader_mod = _import_mcap()
     log_times: list[int] = []
@@ -295,7 +319,7 @@ def read_mcap_topic_timestamps(
 
 
 def read_mcap_all_timestamps(
-    path: str, topics: list[str] | None = None
+    path: str, topics: list[str] | None = None, *, use_cache: bool = True
 ) -> dict[str, dict[str, Any]]:
     """**一次遍历**取多个 topic 的时间戳（按 topic 分桶）。
 
@@ -319,6 +343,37 @@ def read_mcap_all_timestamps(
     """
     import numpy as np
 
+    # **容器级缓存**（2026-09-18 统一修复）：逐流调用者（inspect_streams 实测
+    # 采样率、check_temporal_sync、align_container）各自调用本函数时，若每次都
+    # 重遍历 1.86GB 文件，累计代价是 O(topic 数) × 单次遍历——实测
+    # inspect_streams 因此耗时 365 秒（26 topic × ~14s）。
+    #
+    # 缓存在**读取器层**而非各调用点：此前在 align_container / check_temporal_sync
+    # 各自打补丁，结果漏掉了 inspect_streams（第三个同类病灶）。放在这里则
+    # 所有调用者自动受益，且新调用点无需知道这个优化。
+    #
+    # 缓存键含文件路径 + 修改时间 + 大小：文件被覆盖写入时自动失效。
+    if use_cache:
+        try:
+            st = Path(path).stat()
+            ck = (str(Path(path).resolve()), st.st_mtime_ns, st.st_size)
+        except OSError:
+            ck = None
+        if ck is not None:
+            hit = _TS_CACHE.get(ck)
+            # 缓存只信任"全量"结果（topics=None 时写入）。带 topics 的调用若
+            # 命中一个**不含所需 topic** 的缓存，不能就此返回空——那会让调用方
+            # 误判"无时间戳"，也会退化成慢路径（真实踩坑：inspect_streams 逐流
+            # 调用时，第一个 topic 写入的缓存不含后续 topic，26 次全部回退到
+            # 单 topic 遍历，共 1074 秒）。
+            if hit is not None and hit.get("_complete"):
+                data = {k: v for k, v in hit.items() if k != "_complete"}
+                if topics is None:
+                    return data
+                missing = [t for t in topics if t not in data]
+                if not missing:
+                    return data
+
     reader_mod = _import_mcap()
     wanted = set(topics) if topics else None
     log_buf: dict[str, list[int]] = {}
@@ -338,7 +393,7 @@ def read_mcap_all_timestamps(
     except Exception:  # noqa: BLE001
         return {}
 
-    return {
+    full = {
         name: {
             "log_time_ns": np.asarray(log_buf[name], dtype=np.int64),
             "publish_time_ns": np.asarray(pub_buf[name], dtype=np.int64),
@@ -346,6 +401,25 @@ def read_mcap_all_timestamps(
         }
         for name in log_buf
     }
+    # **只缓存不带 topics 过滤的全量结果**（标记 `_complete`）。
+    #
+    # 为什么不能把带 topics 的结果也当全量：虽然遍历了整个文件，但分桶时
+    # `wanted` 过滤丢弃了其它 topic 的数据——缓存它会让后续请求其它 topic 的
+    # 调用误以为"该 topic 不存在"（真实踩坑：见上方缓存分支的注释）。
+    if use_cache and ck is not None and topics is None:
+        _TS_CACHE[ck] = {**full, "_complete": True}
+    if topics is None:
+        return full
+    return {k: v for k, v in full.items() if k in wanted}
+
+
+def clear_mcap_timestamp_cache() -> None:
+    """清空容器时间戳缓存（测试与"重新加载数据集"场景用）。
+
+    缓存以文件路径 + mtime + size 为键，正常使用下无需手动清理（文件变更会
+    自动失效）；此函数供测试隔离与显式刷新使用。
+    """
+    _TS_CACHE.clear()
 
 
 def read_mcap_topic(
