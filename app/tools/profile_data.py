@@ -48,7 +48,7 @@ def profile_data_impl(
         context, table, expand=expand, focus_fields=focus_fields)
     if not resolved["success"]:
         if resolved.get("error") == "table_not_found" or resolved.get("error") == "table_read_failed":
-            return {
+            out = {
                 "success": False,
                 "error": resolved["error"],
                 "reason": resolved.get("reason"),
@@ -56,6 +56,11 @@ def profile_data_impl(
                 "dataset": context.dataset_id,
                 "user_message": resolved.get("user_message", "指定的表不可用。"),
             }
+            # 透传可用表名示例：模型可据此**直接改用正确表名重试**，
+            # 而不必再去调 inspect_streams（少一轮往返）。
+            if resolved.get("available_examples"):
+                out["available_examples"] = resolved["available_examples"]
+            return out
         # 主表未加载。
         return {
             "success": False,

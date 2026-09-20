@@ -38,6 +38,7 @@ from app.tools import (
     check_dataset_quality,
     check_sensor_sanity,
     compare_datasets,
+    compare_table_columns,
     check_temporal_sync,
     compute_stats,
     generate_report,
@@ -117,7 +118,8 @@ _CLI_TOOL_NAMES = [
     "check_sensor_sanity", "check_dataset_quality", "compute_stats",
     "plot_chart", "generate_report",
     "propose_stream_semantics", "unpack_mcap", "align_container_streams",
-    "inspect_video_frame", "compare_datasets", "segment_actions",
+    "inspect_video_frame", "compare_datasets", "compare_table_columns",
+    "segment_actions",
     "annotate_task", "save_annotations", "check_annotation_qc",
 ]
 
@@ -148,6 +150,7 @@ def _build_main_agent() -> tuple[Agent[RunContext], list[str]]:
         align_container_streams,
         inspect_video_frame,
         compare_datasets,
+        compare_table_columns,
         check_dataset_quality,
         segment_actions,
         annotate_task,

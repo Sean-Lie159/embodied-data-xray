@@ -633,7 +633,22 @@ def resolve_table_name(
     # 显式表名 → 按流登记表查找（文件名精确匹配，忽略大小写）。
     # h5 节点流的表名 = "<文件stem>::<node>"；mcap topic 流形如
     # "<文件stem>::<topic>"（topic 可含斜杠，如 demo::/imu）。
+    #
+    # **表名容错**（2026-09-20 真实事故）：用户/模型给出的表名写法不一，此前只认
+    # 「stem::节点」与「节点名」两种精确形式，导致这些**同样合法**的写法全部失败：
+    #   - `aligned_joints.h5::state/end/position`（带扩展名）
+    #   - `C:\...\aligned_joints.h5::state/end/position`（完整路径）
+    # 而 inspect_streams 的 `source` 恰好是"完整路径::节点"——agent 照清单抄必失败，
+    # 于是得出"工具不具备该能力"的错误结论。现统一折算为候选匹配串集合。
     name_lower = table.strip().lower()
+    match_candidates = {name_lower}
+    file_part, sub_part = _split(name_lower)
+    if sub_part:
+        stem = Path(file_part).stem.lower()
+        name_only = Path(file_part).name.lower()
+        stem_noext = Path(Path(file_part).name).stem.lower()
+        for f in (stem, name_only, stem_noext):
+            match_candidates.add(f"{f}::{sub_part}")
     for s in context.meta.get("streams", []):
         p = s.get("path", "")
         if s.get("format") == "mcap":
@@ -642,7 +657,8 @@ def resolve_table_name(
             if not topic:
                 continue
             display = f"{Path(file_part).stem}::{topic}".lower()
-            if name_lower in (display, topic.lower()):
+            if (display in match_candidates or topic.lower() in match_candidates
+                    or name_lower == topic.lower()):
                 from app.tools.mcap_reader import read_mcap_topic
 
                 read = read_mcap_topic(file_part, topic)
@@ -677,7 +693,9 @@ def resolve_table_name(
             if not node_name:
                 continue
             display = f"{Path(file_part).stem}::{node_name}".lower()
-            if name_lower in (display, node_name.lower()):
+            if (display in match_candidates
+                    or node_name.lower() in match_candidates
+                    or name_lower == node_name.lower()):
                 df = _read_h5_node_stream(p)
                 if df is not None:
                     result = {
@@ -688,7 +706,7 @@ def resolve_table_name(
                         "source": "h5_node",
                     }
                     if expand:
-                        df2, note2 = expand_envelope(df)
+                        df2, note2 = expand_with_focus(df, focus_fields)
                         result["df"] = df2
                         result["expand_note"] = note2
                     return result
@@ -701,7 +719,7 @@ def resolve_table_name(
                     "dataset": context.dataset_id,
                     "source": "h5_node",
                 }
-        if Path(p).name.lower() == name_lower:
+        if Path(p).name.lower() in match_candidates:
             df = read_stream_full(p, s.get("format", ""))
             if df is not None:
                 note = None
@@ -729,6 +747,29 @@ def resolve_table_name(
                 "user_message": f"已找到流 {table}，但按流登记表读取其内容失败，无法分析。",
             }
 
+    # 错误提示必须**给出可直接使用的示例**（2026-09-20 真实事故）：此前只说
+    # "可用表见流登记表/inspect_streams 的表格流清单"，而 agent 照 inspect_streams
+    # 的 `source`（完整路径）抄表名**必然失败**——既没示例可对照，也没说明格式
+    # 要求，于是"能力可达"被误判为"工具不支持"。
+    usable: list[str] = []
+    for s in context.meta.get("streams", []):
+        p = s.get("path", "")
+        if not p:
+            continue
+        fmt = s.get("format")
+        if fmt in ("h5", "mcap"):
+            fp, sub_name = _split(p)
+            if sub_name:
+                usable.append(f"{Path(fp).stem}::{sub_name}")
+        else:
+            usable.append(Path(p).name)
+    examples = usable[:3]
+    hint = (
+        f"表名形如「<文件stem>::<节点>」（h5/mcap 子流，**不含扩展名**）"
+        f"或「<文件名>」（独立文件）。"
+        + (f"当前可用的前几个表名：{examples}。" if examples else "")
+        + "完整清单见 inspect_streams 返回里各条流的 table_name 字段。"
+    )
     return {
         "success": False,
         "error": "table_not_found",
@@ -737,8 +778,9 @@ def resolve_table_name(
         "table_name": table,
         "dataset": dataset_id,
         "source": "error",
+        "available_examples": examples,
         "user_message": (
-            f"当前数据集 {dataset_id} 中不存在表 {table}。可用表见流登记表/inspect_streams 的表格流清单。"
+            f"当前数据集 {dataset_id} 中不存在表 {table}。{hint}"
         ),
     }
 

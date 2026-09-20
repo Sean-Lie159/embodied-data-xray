@@ -263,52 +263,37 @@ def _load_hdf5_native(path: str) -> pd.DataFrame | None:
         （调用方按原路径兜底）。
     """
     try:
-        import h5py
+        import h5py  # noqa: F401
     except ImportError:
         return None
     try:
-        with h5py.File(path, "r") as f:
-            candidates: list[tuple[str, int, int, Any]] = []  # (路径, 行, 列, 数据)
-            def _visit(name: str, node: Any) -> None:
-                if not isinstance(node, h5py.Dataset):
-                    return
-                dtype = node.dtype
-                if node.dtype == object and node.shape == (1,):
-                    return  # object 标量（extra_info / camera_model 等）
-                if dtype.names:  # compound：字段名即列名
-                    ncols = len(dtype.names)
-                elif node.ndim == 2:
-                    ncols = int(node.shape[1])
-                else:
-                    return  # 1D 标量数组（distortion (4,) 等）不构成表
-                candidates.append((name, int(node.shape[0]), ncols, node[()]))
-            f.visititems(_visit)
-            if not candidates:
-                return None
-            # 信息量最大者为主表；并列时路径字母序（确定性）。
-            candidates.sort(key=lambda c: (-(c[1] * c[2]), c[0]))
-            best_path, _rows, _cols, data = candidates[0]
-            try:
-                df = pd.DataFrame(data)
-            except ValueError:
-                # compound 含子数组字段（如 value <f4 (7,)）→ 逐字段转，
-                # 子数组字段保持 object 列（与 _read_hdf5_node 同款防护）。
-                names = getattr(data.dtype, "names", None)
-                if not names:
-                    return None
-                cols: dict[str, Any] = {}
-                for name in names:
-                    col = data[name]
-                    cols[name] = (
-                        list(col) if col.ndim > 1 else col
-                    )  # 子数组字段 → object 列
-                df = pd.DataFrame(cols)
-            df.attrs["h5_source_node"] = best_path
-            df.attrs["h5_structure"] = [
-                {"node": c[0], "rows": c[1], "cols": c[2]}
-                for c in candidates[:20]
-            ]
-            return df
+        # **复用统一节点清单**（2026-09-20 真实缺陷修复）。
+        #
+        # 此前本函数自己遍历 + 自己算行数，**没有**应用 `_merge_frame_layout`
+        # 的帧布局合并——于是"每帧一组"布局下它看到的是**单帧行数**（如
+        # `0/action/end/orientation` 的 2 行），而流登记表里同名节点已是合并后
+        # 的 28270 行。两处口径不一致导致**选错主表**：主表只装载了 14135 帧中
+        # 的第 0 帧（`context.df.shape == (2, 4)`），基于它的统计/绘图全部失真。
+        #
+        # 现改为复用 `_list_hdf5_native_nodes`（含合并），保证"选主表的行数口径"
+        # 与"流登记表口径"同源。
+        nodes = _list_hdf5_native_nodes(path)
+        if not nodes:
+            return None
+        # 信息量最大者为主表；并列时路径字母序（确定性，由 _list_ 已排序）。
+        best = nodes[0]
+        best_path = best["node"]
+        df = read_hdf5_node(path, best_path)
+        if df is None:
+            return None
+        df.attrs["h5_source_node"] = best_path
+        # 结构清单与流登记表同口径（含合并后的行数、帧布局标记）。
+        df.attrs["h5_structure"] = [
+            {"node": n["node"], "rows": n["rows"], "cols": n["cols"],
+             **({"n_frames": n["n_frames"]} if n.get("frame_layout") else {})}
+            for n in nodes[:20]
+        ]
+        return df
     except OSError:
         return None  # 非 HDF5 签名 → 调用方按"可能损坏"兜底（文件确实读过）
     except Exception:  # noqa: BLE001
@@ -2223,6 +2208,24 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         # h5 原生层级：节点登记延后到 context.meta 赋值后（meta 与
         # context.meta 同引用，先赋值再追加才会落到会话 meta 上）。
         meta["h5_node_pending"] = True
+        # **主表选择透明化**（2026-09-20）：把候选清单与"如何切换"一并透出。
+        # 自动选主表按"行×列最大"——判据确定性但**不知道用户想分析什么**，
+        # 用户关心的（末端位置、关节角）往往不是最大的那张。此前只给选中的名字，
+        # agent 无从得知"还有哪些表、怎么换"，只能反问或放弃。
+        meta["main_table"] = {
+            "name": df.attrs.get("h5_source_node"),
+            "reason": "按「行×列最大」自动选择（信息量最大的数据节点）",
+            "candidates": [
+                {"table_name": f"{source.stem}::{h['node']}",
+                 "rows": h.get("rows"), "cols": h.get("cols")}
+                for h in h5_structure[:8]
+            ],
+            "alternative_hint": (
+                "如需分析其他节点，用 table 参数指定其 table_name"
+                "（上列 candidates 或 inspect_streams 的 table_name 字段，"
+                "格式为「<文件stem>::<节点>」，不含扩展名）。"
+            ),
+        }
     # MCAP：单文件多 topic。主 topic 已作为主表，其余 topic 登记为流
     # （复用 h5 节点流范式），供按名切换分析。
     mcap_main_topic = (

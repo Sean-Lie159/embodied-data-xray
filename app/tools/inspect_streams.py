@@ -28,6 +28,34 @@ from app.tools import _sniffing
 _TIMESTAMP_COLS = _sniffing._TIMESTAMP_COLS
 
 
+def _usable_table_name(stream: dict[str, Any]) -> str:
+    """把流登记项折算为**可直接传给 ``table`` 参数**的规范表名。
+
+    规则（与 ``_data_access.resolve_table_name`` 的匹配口径对应）：
+    - 容器子流（h5 节点 / mcap topic）：``"<文件stem>::<节点>"``（**不含扩展名**）；
+    - 独立文件：文件名（如 ``accel.csv``）。
+
+    为什么需要（2026-09-20 真实事故）：agent 只能看到 ``source``（完整绝对路径），
+    照抄去调 ``profile_data(table=...)`` 必然失败——路径带扩展名与目录前缀。
+    本函数提供"照抄即可用"的规范名，使清单与调用口径自洽。
+
+    Args:
+        stream: 流登记项（含 path / format）。
+
+    Returns:
+        规范表名；无 path 时返回空串。
+    """
+    from app.tools._readers import split_path_spec
+
+    path = str(stream.get("path") or "")
+    if not path:
+        return ""
+    file_part, sub = split_path_spec(path)
+    if sub:
+        return f"{Path(file_part).stem}::{sub}"
+    return Path(file_part).name
+
+
 def _resolve_timestamp_column(
     columns: list[str], main: str | None, column_hint: str | None
 ) -> str | None:
@@ -481,9 +509,15 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
                 nb_display = nb_frames
             video_streams.append({
                 "source": src,
+                "table_name": Path(src).name,
                 "role": _sniffing.infer_role(src),
                 "nominal_fps": vmeta.get("fps"),
                 "actual_fps": vmeta.get("fps"),
+                # 帧率来源与冲突（裸流的 ffprobe 速率标签可能与同名时间戳清单
+                # 矛盾——真实事故：stereo 报 60fps 而清单为 30fps）。
+                "fps_source": vmeta.get("fps_source"),
+                "fps_from_timestamp_sidecar": vmeta.get("fps_from_timestamp_sidecar"),
+                "fps_conflict": vmeta.get("fps_conflict"),
                 "nb_frames": nb_display,
                 "nb_frames_source": nb_source,
                 "nb_frames_basis": nb_basis,
@@ -521,6 +555,13 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         rate = _measure_stream_rate(s, context.meta)
         entry = {
             "source": s.get("path"),
+            # **可直接传给 table 参数的规范表名**（2026-09-20 新增）。
+            #
+            # 为什么要与 source 并存：source 面向"这个流来自哪个文件"的**溯源**
+            # 需求（完整绝对路径），table_name 面向"我要读它"的**调用**需求。
+            # 此前只有 source，agent 拿溯源字段去当调用参数必然失败（路径带扩展名
+            # 与目录前缀），于是误判"工具不支持读取该节点"。
+            "table_name": _usable_table_name(s),
             "kind": kind,
             "role": s.get("role", {}),
             "channels": s.get("channels", []),

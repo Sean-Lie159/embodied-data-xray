@@ -1239,6 +1239,61 @@ def _ffprobe_runs() -> bool:
         return False
 
 
+def _fps_from_timestamp_sidecar(path: str) -> float | None:
+    """从同名时间戳清单（``<视频>.txt``）推算帧率（仅读首末两行，零成本）。
+
+    为什么需要（2026-09-20 真实事故）：裸码流的 ``r_frame_rate`` 也可能被码流头
+    信息误导——同一批 8 路中 6 路报 30 fps，而 stereo 两路报 **60 fps**，实测
+    清点却是 14142 帧（= 30 fps）。而采集端逐帧记录的时间戳清单是**真实帧时刻**
+    的直接证据，且存在于同目录同名文件中。
+
+    读取策略：只解析**首行与末行**的时间戳（不读全量），用
+    ``(行数 - 1) / 跨度秒`` 得帧率——比"逐行解析"快几个数量级，且足以判定
+    "60 vs 30"这类数量级矛盾。
+
+    Args:
+        path: 视频文件路径。
+
+    Returns:
+        推算帧率（Hz）；无同名清单 / 清单不可解析 / 行数不足时返回 None。
+    """
+    sidecar = Path(path).with_suffix(".txt")
+    if not sidecar.exists():
+        return None
+    try:
+        lines: list[str] = []
+        n = 0
+        with sidecar.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                s = raw.strip()
+                if not s:
+                    continue
+                n += 1
+                if len(lines) == 0:
+                    lines.append(s)          # 首行
+                else:
+                    lines = [lines[0], s]    # 持续用末行覆盖
+        if n < 2 or len(lines) < 2:
+            return None
+        first = float(lines[0].split()[0])
+        last = float(lines[1].split()[0])
+        # 时间戳量级判定：>=1e17 视为纳秒（19 位 epoch），>=1e14 微秒，
+        # >=1e11 毫秒；其余不猜（宁可返回 None）。
+        if first >= 1e17:
+            span_s = (last - first) / 1e9
+        elif first >= 1e14:
+            span_s = (last - first) / 1e6
+        elif first >= 1e11:
+            span_s = (last - first) / 1e3
+        else:
+            return None
+        if span_s <= 0:
+            return None
+        return (n - 1) / span_s
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def probe_video(path: str) -> dict[str, Any]:
     """用 ffprobe 读取视频元数据。
 
@@ -1313,6 +1368,38 @@ def probe_video(path: str) -> dict[str, Any]:
         fps = _parse_rate(video_stream.get("avg_frame_rate")) or _parse_rate(
             video_stream.get("r_frame_rate"))
 
+    # **裸流的 r_frame_rate 仍可能是误报，需交叉校验**（2026-09-20 实测）。
+    #
+    # 真实事故：同一批 8 路裸流中，6 路报 r=30/1，而 head_stereo_left/right 报
+    # **r=60/1**。用户据此追问"60fps 与 30Hz 时间戳清单差一倍，是否降采样"——
+    # 但全量解码清点后两路均为 **14142 帧**，与同名 .txt 的 14142 行逐帧对应，
+    # 实际就是 30 fps。即 r_frame_rate 在裸流上也可能被码流头信息误导。
+    #
+    # 校验源选**同名时间戳清单**（`<相机>.txt`）：它是采集端记录的真实帧时刻，
+    # 零成本（仅读首末两行），且能同时给出"清单层面"的帧率。两者矛盾时以清单
+    # 为准并如实标注（清单是逐帧实测记录，码流头的速率标签只是提示）。
+    fps_source = "ffprobe_r_frame_rate" if is_raw_stream else "ffprobe_avg_frame_rate"
+    fps_from_sidecar: float | None = None
+    fps_conflict: dict[str, Any] | None = None
+    if is_raw_stream and fps:
+        sidecar = _fps_from_timestamp_sidecar(path)
+        if sidecar:
+            fps_from_sidecar = sidecar
+            # 容差 10%：只判"数量级级别的矛盾"（如 60 vs 30），不动细微差异。
+            if abs(sidecar - fps) > max(1.0, fps * 0.1):
+                fps_conflict = {
+                    "probe_fps": fps,
+                    "sidecar_fps": sidecar,
+                    "sidecar_file": f"{Path(path).with_suffix('')}.txt",
+                    "note": (
+                        f"ffprobe 报 {fps:g} fps，但同名时间戳清单显示 "
+                        f"{sidecar:g} fps（清单为逐帧采集记录，更可信）；"
+                        "已按清单值采用，ffprobe 速率标签在裸流上不可靠。"
+                    ),
+                }
+                fps = round(sidecar, 3)
+                fps_source = "timestamp_sidecar（与 ffprobe 矛盾，以清单为准）"
+
     nb_frames_raw = video_stream.get("nb_frames")
     duration_raw = fmt.get("duration")
     try:
@@ -1339,6 +1426,7 @@ def probe_video(path: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ffprobe_available": True,
         "fps": fps,
+        "fps_source": fps_source,
         "width": video_stream.get("width"),
         "height": video_stream.get("height"),
         "nb_frames": nb_frames,
@@ -1352,6 +1440,12 @@ def probe_video(path: str) -> dict[str, Any]:
         # 故显式标 None + 给出获取途径，而不是给一个编造的数字。
         "nb_frames_unavailable": bool(is_raw_stream and nb_frames is None),
     }
+    # 帧率的交叉校验结果（仅裸流且同名清单可读时才有）：矛盾时必须透出，
+    # 否则用户会像本次事故那样基于误报的 60fps 去追问"是否降采样"。
+    if fps_from_sidecar is not None:
+        result["fps_from_timestamp_sidecar"] = round(fps_from_sidecar, 3)
+    if fps_conflict is not None:
+        result["fps_conflict"] = fps_conflict
     if is_raw_stream:
         # 裸流标注：让下游（抽帧/对齐）知道"该文件无索引、不支持输入侧 seek"。
         result["raw_stream"] = True
