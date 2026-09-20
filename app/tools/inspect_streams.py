@@ -405,6 +405,74 @@ def _find_timestamp_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _camera_coverage_note(streams: list[dict[str, Any]]) -> dict[str, Any]:
+    """比对容器内相机时间戳路数与 camera/ 目录同名 txt 路数（如实标注不对称）。
+
+    为什么需要（2026-09-20，用户确认的取舍 3）：真实数据集 ``2655849`` 的 h5 内
+    ``timestamp/camera/`` 只有 **6 路**（hand_left/right_color、head_color、
+    head_depth、head_stereo_left/right），而 ``camera/`` 目录下有 **9 路**同名
+    txt（另有 head_back_fisheye、head_left_fisheye、head_right_fisheye）。
+    用户在设备清单阶段看不到这个差异，问"h5 时间戳与 camera/ 下每个同名 txt
+    的对齐"时会默认两侧一一对应，进而在找不到对应物时误判为工具漏读。
+
+    本函数**只标注、不补齐**——不臆造 h5 里不存在的相机时间戳，也不为缺失的
+    txt 造数据，只把"哪侧存在哪些相机"如实列出，由用户判断是否属预期。
+
+    Args:
+        streams: 流登记表（RunContext.meta["streams"]）。
+
+    Returns:
+        dict，含 h5_cameras / dir_cameras / only_in_h5 / only_in_dir / note；
+        两侧任一为空、或两侧完全一致时 note 为 None（无不对称可报）。
+    """
+    h5_cams: set[str] = set()
+    dir_cams: set[str] = set()
+    for s in streams:
+        path = str(s.get("path", ""))
+        file_part, _, sub = path.partition("::")
+        # 容器侧：h5 的 timestamp/camera/<name> 节点。
+        if s.get("format") == "h5" and "timestamp/camera/" in sub:
+            h5_cams.add(sub.rsplit("/", 1)[-1].lower())
+        # 目录侧：camera/<相机名>/ 下的 txt（取 camera 的下一层目录名）。
+        if s.get("format") in ("txt", "csv") and "camera" in Path(file_part).parts:
+            parts = Path(file_part).parts
+            try:
+                idx = [p.lower() for p in parts].index("camera")
+            except ValueError:
+                continue
+            if idx + 1 < len(parts) - 1:  # 还有更深一层 = 相机目录名
+                dir_cams.add(parts[idx + 1].lower())
+
+    only_h5 = sorted(h5_cams - dir_cams)
+    only_dir = sorted(dir_cams - h5_cams)
+    note: str | None = None
+    if h5_cams and dir_cams and (only_h5 or only_dir):
+        bits: list[str] = []
+        if only_dir:
+            bits.append(
+                f"仅 camera/ 目录有、h5 内无对应时间戳的相机（{len(only_dir)} 路）："
+                f"{only_dir}"
+            )
+        if only_h5:
+            bits.append(
+                f"仅 h5 内有时间戳、camera/ 目录无同名 txt 的相机（{len(only_h5)} 路）："
+                f"{only_h5}"
+            )
+        note = (
+            f"注意：**相机路数不对称**——h5 内 timestamp/camera/ 有 {len(h5_cams)} 路，"
+            f"camera/ 目录下有 {len(dir_cams)} 路同名 txt，并非一一对应。"
+            + "；".join(bits)
+            + "。仅如实标注、不补齐缺失侧。"
+        )
+    return {
+        "h5_cameras": sorted(h5_cams),
+        "dir_cameras": sorted(dir_cams),
+        "only_in_h5": only_h5,
+        "only_in_dir": only_dir,
+        "note": note,
+    }
+
+
 def _measure_stream_rate(
     stream: dict[str, Any], meta: dict[str, Any]
 ) -> dict[str, Any]:
@@ -693,6 +761,15 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "n_table_streams": len([s for s in streams if s.get("kind") != "video"]),
     }
 
+    # 相机路数对称性（用户确认的取舍 3，2026-09-20）：真实数据集存在
+    # "h5 内 timestamp/camera/ 6 路 vs camera/ 目录 9 路同名 txt"的不对称。
+    # 在设备清单阶段就如实标注，避免用户问"h5 与每个同名 txt 的对齐"时
+    # 误以为两侧一一对应。只标注、不补齐。
+    camera_coverage = _camera_coverage_note(streams)
+    if camera_coverage.get("note"):
+        unclassified_hint = ((unclassified_hint + " ") if unclassified_hint else "") \
+            + camera_coverage["note"]
+
     # 质检状态回写 meta：供 UI 数据集状态面板稳定展示（避免 UI 自行推算而与
     # 工具口径打架）。新增 key 不影响任何现有消费方；meta 每会话独立。
     # 见 docs/数据集状态面板设计.md 2.3 解法 A。
@@ -720,6 +797,7 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "user_confirmed_overrides": user_confirmed_overrides,
         "summary": summary,
         "unclassified_hint": unclassified_hint,
+        "camera_coverage": camera_coverage,
         "user_message": (
             f"已生成设备清单：{len(video_streams)} 路视频、{len(imus)} 个 IMU、"
             f"力通道 {'有' if force['present'] else '无'}、标定{'有' if has_calib else '无'}；"

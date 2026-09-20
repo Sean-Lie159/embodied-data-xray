@@ -119,6 +119,78 @@ def _stream_timing(path_spec: str) -> dict[str, Any] | None:
     return _timing_from_array(arr, unit)
 
 
+def _collect_camera_names(context: RunContext, container_file: str) -> dict[str, Any]:
+    """比对容器内相机时间戳路数与**目录侧同名 txt** 的路数（如实标注不对称）。
+
+    为什么需要（2026-09-20，用户确认的取舍 3）：真实数据集 ``2655849`` 存在
+    一路**不对称**——h5 内 ``timestamp/camera/`` 只有 6 路（hand_left/right_color、
+    head_color、head_depth、head_stereo_left/right），而 ``camera/`` 目录下有
+    **9 路**同名 txt（另有 head_back_fisheye、head_left_fisheye、
+    head_right_fisheye）。用户问"h5 时间戳与 camera/ 下每个同名 txt 的对齐"
+    时，若工具只报 h5 侧的 6 路，会让人误以为这 6 路就是全部相机；若反过来
+    按 9 路去找 h5 对应物，又会找不到 3 路。
+
+    本函数**只标注、不补齐**（不臆造 h5 里不存在的相机时间戳），把"哪些相机
+    只在一侧存在"如实列给用户，由用户判断是否属预期。
+
+    Args:
+        context: 运行时上下文（取 meta.streams）。
+        container_file: 当前对齐的容器文件绝对路径。
+
+    Returns:
+        dict，含 h5_cameras / dir_cameras / only_in_h5 / only_in_dir / note；
+        两侧任一为空或无不对称时 note 为 None。
+    """
+    h5_cams: set[str] = set()
+    dir_cams: set[str] = set()
+    for s in context.meta.get("streams", []):
+        path = str(s.get("path", ""))
+        file_part, _, sub = path.partition("::")
+        # 容器侧：本 h5 的 timestamp/camera/<name> 节点。
+        if (s.get("format") == "h5" and file_part == container_file
+                and "timestamp/camera/" in sub):
+            h5_cams.add(sub.rsplit("/", 1)[-1].lower())
+        # 目录侧：camera/<相机名>/ 下的同名 txt（即 txt 的父目录名）。
+        if s.get("format") in ("txt", "csv") and "camera" in Path(file_part).parts:
+            parts = Path(file_part).parts
+            try:
+                idx = [p.lower() for p in parts].index("camera")
+            except ValueError:
+                continue
+            if idx + 1 < len(parts) - 1:  # 还有更深一层 = 相机目录名
+                dir_cams.add(parts[idx + 1].lower())
+
+    only_h5 = sorted(h5_cams - dir_cams)
+    only_dir = sorted(dir_cams - h5_cams)
+    note: str | None = None
+    if h5_cams and dir_cams and (only_h5 or only_dir):
+        bits: list[str] = []
+        if only_dir:
+            bits.append(
+                f"仅 camera/ 目录有、h5 内无对应时间戳的相机（{len(only_dir)} 路）："
+                f"{only_dir}"
+            )
+        if only_h5:
+            bits.append(
+                f"仅 h5 内有时间戳、camera/ 目录无同名 txt 的相机（{len(only_h5)} 路）："
+                f"{only_h5}"
+            )
+        note = (
+            f"**相机路数不对称**：h5 内 timestamp/camera/ 有 {len(h5_cams)} 路，"
+            f"camera/ 目录下有 {len(dir_cams)} 路同名 txt，并非一一对应。"
+            + "；".join(bits)
+            + "。工具仅如实标注、不补齐缺失侧——这些相机能否跨侧对齐需按上表"
+            "实际情况判断。"
+        )
+    return {
+        "h5_cameras": sorted(h5_cams),
+        "dir_cameras": sorted(dir_cams),
+        "only_in_h5": only_h5,
+        "only_in_dir": only_dir,
+        "note": note,
+    }
+
+
 def align_container_streams_impl(
     context: RunContext,
     container: str | None = None,
@@ -277,6 +349,10 @@ def align_container_streams_impl(
             "time_column 参数指定传感器时间列复核后再下结论。"
         )
 
+    # 相机路数不对称标注（用户确认的取舍 3，2026-09-20）：如实列出"哪些相机
+    # 只在一侧存在"，不补齐缺失侧。真实案例 h5 6 路 vs 目录 9 路。
+    camera_note = _collect_camera_names(context, target_file)
+
     return {
         "success": True,
         "dataset": context.dataset_id,
@@ -290,6 +366,7 @@ def align_container_streams_impl(
         "warnings": warnings,
         "burst_streams": burst_subs,
         "clock_note": clock_note,
+        "camera_coverage": camera_note,
         "user_message": (
             f"容器 {Path(target_file).name}：{len(ok_rows)}/{len(subs)} 个子流"
             f"有可用时间戳；主时钟为 {master['sub']}（跨度 {master['span_s']}s，"
@@ -298,6 +375,7 @@ def align_container_streams_impl(
                + ("…" if len(warnings) > 3 else "") if warnings else " 各子流首尾对齐良好。")
             + (" （子流数超上限，已截断）" if truncated else "")
             + (f" {clock_note}" if clock_note else "")
+            + (f" {camera_note['note']}" if camera_note.get("note") else "")
         ),
     }
 
@@ -326,6 +404,8 @@ def align_container_streams(
     Returns:
         dict，含 container、master（主时钟子流）、streams（逐子流 采样率/
         跨度/样本数/缺口数/相对主时钟首尾偏移/截断标注）、warnings、
-        user_message。
+        camera_coverage（相机路数对称性：h5 内路数 vs camera/ 目录 txt 路数，
+        含 only_in_h5 / only_in_dir / note）、user_message。
+        **相机路数可能不对称**——本工具只如实标注存在哪侧，不补齐缺失侧。
     """
     return align_container_streams_impl(wrapper.context, container, max_streams)
