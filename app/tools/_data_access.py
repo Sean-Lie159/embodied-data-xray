@@ -327,7 +327,8 @@ def read_table_nrows(path: str, fmt: str) -> int | None:
 def expand_envelope(
     df: "pd.DataFrame",
     max_depth: int = 6,
-    max_cols: int = 64,
+    max_cols: int | None = 64,
+    focus: list[str] | None = None,
 ) -> tuple["pd.DataFrame", "str | None"]:
     """把信封型 DataFrame 的 object 列（dict/list）展开为扁平列（只读视图）。
 
@@ -335,24 +336,31 @@ def expand_envelope(
     - dict 递归展开为 ``data.orientation.x`` 等点分列名（键并集取自前 50 行样本）；
     - 数值 list 展开为 ``col.0..col.N``（N 为模态长度，上限 32；短行补 None）；
     - list_of_dict 按下标展开为 ``fingers.0.angles.4``（与嵌套发现的路径一致）；
-    - 达到 max_cols 即停止并在 note 标注"部分展开"；
+    - 达到 max_cols 即停止并在 note 标注"部分展开"；``max_cols=None`` 表示不限；
     - 返回**新 DataFrame**（原 object 列被展开列取代），不修改入参——主表
       ``context.df`` 语义不受影响。
 
     Args:
         df: 输入 DataFrame（含 object 信封列）。
         max_depth: 最大展开深度。
-        max_cols: 展开列数上限。
+        max_cols: 展开列数上限；None 表示不限制（用于结构已知的小文件，如
+            标定文件——其字段数天然有限，限死会丢掉关键的内/外参）。
+        focus: 可选，**优先展开**的顶层列名列表（各占均分配额）。
+            用于"只关心某几个字段"的场景——否则靠前的无关字段会独占 max_cols
+            配额，把目标字段挤掉（真实事故：标定文件的 sensors_list 展开 40+
+            列后，intrinsic/extrinsic 完全轮不到）。
 
     Returns:
         (展开后的 DataFrame, 展开说明 note)；无可展开列时返回 (原 df 副本, None)。
     """
     new_cols: dict[str, list] = {}
     expanded_origins: set[str] = set()
-    holder = {"truncated": False}
+    # None 表示不限：用一个大数占位（避免各处判空）。
+    limit_default = max_cols if max_cols is not None else 1_000_000
+    holder = {"truncated": False, "limit": limit_default}
 
     def _room() -> bool:
-        if len(new_cols) < max_cols:
+        if len(new_cols) < holder["limit"]:
             return True
         holder["truncated"] = True
         return False
@@ -427,7 +435,19 @@ def expand_envelope(
                 if f"{prefix}.{i}" not in new_cols:
                     new_cols[f"{prefix}.{i}"] = vals
 
-    for col in list(df.columns):
+    # 展开配额分配：**focus 指定的字段各占均配额**，其余共享剩余。
+    #
+    # 为什么需要（2026-09-18 真实事故）：展开受 max_cols 限制，先展开的字段会
+    # **独占**配额。标定文件 calibration.json 只有 3 列
+    # （sensors_list / intrinsic / extrinsic），sensors_list 一个就展开出 40+
+    # 列，把 intrinsic（内参）与 extrinsic（外参）完全挤掉——用户要核对
+    # FOV/内外参时工具"什么都读不出来"，而它其实有能力展开。
+    #
+    # 只改"排序"不够（实测：focus=[intrinsic, extrinsic] 时 intrinsic 仍独占
+    # 64 列配额，extrinsic 一个都没展开）。故按字段**分轮设置上限**：每轮给
+    # 一个字段分配配额，逐字段推进，保证每个 focus 字段都能拿到份额。
+
+    def _expand_one(col: Any) -> None:
         series = df[col]
         sample = None
         for v in series:
@@ -435,19 +455,44 @@ def expand_envelope(
                 sample = v
                 break
         if sample is None:
-            continue
+            return
         expanded_origins.add(col)
         if isinstance(sample, dict):
             _expand_dict(series, str(col), 1)
         else:
             _expand_list(series, str(col), 1)
 
+    wanted = [str(f) for f in (focus or []) if str(f) in [str(c) for c in df.columns]]
+    if wanted and max_cols is not None and max_cols > 0:
+        # 每个 focus 字段的配额：均分（至少留 4 列给后续字段，避免单个字段吃光）。
+        share = max(4, max_cols // (len(wanted) + 1))
+        covered: set[str] = set()
+        for name in wanted:
+            col = next(c for c in df.columns if str(c) == name)
+            holder["limit"] = min(max_cols, len(new_cols) + share)
+            _expand_one(col)
+            covered.add(name)
+        # 剩余配额留给其余字段。
+        holder["limit"] = max_cols
+        for col in df.columns:
+            if str(col) not in covered:
+                _expand_one(col)
+    else:
+        # 无 max_cols 限制（None）或未指定 focus：全部字段按序展开。
+        for col in df.columns:
+            _expand_one(col)
+
     keep = [c for c in df.columns if c not in expanded_origins]
-    out = df[keep].copy()
-    for name, vals in new_cols.items():
-        out[name] = vals
+    # **一次性拼接**而非逐列赋值：展开标定文件这类"字段数达数百"的对象时，
+    # `out[name] = vals` 逐列插入会触发 pandas 的
+    # "DataFrame is highly fragmented" 性能告警（实测 749 列），并让后续操作
+    # 变慢。pd.concat 一次性建表既消除告警，也更快。
+    parts = [df[keep].reset_index(drop=True)]
+    if new_cols:
+        parts.append(pd.DataFrame(new_cols).reset_index(drop=True))
+    out = pd.concat(parts, axis=1) if len(parts) > 1 else parts[0].copy()
     note = (
-        "部分展开：达到最大列数上限（max_cols={max_cols}），更深的嵌套字段未展开"
+        f"部分展开：达到最大列数上限（max_cols={max_cols}），更深的嵌套字段未展开"
         if holder["truncated"] else None
     )
     return out, note
@@ -501,8 +546,39 @@ def read_h5_node_field(path_spec: str, field: str) -> "pd.Series | None":
     return series
 
 
+def expand_with_focus(
+    df: "pd.DataFrame", focus_fields: list[str] | None
+) -> tuple["pd.DataFrame", "str | None"]:
+    """按 ``focus_fields`` 语义展开信封型列（统一入口，避免各处重复解析）。
+
+    语义（2026-09-20 新增）：
+    - ``None`` / 空列表：现有行为（按列序展开至 max_cols=64）；
+    - ``["*"]``：展开**全部**字段且**不限列数**——用于字段数有限的配置文件
+      （如标定文件），此时"读全"比"读一部分"更有价值；
+    - 具体字段名列表：为这些字段保留配额优先展开。
+
+    Args:
+        df: 含 object 信封列的 DataFrame。
+        focus_fields: 调用方给定的聚焦字段。
+
+    Returns:
+        (展开后的 DataFrame, note)。
+    """
+    if not focus_fields:
+        return expand_envelope(df)
+    if any(str(f).strip() == "*" for f in focus_fields):
+        return expand_envelope(df, max_cols=None)
+    names = [str(f) for f in focus_fields if str(f).strip() and str(f).strip() != "*"]
+    if not names:
+        return expand_envelope(df)
+    return expand_envelope(df, focus=names)
+
+
 def resolve_table_name(
-    context: RunContext, table: str | None, expand: bool = False
+    context: RunContext,
+    table: str | None,
+    expand: bool = False,
+    focus_fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """解析表名对应的 DataFrame 与来源，统一多表入口（惰性读取，不替换主表）。
 
@@ -541,7 +617,7 @@ def resolve_table_name(
         df = context.df
         note = None
         if expand and df is not None:
-            df, note = expand_envelope(df)
+            df, note = expand_with_focus(df, focus_fields)
         result = {
             "success": df is not None,
             "df": df,
@@ -574,7 +650,7 @@ def resolve_table_name(
                     df = read["df"]
                     note = None
                     if expand:
-                        df, note = expand_envelope(df)
+                        df, note = expand_with_focus(df, focus_fields)
                     result = {
                         "success": True,
                         "df": df,
@@ -630,7 +706,7 @@ def resolve_table_name(
             if df is not None:
                 note = None
                 if expand:
-                    df, note = expand_envelope(df)
+                    df, note = expand_with_focus(df, focus_fields)
                 result = {
                     "success": True,
                     "df": df,

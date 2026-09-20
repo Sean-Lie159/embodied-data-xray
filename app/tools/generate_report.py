@@ -39,6 +39,10 @@ def _build_dataset_overview(context: RunContext) -> str:
              f"**推测类型**: {context.meta.get('guessed_type', 'unknown')}"]
 
     # ---- 文件普查摘要（os 层面读大小，不进 df）----
+    #
+    # **单文件数据集回落**（2026-09-20）：单文件加载（如 calibration.json）不产生
+    # 流登记表，此前会显示"文件数 0 / 总大小 0.0 B"，看起来像报告出错。此时改用
+    # meta 里的 source / format / n_rows 描述该文件本身。
     n_files = 0
     total_bytes = 0
     fmt_dist: dict[str, int] = {}
@@ -53,6 +57,21 @@ def _build_dataset_overview(context: RunContext) -> str:
             total_bytes += Path(path).stat().st_size
         except OSError:
             pass
+    if n_files == 0:
+        # 单文件：用 meta 的 source 描述（存在则给出真实大小）。
+        src = context.meta.get("source")
+        if src:
+            n_files = 1
+            try:
+                total_bytes = Path(str(src)).stat().st_size
+            except OSError:
+                total_bytes = 0
+            fmt = context.meta.get("format", "?")
+            fmt_dist[fmt] = 1
+            n_rows, n_cols = context.meta.get("n_rows"), context.meta.get("n_cols")
+            lines.append(f"- **来源**: `{src}`")
+            if n_rows is not None:
+                lines.append(f"- **表规模**: {n_rows} 行 × {n_cols} 列")
     lines.append(f"- **文件数**: {n_files}")
     lines.append(f"- **总大小**: {_fmt_size(total_bytes)}")
     if fmt_dist:
@@ -75,7 +94,13 @@ def _build_dataset_overview(context: RunContext) -> str:
             src = s.get("path", "N/A")
             lines.append(f"| {name} | {role} | {fmt} | {rate_str} | `{src}` |")
     else:
-        lines.append("（无流登记表）")
+        # 单文件数据集没有流概念；说明清楚而非笼统的"无流登记表"。
+        if context.meta.get("source"):
+            lines.append(
+                "（单文件数据集，无多流结构；列清单见 `columns` 字段）"
+            )
+        else:
+            lines.append("（无流登记表）")
 
     # ---- 模态矩阵（能力标签有无对照表）----
     lines.append("")
@@ -291,13 +316,30 @@ def generate_report_impl(context: RunContext, title: str | None = None) -> dict[
     findings = context.findings
     dataset_id = context.dataset_id
 
-    # 空 findings：未做任何统计/质检/绘图。
-    if not findings:
+    # **无 findings 时仍可出报告**（2026-09-20 修复）。
+    #
+    # 此前直接返回 no_findings 错误，但报告的数据集概况与质检章节本就来自
+    # ``meta``（能力标签、流登记表、qc 明细），**不依赖 findings**——只要数据集
+    # 已加载就有内容可写。真实事故：用户做完 load_dataset + profile_data +
+    # inspect_streams + check_temporal_sync 后要求"生成 md 报告"，工具却回
+    # "当前会话尚无分析结果"（因为这几个工具都不写 findings），用户只能自己
+    # 手工整理文档。
+    #
+    # 现在只在**数据集也未加载**时才拒绝；否则照常出报告，缺失章节如实标注为空。
+    #
+    # 判据用 ``meta`` **内容**而非 ``dataset_id``：后者可能被手工置上（测试或
+    # 旧会话残留）而 meta 仍为空，此时报告其实无任何可写内容——只看 id 会
+    # 产出"全空报告"，比明确拒绝更糟。
+    has_dataset = bool(context.meta) or context.df is not None
+    if not findings and not has_dataset:
         return {
             "success": False,
-            "error": "no_findings",
-            "reason": "当前会话尚无分析结果",
-            "user_message": "当前会话尚无分析结果，请先执行分析（如 compute_stats / check_sensor_sanity / plot_chart 等）再生成报告。",
+            "error": "no_data_loaded",
+            "reason": "尚未加载数据集，也无分析结果",
+            "user_message": (
+                "当前会话既未加载数据集、也无分析结果，无法生成报告。"
+                "请先调用 load_dataset 加载数据。"
+            ),
             "dataset": dataset_id,
         }
 

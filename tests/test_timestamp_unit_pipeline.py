@@ -64,63 +64,62 @@ def test_mcap_ns_column_recognized_via_fingerprint() -> None:
     assert "内容指纹回退" in res["evidence"]
 
 
-def test_end_to_end_ns_duration_is_physical() -> None:
+def test_end_to_end_ns_duration_is_physical(tmp_path: Path) -> None:
     """端到端：登记表单位判为 unknown 时，经列名交叉校验得 ns，时长物理正确。
 
     修复前：单位 unknown → 按秒兜底 → duration_s≈5.28e10（字段名标秒，实为纳秒）。
     修复后：duration_ns≈5.28e10 纳秒（52.8 秒），采样率≈120 Hz。
+
+    用 ``tmp_path``（pytest 提供的**每测试独立目录**）而非固定的
+    ``tests/_tmp_mcap``：后者在多测试同时运行时会被争用（真实踩坑：全量
+    并行跑时该用例偶发 FileNotFoundError，单跑却始终通过）。
     """
-    root = Path(__file__).parent / "_tmp_mcap"
-    root.mkdir(exist_ok=True)
-    try:
-        paths: list[str] = []
-        for i in range(2):
-            p = root / f"glove_{i}.csv"
-            _mcap_frame().to_csv(p, index=False)
-            paths.append(str(p))
+    root = tmp_path / "mcap"
+    root.mkdir()
+    paths: list[str] = []
+    for i in range(2):
+        p = root / f"glove_{i}.csv"
+        _mcap_frame().to_csv(p, index=False)
+        paths.append(str(p))
 
-        meta = {
-            "capabilities": {},
-            # 显式把单位写成 unknown，模拟修复前流登记表的漏判。
-            "streams": [
-                {"path": paths[0], "format": "csv", "kind": "unknown",
-                 "timestamp_unit": "unknown"},
-                {"path": paths[1], "format": "csv", "kind": "unknown",
-                 "timestamp_unit": "unknown"},
-            ],
-        }
-        ctx = RunContext(dataset_id="wujiGlove_data", df=None, meta=meta)
-        result = check_temporal_sync_impl(ctx)
+    meta = {
+        "capabilities": {},
+        # 显式把单位写成 unknown，模拟修复前流登记表的漏判。
+        "streams": [
+            {"path": paths[0], "format": "csv", "kind": "unknown",
+             "timestamp_unit": "unknown"},
+            {"path": paths[1], "format": "csv", "kind": "unknown",
+             "timestamp_unit": "unknown"},
+        ],
+    }
+    ctx = RunContext(dataset_id="wujiGlove_data", df=None, meta=meta)
+    result = check_temporal_sync_impl(ctx)
 
-        assert result["success"] is True, result.get("user_message")
-        checks = result["measurements"]["stream_checks"]
-        assert len(checks) == 2
+    assert result["success"] is True, result.get("user_message")
+    checks = result["measurements"]["stream_checks"]
+    assert len(checks) == 2
 
-        for key, c in checks.items():
-            assert c["present"] is True
-            # 关键：单位经交叉校验修正为 ns，不再停留在 unknown。
-            assert c["timestamp_unit"] == "ns", (
-                f"{key} 单位应为 ns，实为 {c.get('timestamp_unit')}"
-            )
-            # 时长约 52.8 秒（纳秒口径），而非被误读为"528 亿秒"。
-            assert c["duration_ns"] is not None
-            duration_s = c["duration_ns"] / 1e9
-            assert 52.0 < duration_s < 53.5, f"时长应约 52.8s，实为 {duration_s}s"
-            # 采样率约 120 Hz。
-            assert c["actual_rate_hz"] is not None
-            assert 118.0 < c["actual_rate_hz"] < 122.0, (
-                f"采样率应约 120Hz，实为 {c['actual_rate_hz']}"
-            )
-            # 无缺口、无乱序、无重复。
-            assert c["gap_count"] == 0
-            assert c["disorder_count"] == 0
+    for key, c in checks.items():
+        assert c["present"] is True
+        # 关键：单位经交叉校验修正为 ns，不再停留在 unknown。
+        assert c["timestamp_unit"] == "ns", (
+            f"{key} 单位应为 ns，实为 {c.get('timestamp_unit')}"
+        )
+        # 时长约 52.8 秒（纳秒口径），而非被误读为"528 亿秒"。
+        assert c["duration_ns"] is not None
+        duration_s = c["duration_ns"] / 1e9
+        assert 52.0 < duration_s < 53.5, f"时长应约 52.8s，实为 {duration_s}s"
+        # 采样率约 120 Hz。
+        assert c["actual_rate_hz"] is not None
+        assert 118.0 < c["actual_rate_hz"] < 122.0, (
+            f"采样率应约 120Hz，实为 {c['actual_rate_hz']}"
+        )
+        # 无缺口、无乱序、无重复。
+        assert c["gap_count"] == 0
+        assert c["disorder_count"] == 0
 
-        # 单位全部可用 → 无 unit_warnings。
-        assert result["unit_warnings"] == []
-    finally:
-        for f in root.glob("*.csv"):
-            f.unlink()
-        root.rmdir()
+    # 单位全部可用 → 无 unit_warnings。
+    assert result["unit_warnings"] == []
 
 
 # --- 2. 单位未知时显式不可用，绝不按秒兜底 --------------------------------

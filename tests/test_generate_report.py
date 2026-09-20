@@ -29,10 +29,27 @@ def test_generate_report_is_registered() -> None:
 
 
 def test_empty_findings_returns_error(tmp_path: Path) -> None:
+    """**既无数据集也无 findings** → 拒绝生成（不能凭空造报告）。
+
+    注意（2026-09-20 行为变更）：此前只要 findings 为空就报 no_findings，
+    但报告的数据集概况/质检章节来自 meta、**不依赖 findings**——用户在
+    load_dataset + profile_data + check_temporal_sync 之后要报告却被拒。
+    现在只在"数据集也未加载"时才拒绝，错误码相应改为 no_data_loaded。
+    带数据集但无 findings 的场景见 test_nested_calibration.py。
+    """
     ctx = _ctx(output_dir=str(tmp_path))
     r = generate_report_impl(ctx)
     assert r["success"] is False
-    assert r["error"] == "no_findings"
+    assert r["error"] == "no_data_loaded"
+
+
+def test_no_findings_but_dataset_loaded_still_reports(tmp_path: Path) -> None:
+    """**行为变更回归**：有数据集、无 findings 时仍可出报告。"""
+    ctx = _ctx(output_dir=str(tmp_path),
+               meta={"source": "x.json", "n_rows": 3, "n_cols": 2})
+    r = generate_report_impl(ctx)
+    assert r["success"] is True, r.get("user_message")
+    assert Path(r["file_path"]).exists()
 
 
 def test_full_report_all_sections(tmp_path: Path) -> None:

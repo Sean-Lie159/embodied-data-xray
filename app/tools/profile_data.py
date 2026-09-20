@@ -18,7 +18,7 @@ from app.tools import _data_access
 
 def profile_data_impl(
     context: RunContext, max_unique: int = 20, table: str | None = None,
-    expand: bool = False,
+    expand: bool = False, focus_fields: list[str] | None = None,
 ) -> dict:
     """分析当前已加载的数据集并返回概况。
 
@@ -29,6 +29,10 @@ def profile_data_impl(
         context: 运行时上下文，需已通过 load_dataset 加载数据（context.df 非空）。
         max_unique: 每列最多展示的样例值数量，防止结果过大。
         table: 可选，目标表名（文件名，如 "accel.csv"）；缺省=主表。
+        expand: 是否展开信封型 object 列。
+        focus_fields: 可选，展开时优先/完整展开的顶层字段名；``["*"]`` 表示
+            展开全部且不限列数（2026-09-20：标定文件的内/外参会因列数上限
+            被靠前的 sensors_list 挤掉，须显式指定才能读到）。
 
     Returns:
         dict，包含 success、dataset（本次结果产自的数据集名）、table_name、
@@ -40,7 +44,8 @@ def profile_data_impl(
     Raises:
         不直接抛出异常；错误以结构化 dict 的 error 字段返回，便于 Agent 恢复。
     """
-    resolved = _data_access.resolve_table_name(context, table, expand=expand)
+    resolved = _data_access.resolve_table_name(
+        context, table, expand=expand, focus_fields=focus_fields)
     if not resolved["success"]:
         if resolved.get("error") == "table_not_found" or resolved.get("error") == "table_read_failed":
             return {
@@ -243,6 +248,7 @@ def profile_data(
     max_unique: int = 20,
     table: str | None = None,
     expand: bool = False,
+    focus_fields: list[str] | None = None,
 ) -> dict:
     """分析当前已加载数据集并返回概况。
 
@@ -250,13 +256,25 @@ def profile_data(
     唯一值与数值统计。缺省分析主表；指定 table（文件名）可分析目录内的其他表，
     该表按名惰性读取，不替换主表。
 
+    **嵌套结构（expand=True）**：信封型数据（dict/list 嵌套，如标定文件、
+    MCAP 导出）需展开后才能统计。展开有列数上限，靠前的字段可能独占配额——
+    要核对**特定字段**（如标定文件的内参 `intrinsic`、外参 `extrinsic`）时，
+    用 ``focus_fields`` 指定它们，工具会为其**保留配额**；若该文件字段数有限
+    且需要完整展开，可在 ``focus_fields`` 传 ``["*"]``（展开全部，不设上限）。
+
     Args:
         max_unique: 每列最多展示的样例值数量，防止结果过大。
         table: 可选，目标表名（如 "accel.csv"）；缺省=主表。
+        expand: 是否展开信封型 object 列（dict/list → 点分扁平列）。
+        focus_fields: 可选，优先/完整展开的顶层字段名列表。传 ``["*"]`` 表示
+            展开全部字段且不限制列数（适用于字段数有限的配置文件）；
+            传具体字段名（如 ``["intrinsic", "extrinsic"]``）时优先保证这些
+            字段展开。缺省 None = 现有行为（按列序展开至上限）。
 
     Returns:
         dict，包含 success、dataset、table_name、n_rows、n_cols 与 columns 列表；
         未加载数据时返回 success=False 并提示先调用 load_dataset；指定表不存在时
         返回 success=False 且 error="table_not_found"。
     """
-    return profile_data_impl(wrapper.context, max_unique, table)
+    return profile_data_impl(
+        wrapper.context, max_unique, table, expand, focus_fields)
