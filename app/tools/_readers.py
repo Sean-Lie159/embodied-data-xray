@@ -558,22 +558,41 @@ class _H5Reader:
         **轻量路径**（2026-09-18）：只读该字段在各帧的值，不构建整表——此前
         经 ``read_h5_node_field`` → ``read_hdf5_node`` 会把 14135 个帧组的全部
         字段读出来再取一列（实测单节点 4.2 秒、27 节点 113 秒）。
+
+        **不得回退到"整个数据集"**（2026-09-20 真实缺陷）：此前 ``column=None``
+        时硬找名为 ``timestamp`` 的字段，找不到就把**整个数据集扁平化**当时间戳
+        返回。真实案例：imu_data.h5 的 ``left/orientation`` 是 (7466,4) 的姿态
+        四元数，被扁平化成 29864 个值（7466×4）当作时间戳，首值 0.0——于是
+        check_temporal_sync 报出"29863 Hz、29862 个重复、7465 个乱序、漂移
+        -1000 ms/s"等一串** completamente 虚假的异常**，而真实数据是干净可用的。
+        现在改为：只在**明确的时间列/字段**上取值，取不到就返回 None（由调用方
+        如实标注"该流无时间戳列"，而不是拿姿态数据冒充时间）。
         """
         if not sub:
             return (None, None)
-        import pandas as pd
+        from app.tools.load_dataset import (
+            is_timestamp_like_field,
+            read_hdf5_nodes_metadata,
+            read_hdf5_node_field_fast,
+        )
 
-        from app.tools.load_dataset import read_hdf5_node_field_fast
+        # 候选字段：显式指定的 column 优先；否则只用**名字像时间戳**的列。
+        candidates: list[str] = []
+        if column:
+            candidates.append(column)
+        else:
+            meta = read_hdf5_nodes_metadata(path, [sub]).get(sub) or {}
+            candidates.extend(
+                c for c in meta.get("columns", []) if is_timestamp_like_field(str(c))
+            )
+        for field in candidates:
+            arr = read_hdf5_node_field_fast(path, sub, str(field))
+            if arr is not None and len(arr) > 0:
+                import pandas as pd
 
-        field = column or "timestamp"
-        arr = read_hdf5_node_field_fast(path, sub, field)
-        if arr is None and field != "timestamp":
-            field = "timestamp"
-            arr = read_hdf5_node_field_fast(path, sub, field)
-        if arr is None or len(arr) == 0:
-            return (None, None)
-        series = pd.Series(arr, name=field)
-        return (series, field)
+                series = pd.Series(arr, name=str(field))
+                return (series, str(field))
+        return (None, None)
 
 
 class _McapReader:

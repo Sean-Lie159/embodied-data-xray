@@ -581,14 +581,20 @@ def _list_hdf5_native_nodes(path: str) -> list[dict[str, Any]]:
                         ncols = int(node.shape[1])
                         fields = []
                     elif node.ndim == 1 and node.shape[0] > 1:
-                        # 1D 数值向量（如 joint position 的 (14,)）：帧布局下
-                        # 每帧一个观测向量，**必须保留**——此前被排除，导致
-                        # 真实数据集里 action/joint/position 这类流完全不可见
-                        # （2026-09-14 修复）。按"1 行 × N 列"理解，N 为向量维度；
-                        # 维度 1 的 1D 数组（单标量）仍排除，避免把逐帧标量当表。
-                        nrows = 1
-                        ncols = int(node.shape[0])
+                        # 1D 数值数组的语义**取决于布局**（2026-09-20 修正）：
+                        # - 帧布局（每帧一组）：(N,) 是"一帧一条 N 维向量观测"
+                        #   → 1 行 × N 列（如 joint position 的 (14,)）；
+                        # - 非帧布局（普通层级 h5）：(N,) 是"一列 N 行序列"
+                        #   → N 行 × 1 列（真实案例：imu_data.h5 的
+                        #   left/timestamps (7466,) 此前被报成"1 行 × 7466 列"，
+                        #   行列颠倒，agent 据此误判"IMU 时间戳流仅 1 行、异常"）。
                         fields = []
+                        if frame_layout:
+                            nrows = 1
+                            ncols = int(node.shape[0])
+                        else:
+                            nrows = int(node.shape[0])
+                            ncols = 1
                     else:
                         return
                     full = f"{prefix}/{name}" if prefix else name
@@ -718,7 +724,18 @@ def read_hdf5_node_field_fast(
                             flat = arr.reshape(-1)
                             if comp_index >= flat.size:
                                 return None
-                            num = np.asarray([flat[comp_index]], dtype=float)
+                            # **1D 的分量语义取决于布局**（2026-09-20）：
+                            # 帧布局下 (N,) 是"一帧一条 N 维向量"→ 取第 k 个分量
+                            # （单值）；非帧布局下 (N,) 是"一列 N 行序列"→
+                            # 按 <leaf>_<i> 命名时列数仅 1，故 k 只可能为 0，
+                            # 整体返回（不能只取 1 个值，否则行数塌成 1）。
+                            if frame_layout:
+                                num = np.asarray([flat[comp_index]], dtype=float)
+                            else:
+                                if arr.ndim == 1:
+                                    num = np.asarray(flat, dtype=float)
+                                else:
+                                    num = np.asarray([flat[comp_index]], dtype=float)
                         else:
                             if comp_index >= arr.shape[-1]:
                                 return None
@@ -731,6 +748,50 @@ def read_hdf5_node_field_fast(
             return np.asarray(values, dtype=float)
     except Exception:  # noqa: BLE001
         return None
+
+
+def is_timestamp_like_field(name: str) -> bool:
+    """判断 h5 节点的**列/字段名**是否像时间戳（用于挑时间轴，不猜语义）。
+
+    为什么需要（2026-09-20 真实缺陷）：`_H5Reader.timestamp()` 此前在没找到名为
+    ``timestamp`` 的字段时，会**回退把整个数据集扁平化**当时间戳——于是
+    ``left/orientation``（姿态四元数）被当成 29864 个时间戳，产出一串虚假异常。
+
+    判据（确定性，只看命名不看数值）：
+    - 命中时间戳词表（``_sniffing._TIMESTAMP_COLS``，全项目唯一来源）；
+    - 或名字含时间词根（timestamp / stamp / time / clock）；
+    - 或形如 ``<前缀>_ns``/``_us``/``_ms``/``_s`` 且前缀含 ``ts``；
+    - **排除"时间差/间隔/时长"类**：它们也是时间量，但**不是时刻**，拿它们当
+      时间轴会立刻判出荒谬的采样率（真实案例：``time_diff`` 是 -0.5 的常量差值，
+      若被当时间戳会算出 0 Hz 或负间隔）。排除词：diff/delta/interval/duration/
+      offset/latency/frame_diff。
+
+    Args:
+        name: 列名或字段名。
+
+    Returns:
+        True 表示可作为时间轴候选。
+    """
+    from app.tools._sniffing import _TIMESTAMP_COLS
+
+    low = str(name).lower().strip()
+    if not low:
+        return False
+    # 先排除"时间差"类（含 time 词根但语义是差值，绝非时刻）。
+    if any(k in low for k in ("diff", "delta", "interval", "duration",
+                              "offset", "latency", "elapsed", "gap")):
+        return False
+    if low in _TIMESTAMP_COLS:
+        return True
+    # 词表是"精确名"集合，故再放宽到"包含"（如 mcap_log_time_ns、
+    # exposure_start_utc_ns 这类带前后缀的列名）。
+    for token in ("timestamp", "time_stamp", "stamp", "time", "clock"):
+        if token in low:
+            return True
+    # 纯单位后缀形态（如 t_ns / ts_us）。
+    if low.endswith(("_ns", "_us", "_ms", "_s")):
+        return any(k in low for k in ("ts", "t_"))
+    return False
 
 
 def read_hdf5_nodes_metadata(
@@ -793,18 +854,29 @@ def read_hdf5_nodes_metadata(
                 elif leaf.ndim == 2:
                     cols = [f"{field_name}_{i}" for i in range(shape[1])]
                 elif leaf.ndim == 1 and shape[0] > 1:
-                    # 1D 向量：与读取口径一致（1 行 × N 列）。
-                    cols = [f"{field_name}_{i}" for i in range(shape[0])]
+                    # 1D 数组的语义**取决于布局**（2026-09-20 真实缺陷）：
+                    # - 帧布局下，(N,) 是"一帧一条 N 维向量观测" → 1 行 × N 列；
+                    # - 非帧布局（普通层级 h5）下，(N,) 是**一列 N 行的时间序列**
+                    #   （真实案例：imu_data.h5 的 left/timestamps 是 (7466,)
+                    #   的一维时间戳数组，此前被报成"1 行 × 7466 列"，行列颠倒，
+                    #   使 agent 误判"IMU 时间戳流仅 1 行、数据异常")。
+                    if frame_layout:
+                        cols = [f"{field_name}_{i}" for i in range(shape[0])]
+                    else:
+                        cols = [field_name]
                 else:
                     cols = [field_name]
-                rows = shape[0] if len(shape) >= 1 else 0
-                if frame_layout and n_frames:
-                    # 帧布局：总行数 = **单帧行数** × 帧数。
-                    # 1D (N,) 是"一帧一条向量观测" → 单帧 1 行；
-                    # 2D (R,C) 每帧贡献 R 行（如 orientation 的 (2,4) 是双手
-                    # 两条观测）。列数取末维（C）。
-                    per_frame_rows = rows if len(shape) == 2 else 1
-                    rows = per_frame_rows * n_frames
+
+                if not frame_layout:
+                    # 普通层级：行数即首维；1D 时列数为 1。
+                    rows = shape[0] if len(shape) >= 1 else 0
+                elif leaf.ndim == 2:
+                    # 帧布局 2D (R,C)：每帧贡献 R 行（如 orientation 的 (2,4)
+                    # 是双手两条观测），列数取末维 C。
+                    rows = shape[0] * n_frames
+                else:
+                    # 帧布局 1D (N,)：一帧一条向量观测 → 每帧 1 行。
+                    rows = n_frames
                 out[node] = {"columns": cols, "shape": (rows, len(cols))}
     except Exception:  # noqa: BLE001
         return {}
@@ -2054,10 +2126,32 @@ def load_dataset_impl(context: RunContext, path: str, fmt: str | None = None) ->
         if ext == ".csv":
             df = _load_csv(path)
         elif ext == ".json":
-            df = pd.read_json(path, encoding=_detect_encoding(source.read_bytes()))
+            # **优先统一 reader，失败再回退 pd.read_json**（2026-09-20）。
+            #
+            # 为什么不只用统一 reader：它识别顶层 dict 的行列表键
+            # （``data``/``frames``）——UMI 主表
+            # 20260729...json 是 {name, total, ..., data:[1096 行]}，
+            # 顶层标量键与 data 长度不一致，``pd.read_json`` 会抛
+            # "All arrays must be of the same length"，此时必须靠统一 reader。
+            #
+            # 为什么不只用 pd.read_json：部分 JSON 的行列表键是任意名
+            # （如 ``{"a": [...], "b": [...]}``、``{"sensors_list": [...]}``），
+            # 不在白名单内，统一 reader 返回 None，此时只能靠 pd.read_json。
+            # 两者互补，故"先统一、后回退"——保证与目录/按名读取口径一致，
+            # 同时不丢原有能力（此前直接换用统一 reader 导致几个测试回归）。
+            df = _data_access.read_stream_full(path, "json")
+            if df is None:
+                df = pd.read_json(
+                    path, encoding=_detect_encoding(source.read_bytes()))
         elif ext == ".jsonl":
             # JSONL：lines=True（每行一个对象）。与 .json 严格区分，不得混用。
-            df = pd.read_json(path, lines=True, encoding=_detect_encoding(source.read_bytes()))
+            # 同样"先统一、后回退"（JSONL 顶层结构差异小，回退主要覆盖
+            # 空文件等边界）。
+            df = _data_access.read_stream_full(path, "jsonl")
+            if df is None:
+                df = pd.read_json(
+                    path, lines=True,
+                    encoding=_detect_encoding(source.read_bytes()))
         elif ext == ".parquet":
             df = pd.read_parquet(path)
         elif ext == ".h5":

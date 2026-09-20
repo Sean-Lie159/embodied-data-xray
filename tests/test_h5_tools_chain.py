@@ -58,9 +58,15 @@ def h5_ds(tmp_path: Path) -> Path:
 
 
 def test_sync_runs_on_h5_node_streams(h5_ds: Path) -> None:
-    """默认调用即对齐 h5 节点流（timestamp 字段，ms 单位正确归一）。
+    """默认调用即对齐 h5 节点流（时间列 ms 单位正确归一）。
 
     此前：not_applicable（0 可对齐流）——sync 不认识 h5 节点流。
+
+    **行为变更（2026-09-20）**：可对齐流增加——``meta/index_map`` 节点的
+    ``main_timestamp`` 现被正确识别（此前词表只认精确名 ``timestamp``，把它
+    漏判为"无时间戳"，见 test_inspect_rates_on_h5_nodes_correct_unit）。
+    故不再断言"所有流的时间列都叫 timestamp"，改为断言时间列**存在、单位正确、
+    且不是差分量**。
     """
     ctx = RunContext(output_dir=str(h5_ds.parent))
     assert load_dataset_impl(ctx, str(h5_ds))["success"] is True
@@ -71,8 +77,10 @@ def test_sync_runs_on_h5_node_streams(h5_ds: Path) -> None:
     present = [v for v in checks.values() if isinstance(v, dict) and v.get("present")]
     assert len(present) >= 2
     for chk in present:
-        assert chk["timestamp_column"] == "timestamp"
+        assert chk["timestamp_column"], f"时间列名为空：{chk}"
         assert chk["timestamp_unit"] == "ms"
+        # 时间轴必须是"时刻"列（不得是 time_diff 这类差分量）。
+        assert "diff" not in str(chk["timestamp_column"])
     # action（300 行 @100Hz）：periodic；相机（90 行 @30Hz）：行数 <100 判 static
     # （min_samples 守卫，正确行为）。
     by_rate = {round(c["actual_rate_hz"]): c for c in present}
@@ -82,8 +90,15 @@ def test_sync_runs_on_h5_node_streams(h5_ds: Path) -> None:
 def test_inspect_rates_on_h5_nodes_correct_unit(h5_ds: Path) -> None:
     """inspect 采样率：ms epoch 判 ms（不再 s/0.1Hz 失真）。
 
-    无 timestamp 字段的节点（如 meta/index_map，字段为 main_timestamp 等）
-    如实报"无时间戳字段"——不硬凑。
+    **行为变更（2026-09-20）**：``meta/index_map`` 节点的字段是
+    ``main_timestamp`` / ``aligned_timestamp``——**它们就是时间戳**（值形如
+    ``T0_MS + n×33.33``，ms epoch）。此前测试断言该节点"应报无时间戳字段"，
+    那是因为词表只认精确名 ``timestamp``、把 ``main_timestamp`` 漏判了。
+    现判据放宽到"名字含时间词根"，该节点被正确识别——这是**修复而非回归**，
+    故断言同步更新为"应报出 ~30Hz"。
+
+    同时守护新增的排除规则：``time_diff``（时间差，值为 -0.5 常量）**不得**
+    被当作时间轴（真实风险：拿差值当时刻会算出 0 Hz 或负间隔）。
     """
     ctx = RunContext(output_dir=str(h5_ds.parent))
     assert load_dataset_impl(ctx, str(h5_ds))["success"] is True
@@ -91,15 +106,31 @@ def test_inspect_rates_on_h5_nodes_correct_unit(h5_ds: Path) -> None:
     for st in ins["table_streams"]:
         mr = st["sample_rate"]
         node = st["source"].partition("::")[2]
-        if "index_map" in node:
-            # index_map 节点字段为 main_timestamp 等（无 timestamp）→ 如实报。
-            assert mr.get("present") is False
-            assert "时间戳字段" in mr.get("reason", "")
-        else:
-            assert mr.get("present") is True
-            assert mr["timestamp_unit"] == "ms"
-            expected = 100 if "action" in node else 30
-            assert expected * 0.9 <= mr["sample_rate_hz"] <= expected * 1.1
+        assert mr.get("present") is True, f"{node} 未读出采样率：{mr}"
+        assert mr["timestamp_unit"] == "ms"
+        expected = 100 if "action" in node else 30
+        assert expected * 0.9 <= mr["sample_rate_hz"] <= expected * 1.1, (
+            f"{node} 采样率 {mr['sample_rate_hz']} 偏离预期 {expected}Hz"
+        )
+        # 时间轴必须是"时刻"列，不能是 time_diff 这类差分量。
+        col = str(mr.get("timestamp_column") or "")
+        assert "diff" not in col, f"{node} 把差分量 {col!r} 当成时间轴"
+
+
+def test_timestamp_field_candidates_exclude_diff_kinds() -> None:
+    """**判据单测**：时间戳候选需含时刻语义，排除差/间隔/时长类。"""
+    from app.tools.load_dataset import is_timestamp_like_field
+
+    # 应识别为时间轴候选。
+    for yes in ("timestamp", "main_timestamp", "aligned_timestamp",
+                "mcap_log_time_ns", "exposure_start_utc_ns", "t_ns", "ts_us",
+                "clock"):
+        assert is_timestamp_like_field(yes) is True, yes
+    # 不得当作时间轴：差分量与无关列。
+    for no in ("time_diff", "delta_time", "interval_ms", "duration_ns",
+               "offset_us", "latency_ms", "aligned_index", "value",
+               "orientation_0", "position", "elapsed_s"):
+        assert is_timestamp_like_field(no) is False, no
 
 
 def test_infer_unit_ms_epoch(h5_ds: Path) -> None:
