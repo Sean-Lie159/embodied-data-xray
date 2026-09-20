@@ -508,11 +508,133 @@ def _merge_frame_layout(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _is_numeric_dtype(dtype: Any) -> bool:
+    """判断 h5 叶子的 dtype 是否为"可表格化的数值"（**准入的唯一 dtype 闸门**）。
+
+    为什么需要（2026-09-20 真实缺陷修复）：此前 `_visit` 按**维数**枚举接纳形态
+    （compound / 2D / 1D 多元素），把 0 维标量与单元素数组一律丢弃——于是真实
+    数据集 aligned_joints.h5 每帧的 ``main_timestamp``（``shape=()`` uint64）
+    与 ``timestamp/camera/*``（``shape=(1,)`` uint64）**从未进入流登记表**，
+    下游 `inspect_streams` / `align_container_streams` 因此对 27 条已登记流
+    如实报"无时间戳"，agent 只能回答"h5 里没有时间戳"——而时间戳就在那里。
+
+    改为按 dtype 判定后，接纳规则不再与维数耦合，但必须**同时收紧 dtype**：
+    否则 ``state/end/errmsg``（``dtype=object``、``shape=(1,)`` 的字符串字段）
+    会被一并纳入，把错误消息当数值流登记（新噪声）。
+
+    Args:
+        dtype: h5py 叶子的 dtype。
+
+    Returns:
+        True 表示数值型（含整型/浮点/布尔）；object / str / bytes 等返回 False。
+    """
+    import numpy as _np
+
+    try:
+        if dtype is None:
+            return False
+        names = getattr(dtype, "names", None)
+        if names:
+            # compound（结构化）dtype 的 kind 是 "V"（void），**不是**数值——
+            # 若在此一律拒绝，会把项目既有的 compound 节点（动作流等）全部丢掉
+            # （实测踩坑：本函数初版即把 27 条流里的全部 compound 误杀）。
+            # compound 的正确判据是"**至少有一个**数值字段"（真实形态如
+            # ``[("value","<f4"),("timestamp","<f8")]``；纯字符串字段的
+            # compound 仍应拒绝）。
+            return any(
+                _is_numeric_dtype(dtype.fields[n][0]) for n in names
+            )
+        if dtype == object or dtype.kind in ("O", "U", "S", "V"):
+            return False
+        return bool(
+            _np.issubdtype(dtype, _np.number) or _np.issubdtype(dtype, _np.bool_)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _classify_h5_leaf(
+    shape: tuple[int, ...], dtype: Any, frame_layout: bool
+) -> dict[str, Any] | None:
+    """判定一个 h5 叶子能否作为"表"，并给出 (rows, cols, fields)。
+
+    **这是 h5 节点接纳的唯一判据**（2026-09-20 重构）：此前 `_visit` 内联按
+    维数枚举，``read_hdf5_nodes_metadata`` 又各写一套列名/行数推导，两处口径
+    必须手工保持同步——这次漏掉"0 维标量 / 单元素数组"正是因为**两处都漏**，
+    且谁也没有错到显眼。收敛为一处后，新增形态只需改本函数。
+
+    接纳形态与行列语义（``shape`` 为**单帧内**的形状）：
+
+    ====================  ==================  ==========================
+    形态                 非帧布局            帧布局（每帧一组）
+    ====================  ==================  ==========================
+    compound             rows=shape[0]       rows=shape[0]（每帧多行）
+                         cols=len(names)     cols=len(names)
+    2D 数值              rows=shape[0]       rows=shape[0]（如 (2,4) 双手机）
+                         cols=shape[1]       cols=shape[1]
+    1D 多元素 (N>1)      rows=shape[0]       rows=1
+                         cols=1              cols=shape[0]
+    1D 单元素 (N==1)     rows=1, cols=1      rows=1, cols=1
+    0 维标量             rows=1, cols=1      rows=1, cols=1
+    ====================  ==================  ==========================
+
+    标量/单元素按"**每帧 1 行 × 1 列**"理解，而非 0 行或 1 行 N 列表头：
+    ``main_timestamp`` 的语义是"每帧一个时刻观测"，与 ``action/joint/position``
+    （每帧 1 行 × 14 列）同级，只是宽度为 1。这样 `_merge_frame_layout` 的
+    "行数 × 帧数"折叠规则与 `_read_frame_layout_node` 的按帧拼接都能直接复用，
+    无需为标量开特例。
+
+    Args:
+        shape: 叶子的 shape（已转为 tuple[int, ...]）。
+        dtype: 叶子的 dtype。
+        frame_layout: 是否为"每帧一组"布局（影响 1D 的行列语义）。
+
+    Returns:
+        {"rows", "cols", "fields"}；不接纳（非数值 / 空维度）返回 None。
+    """
+    # dtype 闸门：非数值一律不接纳（排除字符串/object/嵌套）。
+    if not _is_numeric_dtype(dtype):
+        return None
+
+    names = getattr(dtype, "names", None)
+    if names:
+        # compound：字段名即列名；每帧含 shape[0] 行。
+        if len(shape) < 1:
+            return None
+        return {"rows": int(shape[0]), "cols": len(names), "fields": list(names)}
+
+    ndim = len(shape)
+    if ndim == 0:
+        # 0 维标量（如 main_timestamp）：每帧一个观测。
+        return {"rows": 1, "cols": 1, "fields": []}
+    if ndim == 1:
+        n = int(shape[0])
+        if n == 0:
+            return None  # 空数组不构成表
+        if n == 1:
+            # 单元素数组（如 timestamp/camera/* 的 (1,)）：每帧一个标量观测。
+            return {"rows": 1, "cols": 1, "fields": []}
+        # 多元素 1D：语义取决于布局（见函数 docstring）。
+        if frame_layout:
+            return {"rows": 1, "cols": n, "fields": []}
+        return {"rows": n, "cols": 1, "fields": []}
+    if ndim == 2:
+        return {"rows": int(shape[0]), "cols": int(shape[1]), "fields": []}
+    # 3 维及以上：不对应二维表，不接纳（如标定矩阵/点云张量）。
+    return None
+
+
 def _list_hdf5_native_nodes(path: str) -> list[dict[str, Any]]:
     """列出 h5py 原生层级文件的全部候选数据节点（供流登记）。
 
-    候选与 _load_hdf5_native 同口径：compound dtype（字段名即列名）或
-    2D 数值数组；object 标量与 1D 标量数组不算表。
+    候选判据收敛在 :func:`_classify_h5_leaf`（唯一准入点）：compound、
+    2D 数值、1D 多元素、**1D 单元素**、**0 维数值标量**；非数值 dtype
+    （object/字符串）与 3 维以上一律不接纳。
+
+    历史上这里按维数枚举 `if compound / elif ndim==2 / elif ndim==1 and
+    shape[0]>1 / else 丢弃`，导致 0 维标量与单元素数组被静默丢弃——真实后果是
+    aligned_joints.h5 每帧的 ``main_timestamp`` 与 6 路 ``timestamp/camera/*``
+    从未进入流登记表，agent 据此回答"h5 里没有时间戳"。
 
     **"每帧一组"布局会被合并**（见 :func:`_merge_frame_layout`）：真实数据集
     aligned_joints.h5 的 14135 帧 × 6 字段会被登记为 6 条流而非 84,810 条——
@@ -553,41 +675,18 @@ def _list_hdf5_native_nodes(path: str) -> list[dict[str, Any]]:
                 def _visit(name: str, node: Any) -> None:
                     if not isinstance(node, h5py.Dataset):
                         return
-                    dtype = node.dtype
-                    if dtype == object and node.shape == (1,):
-                        return
-                    if dtype.names:
-                        ncols = len(dtype.names)
-                        nrows = int(node.shape[0])
-                        fields = list(dtype.names)
-                    elif node.ndim == 2:
-                        # 2D 数值：行×列（如 orientation 的 (2,4)）。
-                        nrows = int(node.shape[0])
-                        ncols = int(node.shape[1])
-                        fields = []
-                    elif node.ndim == 1 and node.shape[0] > 1:
-                        # 1D 数值数组的语义**取决于布局**（2026-09-20 修正）：
-                        # - 帧布局（每帧一组）：(N,) 是"一帧一条 N 维向量观测"
-                        #   → 1 行 × N 列（如 joint position 的 (14,)）；
-                        # - 非帧布局（普通层级 h5）：(N,) 是"一列 N 行序列"
-                        #   → N 行 × 1 列（真实案例：imu_data.h5 的
-                        #   left/timestamps (7466,) 此前被报成"1 行 × 7466 列"，
-                        #   行列颠倒，agent 据此误判"IMU 时间戳流仅 1 行、异常"）。
-                        fields = []
-                        if frame_layout:
-                            nrows = 1
-                            ncols = int(node.shape[0])
-                        else:
-                            nrows = int(node.shape[0])
-                            ncols = 1
-                    else:
+                    # 形状/dtype 判定收敛到唯一入口（新增形态只改 _classify_h5_leaf）。
+                    shape = tuple(int(x) for x in node.shape)
+                    info = _classify_h5_leaf(shape, node.dtype, frame_layout)
+                    if info is None:
                         return
                     full = f"{prefix}/{name}" if prefix else name
                     out.append({
                         "node": full,
-                        "rows": nrows,
-                        "cols": ncols,
-                        "fields": fields,
+                        "rows": info["rows"],
+                        "cols": info["cols"],
+                        "fields": info["fields"],
+                        "ndim": len(shape),
                     })
                 root_node.visititems(_visit)
 
@@ -608,7 +707,7 @@ def _classify_h5_node(fields: list[str], node_path: str) -> tuple[str, str]:
     """按节点字段特征判定 kind 与语义标签（确定性，不硬猜语义之外的）。
 
     Args:
-        fields: compound 字段名清单（2D 数值节点为空）。
+        fields: compound 字段名清单（2D/1D/标量数值节点为空）。
         node_path: 节点路径（如 action/left_eef/feedback/motor_command）。
 
     Returns:
@@ -620,6 +719,20 @@ def _classify_h5_node(fields: list[str], node_path: str) -> tuple[str, str]:
         return "actions", "动作/指令流"
     if any(f in ("timestamp", "file_path", "frame_index") for f in fl) and "camera" in path_l:
         return "frame_index", "相机帧索引"
+    # 时间戳流（2026-09-20 新增）：帧内标量时间戳节点的 fields 为空，
+    # 只能靠路径判定。真实形态：
+    #   - ``main_timestamp``（帧内 0 维标量，主时钟）
+    #   - ``timestamp/camera/<name>``（帧内 (1,) 标量，各相机采集时刻）
+    # 若不识别，这 7 条流会全部落到 unknown → 触发 UI 的"未分类"提示，
+    # 用户看到一堆"未知（无法分类）"反而更困惑。
+    # **必须是"时刻"语义**：排除 time_diff/delta 这类差分量（_is_timestamp_like_field
+    # 词表已含 diff/delta 排除规则，此处复用同一判据，避免两套口径）。
+    leaf_name = node_path.rsplit("/", 1)[-1]
+    if "action" not in path_l and "state" not in path_l and "calibration" not in path_l:
+        if is_timestamp_like_field(leaf_name) or is_timestamp_like_field(node_path):
+            if "camera" in path_l:
+                return "timestamp_index", "相机采集时刻（逐帧时间戳）"
+            return "timestamp_index", "主时钟时间戳（逐帧）"
     if any("orientation" in f or "accel" in f for f in fl) or "imu" in path_l:
         return "imu", "IMU 传感器"
     if "pose" in path_l or any("quat" in f for f in fl):
@@ -776,6 +889,18 @@ def is_timestamp_like_field(name: str) -> bool:
     # 纯单位后缀形态（如 t_ns / ts_us）。
     if low.endswith(("_ns", "_us", "_ms", "_s")):
         return any(k in low for k in ("ts", "t_"))
+    # 路径上下文形态（2026-09-20 新增）：h5 的帧内时间戳节点命名可能**不含
+    # 任何时间词根**——真实形态 ``timestamp/camera/<相机名>``，叶子名是
+    # ``head_color`` / ``hand_left_color`` / ``head_stereo_right`` 这类纯相机名。
+    # 但**父级路径**里的 ``timestamp`` 已明确宣告其语义，故按路径判定。
+    # 约束：父级须含时间词根，且叶子名不得含动作/状态语义（防误伤
+    # ``state/*``、``action/*`` 下的同名叶子）。
+    if "/" in low:
+        parent = low.rsplit("/", 1)[0]
+        if any(t in parent for t in ("timestamp", "time_stamp", "stamp", "clock")):
+            if not any(k in low for k in ("action", "state", "command", "errmsg",
+                                          "errcode", "effort", "velocity")):
+                return True
     return False
 
 
@@ -834,11 +959,18 @@ def read_hdf5_nodes_metadata(
                 shape = tuple(int(x) for x in leaf.shape)
                 field_name = node.rsplit("/", 1)[-1]
                 dtype = leaf.dtype
+                # 行列语义与 _list_hdf5_native_nodes **同源**（唯一判据
+                # _classify_h5_leaf），避免两处口径各写一套导致漏改
+                # （2026-09-20：漏掉 0 维标量与单元素数组正是两处都漏）。
+                info = _classify_h5_leaf(shape, dtype, bool(frame_layout))
+                if info is None:
+                    continue
+                ndim = len(shape)
                 if dtype.names:
                     cols = [str(n) for n in dtype.names]
-                elif leaf.ndim == 2:
+                elif ndim == 2:
                     cols = [f"{field_name}_{i}" for i in range(shape[1])]
-                elif leaf.ndim == 1 and shape[0] > 1:
+                elif ndim == 1 and shape[0] > 1:
                     # 1D 数组的语义**取决于布局**（2026-09-20 真实缺陷）：
                     # - 帧布局下，(N,) 是"一帧一条 N 维向量观测" → 1 行 × N 列；
                     # - 非帧布局（普通层级 h5）下，(N,) 是**一列 N 行的时间序列**
@@ -850,18 +982,16 @@ def read_hdf5_nodes_metadata(
                     else:
                         cols = [field_name]
                 else:
+                    # 0 维标量与 1D 单元素（如 main_timestamp / timestamp/camera/*）：
+                    # 单列，列名即字段名（不追加 _0——只有一列且语义就是该字段名，
+                    # 追加后缀会让 is_timestamp_like_field("main_timestamp") 失效）。
                     cols = [field_name]
 
+                # 行数：帧布局下"每帧贡献 info['rows'] 行"。
                 if not frame_layout:
-                    # 普通层级：行数即首维；1D 时列数为 1。
-                    rows = shape[0] if len(shape) >= 1 else 0
-                elif leaf.ndim == 2:
-                    # 帧布局 2D (R,C)：每帧贡献 R 行（如 orientation 的 (2,4)
-                    # 是双手两条观测），列数取末维 C。
-                    rows = shape[0] * n_frames
+                    rows = int(info["rows"])
                 else:
-                    # 帧布局 1D (N,)：一帧一条向量观测 → 每帧 1 行。
-                    rows = n_frames
+                    rows = int(info["rows"]) * int(n_frames or 0)
                 out[node] = {"columns": cols, "shape": (rows, len(cols))}
     except Exception:  # noqa: BLE001
         return {}
@@ -917,22 +1047,43 @@ def _read_frame_layout_node(f: Any, node: str) -> pd.DataFrame | None:
         if leaf is None or not isinstance(leaf, h5py.Dataset):
             continue
         data = leaf[()]
-        # 1D 数值数组是**一帧一条向量观测**（如 joint position (14,)），
-        # 应理解为「1 行 × N 列」。直接 pd.DataFrame(data) 会得到 N 行 1 列
-        # （把向量当成了时间序列），使每帧贡献 N 行、行数与语义都不对。
-        if getattr(data, "ndim", 0) == 1 and getattr(data, "shape", (0,))[0] > 1:
-            data = np.asarray(data).reshape(1, -1)
-        frame_df = _dataset_to_frame(data)
+        # 每帧数据一律规范为「行 × 列」二维形态（每帧一条观测 → 1 行）：
+        #
+        # - 1D 多元素 (N,)（如 joint position (14,)）：是**一帧一条 N 维向量观测**，
+        #   应理解为「1 行 × N 列」。直接 pd.DataFrame(data) 会得到 N 行 1 列
+        #   （把向量当成了时间序列），使每帧贡献 N 行、行数与语义都不对。
+        # - 1D 单元素 (1,)（如 timestamp/camera/head_color）：reshape(1, 1)。
+        #   **此前被漏掉**（判据是 shape[0] > 1）→ 该流即便登记也无法读出，
+        #   真实后果是 h5 相机时间戳与主时间戳对流皆空。
+        # - 0 维标量（如 main_timestamp，leaf[()] 返回 numpy 标量）：
+        #   pd.DataFrame(scalar) 会抛 ValueError，必须显式 reshape(1, 1)。
+        #   此前该形态连登记都进不去，本分支是为配套 _classify_h5_leaf 新增。
+        arr = np.asarray(data)
+        if arr.ndim == 0:
+            arr = arr.reshape(1, 1)
+        elif arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        frame_df = _dataset_to_frame(arr)
         if frame_df is None:
             continue
         # 列名语义化：裸 ndarray 转 DataFrame 后列名是 0/1/2… 序号，
         # 对用户与模型毫无意义。用"字段名_序号"命名（如 position 的 (14,)
         # → position_0…position_13），既保留原始字段语义又标明维度。
+        #
+        # **单列节点例外**（2026-09-20）：0 维标量与 1D 单元素（如
+        # main_timestamp / timestamp/camera/head_color）只有一列，追加 ``_0``
+        # 反而破坏列名的**时间戳语义**—— ``is_timestamp_like_field("head_color_0")``
+        # 为 False、而 ``is_timestamp_like_field("head_color")`` 的调用方
+        # （_H5Reader.timestamp 按列名挑时间轴）会因此挑不到列。故单列时
+        # 直接用字段名本身。
         field_name = node.rsplit("/", 1)[-1]
         if all(isinstance(c, (int, np.integer)) for c in frame_df.columns):
-            frame_df.columns = [
-                f"{field_name}_{i}" for i in range(frame_df.shape[1])
-            ]
+            if frame_df.shape[1] == 1:
+                frame_df.columns = [field_name]
+            else:
+                frame_df.columns = [
+                    f"{field_name}_{i}" for i in range(frame_df.shape[1])
+                ]
         frame_df.insert(0, "frame_index", int(fid))
         frames.append(frame_df)
     if not frames:

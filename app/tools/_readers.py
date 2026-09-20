@@ -577,14 +577,21 @@ class _H5Reader:
         )
 
         # 候选字段：显式指定的 column 优先；否则只用**名字像时间戳**的列。
+        #
+        # 判据须带上**节点路径**（2026-09-20）：帧内相机时间戳节点的列名是
+        # ``head_color`` / ``hand_left_color`` 这类纯相机名，不含任何时间词根，
+        # 但路径 ``timestamp/camera/<名>`` 已宣告语义。只传叶子列名会漏判，
+        # 故同时以 ``<节点路径>/<列名>`` 再判一次。
         candidates: list[str] = []
         if column:
             candidates.append(column)
         else:
             meta = read_hdf5_nodes_metadata(path, [sub]).get(sub) or {}
-            candidates.extend(
-                c for c in meta.get("columns", []) if is_timestamp_like_field(str(c))
-            )
+            for c in meta.get("columns", []):
+                name = str(c)
+                if (is_timestamp_like_field(name)
+                        or is_timestamp_like_field(f"{sub}/{name}")):
+                    candidates.append(name)
         for field in candidates:
             arr = read_hdf5_node_field_fast(path, sub, str(field))
             if arr is not None and len(arr) > 0:
