@@ -200,7 +200,16 @@ def test_report_profile_contains_stream_details(tmp_path: Path) -> None:
     assert "100.0 Hz" in content or "100 Hz" in content
     # 模态矩阵。
     assert "模态矩阵" in content
-    assert "视频流" in content
+    #
+    # **断言已更新（2026-09-21）**：模态矩阵由硬编码六行改为**从
+    # capabilities 动态生成**。本用例的 capabilities 只声明了
+    # has_imu/has_force/has_actions，因此矩阵只应出现这三项——
+    # 旧断言写死的"视频流"在本数据里根本不存在（它此前靠硬编码列表
+    # 凭空出现，是"幽灵行"）。
+    assert "IMU" in content
+    assert "力/力矩" in content
+    assert "状态/动作" in content
+    assert "视频流" not in content, "不应出现 capabilities 中未声明的模态"
 
 
 def test_report_qc_section_contains_measurements(tmp_path: Path) -> None:

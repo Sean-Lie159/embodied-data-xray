@@ -18,6 +18,7 @@ from agents import RunContextWrapper
 from agents.decorators import tool
 
 from app.agent.context import RunContext
+from app.tools.capability_meta import build_capability_matrix
 
 
 def _output_report_path(context: RunContext) -> Path:
@@ -103,21 +104,51 @@ def _build_dataset_overview(context: RunContext) -> str:
             lines.append("（无流登记表）")
 
     # ---- 模态矩阵（能力标签有无对照表）----
+    #
+    # **动态生成，不再硬编码**（真实缺陷修正，2026-09-21）：
+    # 初版是写死的六行，而 capabilities 实际有 10 个键——漏掉了 has_pose
+    # （手套数据的核心模态）、has_audio、has_hand_tracking 等。后果是在一份
+    # 位姿追踪数据上，矩阵显示出"IMU ✗ / 力 ✗ / 标定 ✗"却**没有"位姿"这一行**，
+    # 用户看到的全是"没有"，最关键的能力反而不见了。
+    #
+    # 现在遍历 capabilities 的全部键（含未来新增），中文名取自注册表；
+    # 未登记的键会用原键名并标注"未登记"——让遗漏立刻可见，而不是静默丢失。
     lines.append("")
     lines.append("**模态矩阵**")
-    rows = [
-        ("视频流", caps.get("has_video_streams")),
-        ("IMU", caps.get("has_imu")),
-        ("力/力矩", caps.get("has_force")),
-        ("标定", caps.get("has_calibration")),
-        ("状态/动作", caps.get("has_actions")),
-        ("语言标注", caps.get("has_language")),
-    ]
-    lines.append("| 模态 | 有无 |")
-    lines.append("|---|---|")
-    for label, present in rows:
-        mark = "✓" if present else "✗"
-        lines.append(f"| {label} | {mark} |")
+    matrix = build_capability_matrix(caps)
+    if matrix["rows"]:
+        lines.append("| 模态 | 有无 | 说明 |")
+        lines.append("|---|---|---|")
+        for row in matrix["rows"]:
+            if row["present"] is True:
+                mark = "✓"
+            elif row["present"] is False:
+                mark = "✗"
+            else:
+                mark = "未探测"
+            # 说明列：有值时给白话；无值时给"没有≠缺陷"的安抚说明（若有）。
+            note = row["what"]
+            if row["present"] is not True and row["absent_note"]:
+                note = f"{note}；{row['absent_note']}"
+            lines.append(f"| {row['label']} | {mark} | {note} |")
+    else:
+        lines.append("（无能力标签）")
+
+    if matrix["details"]:
+        lines.append("")
+        detail_str = "；".join(
+            f"{d['label']}：{d['value']}"
+            for d in matrix["details"] if d["value"] is not None
+        )
+        if detail_str:
+            lines.append(f"附注：{detail_str}")
+
+    if matrix["unregistered"]:
+        lines.append("")
+        lines.append(
+            "> 注意：以下能力标签未登记中文名，已按原键名列出："
+            + "、".join(f"`{k}`" for k in matrix["unregistered"])
+        )
 
     return "\n".join(lines)
 
