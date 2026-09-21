@@ -2406,6 +2406,34 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     # 但因为 .txt 不在支持格式内而被完全忽略）。现在经统一读取器识别并登记为流。
     register_text_data_streams(context, probe)
 
+    # 数据集画像覆盖（设计 B-3.2）：用户确认过的类型与预期缺失优先于自动识别。
+    #
+    # 为什么需要：guessed_type 此前算完即固定、无确认通道，用户即使确认了数据
+    # 性质，报告仍永远显示 unknown（用户质疑："做过语义确认，为什么还是 unknown？"）。
+    # 流的语义标签有 label_source 支持覆盖，数据集类型层面此前缺失该机制。
+    _confirmed_type = profile_store.get_confirmed_dataset_type(
+        str(context.output_dir or "outputs"), dataset_id)
+    if _confirmed_type:
+        meta["guessed_type"] = _confirmed_type.get("value")
+        meta["guessed_type_source"] = _confirmed_type.get("source")
+        meta["guessed_type_auto_detected"] = _confirmed_type.get("auto_detected")
+        meta["guessed_type_confirmed_at"] = _confirmed_type.get("confirmed_at")
+        if _confirmed_type.get("note"):
+            meta["guessed_type_note"] = _confirmed_type.get("note")
+
+    # 已确认的预期缺失（"这组列本来就没有数据"）：供质检区分预期/意外缺失。
+    _expected_missing = profile_store.get_expected_missing(
+        str(context.output_dir or "outputs"), dataset_id)
+    if _expected_missing:
+        meta["expected_missing"] = _expected_missing
+
+    # 能力标签覆盖（人工纠正嗅探结果）。
+    _caps_override = profile_store.get_capabilities_override(
+        str(context.output_dir or "outputs"), dataset_id)
+    if _caps_override:
+        meta["capabilities"].update(_caps_override)
+        meta["capabilities_override_source"] = profile_store.SOURCE_USER
+
     # 物化采样率指标（**唯一来源**，设计见 docs/指标单一来源与数据集画像设计.md）。
     #
     # 为什么在加载时就物化：此前采样率有 7 处独立实现、算法不同、互相覆盖，

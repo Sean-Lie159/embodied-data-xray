@@ -48,6 +48,7 @@ from app.tools import (
     compare_table_columns,
     check_temporal_sync,
     compute_stats,
+    confirm_dataset_profile,
     generate_report,
     inspect_streams,
     inspect_video_frame,
@@ -83,6 +84,7 @@ _ALL_TOOLS = [
     annotate_task,
     save_annotations,
     check_annotation_qc,
+    confirm_dataset_profile,
 ]
 
 

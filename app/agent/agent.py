@@ -300,6 +300,8 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "annotate_task": ("discovered", "results"),
     "save_annotations": ("results", "post_save_qc"),
     "check_annotation_qc": ("failures", "warnings", "per_episode"),
+    # 画像确认：内容摘要保留，明细可丢。
+    "confirm_dataset_profile": ("confirmed",),
     "compute_stats": ("per_episode", "episodes"),
     "plot_chart": (),
     "generate_report": ("report_markdown", "content"),
@@ -692,6 +694,7 @@ _TOOL_FUNCTION_TEXT: dict[str, str] = {
     "annotate_task": "正在登记任务标注",
     "save_annotations": "正在保存标注",
     "check_annotation_qc": "正在检查标注质量",
+    "confirm_dataset_profile": "正在确认数据集画像",
     "compute_stats": "正在计算统计指标",
     "plot_chart": "正在绘图",
     "generate_report": "正在生成报告",

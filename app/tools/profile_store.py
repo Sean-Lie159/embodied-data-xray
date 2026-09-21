@@ -220,6 +220,12 @@ def save_dataset_profile(
     *,
     stream_overrides: dict[str, dict[str, Any]] | None = None,
     pair_overrides: list[dict[str, Any]] | None = None,
+    dataset_type: str | None = None,
+    auto_detected_type: str | None = None,
+    dataset_type_note: str | None = None,
+    expected_missing: dict[str, list[str]] | None = None,
+    expected_missing_note: str | None = None,
+    capabilities_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """写入/合并指定数据集的已确认画像，返回更新后的全量画像。
 
@@ -231,6 +237,18 @@ def save_dataset_profile(
         dataset_id: 数据集标识名。
         stream_overrides: 流覆盖映射（文件名→{kind/role/semantic_label/...}）。
         pair_overrides: 配对覆盖列表。
+        dataset_type: **用户确认的数据集类型**（覆盖自动识别的 unknown）。
+            这是设计 B-3.2 的核心：此前 ``guessed_type`` 算完即固定，
+            用户即使确认了数据性质也无处记录，报告永远显示 unknown。
+        auto_detected_type: 自动识别结果（保留供对照，便于看出"确认改了什么"）。
+        dataset_type_note: 用户对类型的说明（如"左右前臂不采集"）。
+        expected_missing: **已确认的预期缺失**，形如
+            ``{"tips_trajectory.csv": ["*forearm_pos_*"]}``（通配符或精确列名）。
+            作用：质检的缺失值检查会把这些列**排除**在判定外，
+            并如实标注"属已确认的预期缺失"——避免每轮都把已知的预期缺失
+            报成 fail，用户反复口头解释。
+        expected_missing_note: 预期缺失的原因说明。
+        capabilities_override: 能力标签覆盖（人工纠正嗅探结果）。
 
     Returns:
         更新后的全量画像 dict（已落盘）。
@@ -264,8 +282,126 @@ def save_dataset_profile(
                 p["source"] = SOURCE_USER
             entry["pairs"] = pair_overrides
 
+        # ---- 数据集类型确认（设计 B-3.2）----
+        if dataset_type is not None:
+            entry["dataset_type"] = {
+                "value": str(dataset_type),
+                "source": SOURCE_USER,
+                "auto_detected": auto_detected_type,
+                "note": dataset_type_note or "",
+                "confirmed_at": _utc_now_iso(),
+            }
+
+        # ---- 已确认的预期缺失（设计 B-3.2）----
+        if expected_missing is not None:
+            entry["expected_missing"] = {
+                "patterns": {
+                    str(f): [str(p) for p in pats]
+                    for f, pats in expected_missing.items()
+                },
+                "source": SOURCE_USER,
+                "note": expected_missing_note or "",
+                "confirmed_at": _utc_now_iso(),
+            }
+
+        # ---- 能力标签覆盖 ----
+        if capabilities_override:
+            entry["capabilities_override"] = {
+                "values": dict(capabilities_override),
+                "source": SOURCE_USER,
+                "confirmed_at": _utc_now_iso(),
+            }
+
         _atomic_write(path, profile)
         return profile
+
+
+def _utc_now_iso() -> str:
+    """当前 UTC 时间（ISO 8601，秒精度）——用于记录确认时间。"""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_confirmed_dataset_type(
+    output_dir: str, dataset_id: str,
+) -> dict[str, Any] | None:
+    """读**用户确认的**数据集类型；未确认返回 None。
+
+    Returns:
+        ``{"value", "source", "auto_detected", "note", "confirmed_at"}`` 或 None。
+    """
+    entry = load_dataset_profile(output_dir, dataset_id)
+    got = entry.get("dataset_type")
+    return got if isinstance(got, dict) and got.get("value") else None
+
+
+def get_expected_missing(
+    output_dir: str, dataset_id: str,
+) -> dict[str, Any] | None:
+    """读**已确认的预期缺失**；未确认返回 None。
+
+    Returns:
+        ``{"patterns": {文件名: [模式...]}, "source", "note", "confirmed_at"}``
+        或 None。
+    """
+    entry = load_dataset_profile(output_dir, dataset_id)
+    got = entry.get("expected_missing")
+    return got if isinstance(got, dict) and got.get("patterns") else None
+
+
+def get_capabilities_override(
+    output_dir: str, dataset_id: str,
+) -> dict[str, Any] | None:
+    """读**用户确认的能力标签覆盖**；未确认返回 None。"""
+    entry = load_dataset_profile(output_dir, dataset_id)
+    got = entry.get("capabilities_override")
+    if isinstance(got, dict) and got.get("values"):
+        return got["values"]
+    return None
+
+
+def match_expected_missing(
+    patterns: dict[str, list[str]],
+    filename: str,
+    columns: list[str] | None = None,
+) -> list[str]:
+    """在指定文件的列中匹配"已确认预期缺失"的模式。
+
+    匹配用 ``fnmatch``（支持 ``*forearm_pos_*`` 这类通配符）——
+    设计决策见设计文档"待裁决决策点 3"：选通配符（简洁）**且回显命中清单**
+    （让用户看到实际排除了哪些列，避免误伤无感知）。
+
+    Args:
+        patterns: ``{文件名: [模式...]}``。
+        filename: 当前文件名（按 basename 匹配，兼容带路径的键）。
+        columns: 该文件的列名清单；为 None 时只返回模式本身（不做列匹配）。
+
+    Returns:
+        命中该文件的模式列表（列匹配时为**实际命中的列名**）。
+    """
+    import fnmatch
+    from pathlib import Path as _P
+
+    base = _P(str(filename)).name
+    # 先找匹配该文件的模式集合（键可以是文件名或通配）。
+    pats: list[str] = []
+    for key, val in (patterns or {}).items():
+        if _P(str(key)).name == base or fnmatch.fnmatch(base, str(key)):
+            pats.extend(str(p) for p in val)
+
+    if not pats:
+        return []
+    if columns is None:
+        return pats
+
+    hit: list[str] = []
+    for col in columns:
+        for p in pats:
+            if fnmatch.fnmatch(str(col), p):
+                hit.append(str(col))
+                break
+    return hit
 
 
 def apply_profile_overrides(

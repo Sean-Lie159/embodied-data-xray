@@ -36,8 +36,33 @@ def _build_dataset_overview(context: RunContext) -> str:
     """数据集画像章节：文件普查摘要 + 流明细表 + 模态矩阵。"""
     caps = context.meta.get("capabilities", {})
     streams = context.meta.get("streams", [])
-    lines = [f"**dataset_id**: {context.dataset_id or 'unknown'}",
-             f"**推测类型**: {context.meta.get('guessed_type', 'unknown')}"]
+    #
+    # **类型措辞修正（2026-09-21）**：区分"用户已确认"与"自动推测"两种来源，
+    # 并在 unknown 时主动提示可确认——此前报告永远只显示 `推测类型: unknown`，
+    # 即使用户已经做过语义确认也无处体现（用户质疑："做过语义确认，为什么
+    # 还是 unknown？"）。根因是数据集类型缺少确认通道。
+    guessed = context.meta.get("guessed_type", "unknown")
+    type_source = context.meta.get("guessed_type_source")
+    auto_type = context.meta.get("guessed_type_auto_detected")
+    type_note = context.meta.get("guessed_type_note")
+
+    if type_source == "user_confirmed":
+        type_line = f"**数据集类型**: {guessed}（来源：用户确认）"
+        if auto_type and auto_type != guessed:
+            type_line += f"；自动识别曾为 `{auto_type}`"
+    else:
+        type_line = f"**推测类型**: {guessed}（自动识别，未经确认）"
+
+    lines = [f"**dataset_id**: {context.dataset_id or 'unknown'}", type_line]
+
+    if type_note:
+        lines.append(f"**类型说明**: {type_note}")
+
+    if type_source != "user_confirmed" and str(guessed) == "unknown":
+        lines.append(
+            "> 未匹配到已知的数据格式。**如需固定类型**，可确认后写入数据集画像"
+            "（跨会话生效），此后报告与质检都会采用该确认。"
+        )
 
     # ---- 文件普查摘要（os 层面读大小，不进 df）----
     #

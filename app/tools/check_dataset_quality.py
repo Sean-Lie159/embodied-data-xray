@@ -1175,7 +1175,46 @@ def check_dataset_quality_impl(
         # "value 2% < threshold 5% 却判 fail"这种看起来自相矛盾的结果
         # （某一列 100% 为空，整体被摊薄）。这会让人怀疑工具算错了。
         nan_ratio, nan_per_col = _nan_inf_ratio(df, cols)
-        offenders = {k: v for k, v in nan_per_col.items() if v > settings.quality_gate_nan_ratio}
+
+        # **已确认的预期缺失**（设计 B-3.2）：用户明确说明"这组列本来就没有
+        # 数据"（如手套不含前臂传感器）时，这些列**排除在判定外**，并如实
+        # 标注为「预期缺失」——**不隐藏，只区分**。
+        #
+        # 为什么要做：此前这类列每轮都被判 fail，用户每轮都要口头解释一遍
+        # （真实事故：tips_trajectory.csv 的 14 个 forearm 列 100% 空）。
+        em_patterns = (context.meta.get("expected_missing") or {}).get("patterns") or {}
+        em_note = (context.meta.get("expected_missing") or {}).get("note") or ""
+        expected_cols: list[str] = []
+        if em_patterns:
+            from app.tools.profile_store import match_expected_missing
+
+            src_name = ""
+            raw_src = str(context.meta.get("source", "") or "")
+            table_name = context.meta.get("checked_table") or ""
+            if table_name:
+                src_name = str(table_name)
+            elif raw_src:
+                from pathlib import Path as _P
+
+                src_name = _P(raw_src).name
+            # 逐文件匹配：只要某文件模式命中这些列即视为预期缺失
+            # （同一份画像可能覆盖多张表）。
+            for fname in em_patterns:
+                expected_cols.extend(
+                    match_expected_missing(em_patterns, fname, list(df.columns))
+                )
+        expected_set = set(expected_cols)
+
+        offenders: dict[str, float] = {}
+        expected_hits: dict[str, float] = {}
+        for k, v in nan_per_col.items():
+            if v <= settings.quality_gate_nan_ratio:
+                continue
+            if k in expected_set:
+                expected_hits[k] = v
+            else:
+                offenders[k] = v
+
         sorted_offenders = dict(sorted(offenders.items(), key=lambda kv: -kv[1])[:10])
         if offenders:
             worst_col, worst_ratio = next(iter(sorted_offenders.items()))
@@ -1190,6 +1229,13 @@ def check_dataset_quality_impl(
                 f"各字段缺失/异常值比例均未超过 "
                 f"{settings.quality_gate_nan_ratio:.0%}（整体 {nan_ratio:.1%}）。"
             )
+        if expected_hits:
+            detail += (
+                f" 另有 {len(expected_hits)} 个字段为空但属**已确认的预期缺失**"
+                f"（依据：用户确认）——已排除在判定外"
+                + (f"；原因：{em_note}" if em_note else "")
+                + "。"
+            )
         gate_checks["nan_inf"] = {
             "result": _FAIL if offenders else _PASS,
             # 判定依据：逐字段（而非整体）——避免被摊薄掩盖。
@@ -1202,6 +1248,9 @@ def check_dataset_quality_impl(
                 if sorted_offenders else None),
             "threshold": settings.quality_gate_nan_ratio,
             "per_column": sorted_offenders,
+            # 预期缺失单独列出（与"意外缺失"区分，且不隐藏）。
+            "expected_missing_columns": expected_hits,
+            "expected_missing_note": em_note,
             "detail": detail,
         }
 
