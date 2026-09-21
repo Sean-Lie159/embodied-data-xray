@@ -179,18 +179,40 @@ def _normalize_to_ns(ts: np.ndarray, unit: str) -> tuple[np.ndarray, dict[str, A
     }
 
 
-def _nominal_rate(stream: dict[str, Any]) -> float | None:
-    """从流登记表/meta 读取标称采样率；缺省返回 None。
+def _nominal_rate(stream: dict[str, Any], context: Any = None) -> float | None:
+    """读取**标称**采样率（声明值）；缺省返回 None。
 
-    注意 ``measured_rate`` 可能是 **None** 而非 dict（如日志流无采样率概念，
-    登记时显式写 None）——此前直接 .get 会抛 AttributeError 打断整个检查，
-    故此处做类型判定（真实缺陷，2026-09-14 由文本流接入暴露）。
+    **语义已修正（缺陷 A2-3，2026-09-21）**：旧实现先读
+    ``stream["nominal_rate_hz"]``（该字段**全项目只有读、没有写**，恒为
+    None），随后**回落到 ``measured_rate.sample_rate_hz``**——这等于把
+    "实测值"当成"标称值"，使 `nominal_check` 实质是在拿实测比实测，
+    既无意义又掩盖了"声明值缺失"这一事实（用户看到的
+    "nominal_check skipped（未配置 nominal_rate_hz）"正是必然结果）。
+
+    现在改为经 ``metrics_store`` 读取：标称值只来自**声明来源**
+    （平台配置文件 / fps 列 / LeRobot 元数据），与实测值严格区分。
+    **读不到就返回 None**（如实表明"无可对照的声明值"），
+    不再用实测值顶替。
+
+    Args:
+        stream: 流登记项（保留形参以兼容既有调用点）。
+        context: 运行时上下文（读 ``meta["metrics"]``）；为 None 时尝试从
+            ``stream`` 的旧字段兜底（仅为向后兼容，且**不**回落到实测值）。
+
+    Returns:
+        标称采样率（Hz）；无声明值时为 None。
     """
+    if context is not None:
+        from app.tools.metrics_store import get_nominal_rate_hz
+
+        got = get_nominal_rate_hz(context)
+        if got:
+            return float(got["value"])
+
+    # 向后兼容：仅认显式声明字段，**不回落到 measured_rate**。
     rate = stream.get("nominal_rate_hz")
-    if rate is None:
-        measured = stream.get("measured_rate")
-        if isinstance(measured, dict):
-            rate = measured.get("sample_rate_hz")
+    if isinstance(rate, dict):
+        rate = rate.get("value")
     return float(rate) if isinstance(rate, (int, float)) and rate > 0 else None
 
 
@@ -863,7 +885,7 @@ def check_temporal_sync_impl(
                 "ts": ts_ns,
                 "ts_raw": ts,
                 "source": s.get("path"),
-                "nominal": _nominal_rate(s),
+                "nominal": _nominal_rate(s, context),
                 "unit_info": unit_info,
                 "timestamp_unit": unit,
                 "timestamp_column": col_name or None,

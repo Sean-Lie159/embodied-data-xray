@@ -23,6 +23,7 @@ from agents import RunContextWrapper
 from agents.decorators import tool
 
 from app.agent.context import RunContext
+from app.config import get_settings
 from app.tools import _data_access, _sniffing
 from app.tools._sniffing import probe_full_paths
 from app.tools import profile_store
@@ -1519,35 +1520,30 @@ def register_text_data_streams(
 def _measure_rate_hz(df: pd.DataFrame, ts_col: str | None) -> float | None:
     """从时间列估算采样率（Hz）；无法估算返回 None。
 
-    仅用于给流登记表标注"这条流大约多快"（供 UI 与对齐分析参考），
-    不做单位强判——量级明显不符合时间语义时直接返回 None（宁缺勿错）。
+    **实现已收敛到统一入口**（缺陷 A2-1 修复，2026-09-21）：
+    此前本函数调 ``infer_unit(ts)`` **不传列名**，而
+    ``timestamp_units.infer_unit`` 把列名后缀（``_ns``/``_us``/``_ms``）
+    当作最高优先级的单位线索——不传就退化为纯量级猜测，对
+    ``timestamp_ns`` 可能失准，直接导致报告流明细显示"未知"，
+    而 ``check_temporal_sync``（传了列名）却能算出 120.007Hz。
+    同时旧实现用**均值**（对丢帧敏感），新实现用**中位数**。
+
+    现改为调用 ``metrics_store.measure_rate_hz``——全项目唯一的采样率
+    算法实现，保证任何调用方得到的都是同一个值。
+
+    Args:
+        df: 数据表。
+        ts_col: 时间列名（**必须传**，携带单位后缀线索）。
+
+    Returns:
+        采样率（Hz）；无法估算时 None（宁缺勿错）。
     """
     if not ts_col or ts_col not in df.columns:
         return None
-    try:
-        ts = pd.to_numeric(df[ts_col], errors="coerce").to_numpy(dtype=float)
-    except Exception:  # noqa: BLE001
-        return None
-    ts = ts[np.isfinite(ts)]
-    if len(ts) < 3:
-        return None
-    from app.tools.timestamp_units import to_ns
+    from app.tools.metrics_store import measure_rate_hz
 
-    # 用既有单位推断（量级）换算到 ns 再算速率——与 check_temporal_sync 同口径。
-    from app.tools.timestamp_units import infer_unit
-
-    unit = infer_unit(ts)["unit"]
-    if unit not in ("ns", "us", "ms", "s"):
-        return None
-    ns = to_ns(ts, unit)
-    diffs = np.diff(ns)
-    diffs = diffs[diffs > 0]
-    if len(diffs) == 0:
-        return None
-    mean_ns = float(np.mean(diffs))
-    if mean_ns <= 0:
-        return None
-    return 1e9 / mean_ns
+    got = measure_rate_hz(df[ts_col], col_name=ts_col)
+    return float(got["value"]) if got else None
 
 
 def register_mcap_topic_streams(
@@ -2409,6 +2405,27 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
     # 就在其中（真实案例 2026-09-14：14 个相机 .txt 各含 14142 行纳秒时间戳，
     # 但因为 .txt 不在支持格式内而被完全忽略）。现在经统一读取器识别并登记为流。
     register_text_data_streams(context, probe)
+
+    # 物化采样率指标（**唯一来源**，设计见 docs/指标单一来源与数据集画像设计.md）。
+    #
+    # 为什么在加载时就物化：此前采样率有 7 处独立实现、算法不同、互相覆盖，
+    # 导致同一数据集在报告/质检/时间同步三处显示不同数值（实测事故：
+    # 流明细"未知"、同步检查 120.007Hz、质检 skip）。此处算一次、写一处，
+    # 其余工具一律读 meta["metrics"]。
+    #
+    # 注意：必须在"标称值来源"全部就位后调用——config 流的状态是
+    # build_streams_registry 写入的，故置于其后。
+    from app.tools.metrics_store import materialize as _materialize_metrics
+
+    try:
+        _materialize_metrics(
+            context,
+            df=context.df,
+            tolerance_ratio=get_settings().metrics_rate_tolerance_ratio,
+        )
+    except Exception:  # noqa: BLE001
+        # 指标物化失败不应阻断加载（诚实降级：下游读不到就显示"未知"）。
+        pass
 
     file_survey: dict[str, Any] = {
         "total_files": probe["total_files"],

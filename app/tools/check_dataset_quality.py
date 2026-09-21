@@ -269,12 +269,21 @@ def _nan_inf_ratio(df: pd.DataFrame, cols: list[str]) -> tuple[float, dict[str, 
 
 
 def _find_time_col(df: pd.DataFrame) -> str | None:
-    """查找时间列（用于单调性与丢帧检查）。"""
-    for cand in ("timestamp", "time", "ts", "log_time"):
-        for c in df.columns:
-            if str(c).lower().strip() == cand:
-                return str(c)
-    return None
+    """查找时间列（用于单调性、丢帧与采样率检查）。
+
+    **修正（2026-09-21）**：旧实现只做**精确名匹配**（``timestamp``/``time``/
+    ``ts``/``log_time``），因此对 ``timestamp_ns`` 这类**带单位后缀的真实列名
+    完全失配**——表现为质检的「时间戳顺序」「丢帧」全部 skip、"未找到时间列"，
+    而同一份数据在时间同步检查里却能正常算出 120.007Hz。
+    （事故现场：手套数据 ``timestamp_ns``。）
+
+    现复用 ``metrics_store`` 的列查找（精确优先 + 前缀匹配），
+    保证各工具对"哪一列是时间列"的判断一致。时间列候选集合也统一为
+    ``metrics_store._TIME_COL_CANDIDATES``，不再各自维护一份。
+    """
+    from app.tools.metrics_store import _TIME_COL_CANDIDATES, _find_col
+
+    return _find_col(df, _TIME_COL_CANDIDATES)
 
 
 def _monotonic_violations(series: pd.Series) -> tuple[int, int, list[int]]:
@@ -430,8 +439,19 @@ def _schema_consistency(df: pd.DataFrame) -> tuple[int, list[dict[str, Any]]]:
     return len(bad_cols), mismatches
 
 
-def _check_fps(context: RunContext, df: pd.DataFrame) -> dict[str, Any]:
-    """检查 fps 合法性与实际采样率一致性（LeRobot 有 fps<=0 硬校验）。"""
+def _check_fps(
+    context: RunContext, df: pd.DataFrame, settings: Any = None,
+) -> dict[str, Any]:
+    """检查 fps 合法性与实际采样率一致性（LeRobot 有 fps<=0 硬校验）。
+
+    Args:
+        context: 运行时上下文。
+        df: 数据表。
+        settings: 配置（读取容差 ``metrics_rate_tolerance_ratio``）；
+            缺省时现取，便于测试注入。
+    """
+    if settings is None:
+        settings = get_settings()
     fps: float | None = None
     source = ""
     for cand in ("fps", "frame_rate", "rate_hz"):
@@ -480,29 +500,49 @@ def _check_fps(context: RunContext, df: pd.DataFrame) -> dict[str, Any]:
         return out
 
     # 与实际时间戳采样率比对。
+    #
+    # **两处缺陷已修（2026-09-21）**：
+    # 1. 旧实现是 `measured = 1.0 / median_step`——**对原始数值取倒数、
+    #    完全没做单位归一化**。对纳秒时间戳（间隔 8,333,100）会得出
+    #    `1.2e-7` 这种无意义值，并据此误判"偏差超 10%"。属潜伏缺陷：
+    #    此前因"无声明 fps"而 skip 才未暴露。
+    # 2. 容差硬编码 10%，与其它地方可能不一致；改为读配置
+    #    （`metrics_rate_tolerance_ratio`，默认 5%，依据 Soda/GX 惯例）。
+    #
+    # 现统一走 `metrics_store.measure_rate_hz`——全项目唯一算法，
+    # 先按列名后缀推断单位、归一化到纳秒后再求速率。
     tcol = _find_time_col(df)
     if tcol is not None:
-        arr = pd.to_numeric(df[tcol], errors="coerce").to_numpy(dtype="float64")
-        arr = arr[~np.isnan(arr)]
-        if arr.size >= 3:
-            diffs = np.diff(arr)
-            diffs = diffs[diffs > 0]
-            if diffs.size:
-                median_step = float(np.median(diffs))
-                if median_step > 0:
-                    measured = 1.0 / median_step
-                    out["measured_rate_hz"] = round(measured, 4)
-                    # 相对偏差 > 10% 提示不一致（诊断性质，只 warn）。
-                    if fps > 0 and abs(measured - fps) / fps > 0.10:
-                        out["result"] = _WARN
-                        out["detail"] = (
-                            f"声明 fps={fps} 与实测采样率 {round(measured, 3)}Hz "
-                            "相对偏差超 10%"
-                        )
-                        return out
+        from app.tools.metrics_store import measure_rate_hz
+
+        got = measure_rate_hz(df[tcol], col_name=tcol)
+        if got is not None:
+            measured = float(got["value"])
+            out["measured_rate_hz"] = round(measured, 4)
+            out["measured_unit"] = got.get("unit")
+            out["rate_source"] = got.get("source")
+            tol = float(getattr(
+                settings, "metrics_rate_tolerance_ratio", 0.05))
+            dev = abs(measured - fps) / fps if fps > 0 else 0.0
+            out["deviation_ratio"] = round(dev, 8)
+            out["tolerance_ratio"] = tol
+            if dev > tol:
+                out["result"] = _WARN
+                out["detail"] = (
+                    f"声明采样率 {fps} Hz 与实测 {round(measured, 3)} Hz 的"
+                    f"偏差 {round(dev * 100, 3)}% 超过容差 "
+                    f"{round(tol * 100, 2)}%——建议核对设备实际输出设置"
+                )
+                return out
+            out["detail"] = (
+                f"声明 {fps} Hz，实测 {round(measured, 3)} Hz，"
+                f"偏差 {round(dev * 100, 4)}%（容差 {round(tol * 100, 2)}%）→ 一致"
+            )
+            out["result"] = _PASS
+            return out
 
     out["result"] = _PASS
-    out["detail"] = f"fps={fps} 合法"
+    out["detail"] = f"fps={fps} 合法（未测出实际采样率可供对照）"
     return out
 
 
@@ -1196,7 +1236,7 @@ def check_dataset_quality_impl(
         # 5) fps 合法性（**必须在丢帧之前算**：丢帧判据需要它的 declared_fps
         # 作权威参照。初版把 fps 放在丢帧之后，导致 declared_fps 永远拿不到，
         # 丢帧退化为自我掩饰的中位间隔外推——这是实测发现的顺序缺陷。）
-        fps_check = _check_fps(context, df)
+        fps_check = _check_fps(context, df, settings)
         gate_checks["fps_valid"] = fps_check
 
         # 4) 丢帧（优先用声明 fps 作权威参照，见 _frame_loss_estimate 的取舍说明）

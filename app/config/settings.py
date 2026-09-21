@@ -130,6 +130,15 @@ class Settings(BaseSettings):
     # 离群 episode 检测（IQR 法）的 k 值：Q1 - k*IQR / Q3 + k*IQR 之外视为离群。
     stats_outlier_k: float = Field(default=1.5, ge=0.0)
 
+    # --- 指标口径（metrics_store）--------------------------------------------
+    # 采样率"实测值 vs 声明值"的一致性容差（相对偏差比例）。
+    # 默认 0.05（5%）——依据：Soda 的 percent_threshold 默认 0.05、
+    # Great Expectations 同为百分比阈值。
+    # **为什么用容差而非相等**：声明值是"设计目标"、实测值是"实际表现"，
+    # 二者接近但不完全相等是物理常态（如声明 120Hz、实测 120.007Hz，
+    # 偏差 0.006%，应判为一致）。
+    metrics_rate_tolerance_ratio: float = Field(default=0.05, gt=0.0, le=1.0)
+
     # --- 动作切片（segment_actions）阈值 -------------------------------------
     # 设计依据：docs/标注与质检能力设计.md §5.2.2。
     # **重要**：以下粒度阈值均为**占位建议值，未经任何数据集验证**——业界对
