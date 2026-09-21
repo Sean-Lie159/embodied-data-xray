@@ -217,3 +217,60 @@ def test_droppable_table_covers_all_tools() -> None:
         "check_sensor_sanity", "compute_stats", "plot_chart", "generate_report",
     }
     assert expected.issubset(set(_TOOL_DROPPABLE))
+
+
+def test_droppable_covers_all_registered_tools() -> None:
+    """可丢弃字段表必须覆盖**当前实际注册的每一个工具**（防新增工具漏配）。
+
+    为什么从"全员注册表"取名单而不是硬编码：此前测试只校验 8 个历史工具，
+    工具数已增至 19，中间新增的（如 `compare_table_columns`）**全部漏配而测试
+    不报**——漏配的工具会跳过档 1，超预算时按体积整体硬截断，把结论字段与长
+    明细一起砍掉（2026-09-21 发现并修复）。
+
+    注意：不在 `_ALL_TOOLS` 中的工具（如 CLI 独有项）不参与本断言——
+    它们由各自的注册路径保证。
+    """
+    from app.services.chat_service import _ALL_TOOLS
+
+    registered = {getattr(t, "name", None) for t in _ALL_TOOLS}
+    registered.discard(None)
+    missing = sorted(registered - set(_TOOL_DROPPABLE))
+    assert not missing, (
+        f"以下已注册工具在 _TOOL_DROPPABLE 中漏配（会跳过档 1 降级）：{missing}"
+    )
+
+
+def test_droppable_compare_table_columns_keeps_conclusions() -> None:
+    """跨表运算的降级必须保留对齐口径与计数，先丢明细。
+
+    回归（2026-09-21）：`compare_table_columns` 此前未登记，超预算时走通用
+    截断——`aligned_on`/`n_matched`/`unmatched` 这些**结论字段**可能先于
+    `samples` 一起被砍。现要求降级后这些字段仍在。
+    """
+    droppable = _TOOL_DROPPABLE["compare_table_columns"]
+    assert "samples" in droppable, "样例行属可再生明细，应优先丢弃"
+    assert "result" in droppable or "samples" in droppable
+    # 结论字段绝不能出现在可丢清单里。
+    for conclusion_key in ("aligned_on", "n_a", "n_b", "n_matched", "unmatched",
+                           "columns_used", "user_message", "success"):
+        assert conclusion_key not in droppable, (
+            f"{conclusion_key} 是结论字段，不得列为可丢"
+        )
+
+    # 端到端：超预算时先丢 samples，结论字段留存。
+    r = {
+        "success": True,
+        "aligned_on": "frame_index",
+        "n_a": 28270, "n_b": 28270, "n_matched": 28270,
+        "unmatched": {"keys_only_in_a": 0, "keys_only_in_b": 0},
+        "result": {"pos_x（A−B）": {"n": 28270, "mean": 0.001, "std": 0.02}},
+        "samples": [{"frame_index": i, "pos_x_A": 0.1, "pos_x_B": 0.1}
+                    for i in range(500)],
+        "user_message": "已按 frame_index 对齐，对齐后 28270 行。",
+    }
+    out = enforce_output_limit(r, budget_tokens=300, droppable=droppable,
+                               tool_name="compare_table_columns")
+    assert out.get("truncated") is True
+    assert out["aligned_on"] == "frame_index"
+    assert out["n_matched"] == 28270
+    assert "samples" not in out, "应先丢弃样例行"

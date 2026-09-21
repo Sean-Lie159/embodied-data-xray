@@ -286,6 +286,14 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "inspect_video_frame": (),
     # 数据集对比：matched 是同名流逐条对比（长列表）；只保留 summary 与计数。
     "compare_datasets": ("matched", "only_in_a", "only_in_b"),
+    # 跨表逐行运算：samples 是供人工核对的样例行（可丢），result 是各列统计
+    # 与 decile 分布（冗长但可再生）；对齐口径（aligned_on / n_matched /
+    # unmatched）与 counts 是结论，必须保留。
+    #
+    # 此前本项缺失（2026-09-21 补）：漏配时 droppable 取空元组，该工具**直接
+    # 跳过档 1**、落入档 2/3 的通用截断——超预算时按体积整体砍，而不是先丢
+    # 次要明细；表现为"结论字段与长明细一起被截"，与既有降级纪律不符。
+    "compare_table_columns": ("result", "samples"),
 }
 
 
