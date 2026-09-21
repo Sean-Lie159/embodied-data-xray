@@ -707,6 +707,35 @@ def fingerprint_force(sample: pd.DataFrame, columns: list[str]) -> dict[str, Any
 
 # --- 流分类裁判：综合第 1 / 2 层 -------------------------------------------
 
+def _calibration_kind_from_name(name_lower: str) -> str | None:
+    """按文件名命名惯例判定标定文件（内参/外参），不猜内容。
+
+    为真实数据集 ``parameters/sensor/`` 下的标定文件而加（2026-09-21）：
+    - ``extrinsic_end_T_<camera>_rgbd_aligned.json`` → 相机外参（变换矩阵）
+    - ``intrinsic_<camera>_*.json`` → 相机内参
+    - ``<A>_T_<B>`` 变换矩阵命名惯例 → 相机外参（变换矩阵）
+
+    为什么只认命名、不看内容：这些 JSON 是变换矩阵/内参数组，没有"列名"可言，
+    第 1 层词典与第 2 层内容指纹**天然无从下手**。而文件名已经把语义说清楚了，
+    属确定性命名线索。**注意**这不是内容验证结论——若用户的实际命名不符惯例，
+    应由第 4 层用户确认纠正。
+
+    Args:
+        name_lower: 文件名（已小写）。
+
+    Returns:
+        语义标签；不命中命名惯例返回 None。
+    """
+    if "extrinsic" in name_lower:
+        return "相机外参（变换矩阵）"
+    if "intrinsic" in name_lower:
+        return "相机内参"
+    if "_t_" in name_lower:
+        # ``end_T_head_left_rgbd`` 这类"父坐标系_T_子坐标系"命名。
+        return "相机外参（变换矩阵）"
+    return None
+
+
 def classify_table_stream(
     name: str,
     columns: list[str],
@@ -887,6 +916,33 @@ def classify_table_stream(
             "quaternion_groups": quat_groups,
             "imu_axes": None,
         }
+    # 7.5 标定文件（2026-09-21，缺陷 B 修复）。
+    #
+    # 背景：真实数据集 `parameters/sensor/` 下有 5 条
+    # ``extrinsic_end_T_<camera>_rgbd_aligned.json``（末端→相机的变换矩阵，
+    # 即相机外参）以及若干 ``intrinsic_*.json``。它们的语义在**文件名**上很明确，
+    # 但内容太小/无列名，第 1 层词典与第 2 层指纹都不命中 → 全部落到 unknown，
+    # 表现为"判不出，未做硬猜"。而这类文件恰恰是跨相机对齐的必要参数。
+    #
+    # 判据只认**命名惯例**（extrinsic/intrinsic/``<A>_T_<B>``），不猜内容——
+    # 属"确定性命名线索"，不是内容指纹结论，故 label_confidence 记 medium、
+    # label_source 记 dictionary。
+    _calib = _calibration_kind_from_name(lower)
+    if _calib is not None:
+        return {
+            "kind": "calibration",
+            "semantic_label": _calib,
+            "label_evidence": f"文件名命名惯例命中（{name}）",
+            "label_confidence": "medium",
+            "status": "active",
+            "channels": columns,
+            "timestamp_column": ts_fp.get("column"),
+            "timestamp_unit": ts_unit,
+            "timestamp_unit_basis": ts_unit_basis,
+            "quaternion_groups": quat_groups,
+            "imu_axes": None,
+        }
+
     # 8. 判不出：所有层级均未命中，明确返回 unknown，绝不硬猜。
     # 证据需说明"第 1 层词典线索 + 第 2 层内容指纹均无法判定"，把决策空间留给
     # 第 3 层 LLM 语义假设（目前未接模型，见 docs/技术债.md）或第 4 层用户确认。

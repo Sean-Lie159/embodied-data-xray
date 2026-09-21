@@ -737,9 +737,133 @@ def _classify_h5_node(fields: list[str], node_path: str) -> tuple[str, str]:
         return "imu", "IMU 传感器"
     if "pose" in path_l or any("quat" in f for f in fl):
         return "pose", "位姿流"
-    if "calibration" in path_l:
-        return "calibration", "标定数据"
+    if "calibration" in path_l or _is_calibration_extrinsic(node_path):
+        return "calibration", _calibration_label(node_path)
+    # state/* 遥测流的路径判定（2026-09-21，缺陷 A 修复）。
+    #
+    # 为什么必须在这里单独判：帧布局下 state/* 是**裸 ndarray**，
+    # `_classify_h5_leaf` 为其返回 ``fields=[]``，于是上面所有依赖 ``fl``
+    # 的判据（``any("quat" in f ...)`` 等）**恒为 False**；而 state 路径
+    # 又不含 ``action``/``pose``/``imu`` 等既有词根 → 24 条真实遥测流
+    # （joint/position 14135×14、end/wrench 14135×12、waist/effort 14135×5、
+    # head/mode、end/errcode …）全部落到 unknown。
+    #
+    # 反证：同数据的 ``action/joint/position`` 因路径含 ``action`` 被正确
+    # 识别——同类数据一半识别一半不识别，属明确逻辑漏洞。
+    #
+    # **注意**：这些标签是**基于路径的语义假设**（label_confidence=medium），
+    # 仅供用户/模型理解清单，**不代表该流已被验证**，不得用于数值计算
+    # （AGENTS.md §3.4）。该约束同时写入 label_evidence 文案。
+    if "state" in path_l:
+        state_kind = _classify_state_leaf(node_path)
+        if state_kind is not None:
+            return state_kind
     return "unknown", "未知（无法分类）"
+
+
+# 相机标定文件的命名惯例（2026-09-21，缺陷 B 修复）。
+#
+# 背景：真实数据集有 5 条 ``extrinsic_end_T_<camera>_rgbd_aligned.json``，
+# 是"末端 → 相机"的变换矩阵（相机外参），语义明确，但路径**不含**
+# ``calibration`` 字样 → 既不命中 calibration 分支，也不属空流/日志，
+# 最终标为"未知（无法分类）"。工具 evidence 自承"判不出，未做硬猜"。
+#
+# 判据按命名惯例（整词/前缀，避免子串误命中）：
+_CALIB_EXTRINSIC_TOKENS = ("extrinsic",)
+_CALIB_INTRINSIC_TOKENS = ("intrinsic",)
+
+
+def _is_calibration_extrinsic(node_path: str) -> bool:
+    """判断路径是否为相机标定文件（内参/外参命名惯例）。
+
+    Args:
+        node_path: 节点路径或文件名。
+
+    Returns:
+        True 表示按命名惯例属标定文件。
+    """
+    low = node_path.lower()
+    if any(t in low for t in _CALIB_EXTRINSIC_TOKENS):
+        return True
+    if any(t in low for t in _CALIB_INTRINSIC_TOKENS):
+        return True
+    # ``<frame>_T_<frame>`` 是变换矩阵的通行命名（如 end_T_hand_left_rgbd）。
+    # 用 split 后的整词 ``t`` 匹配，避免误伤含字母 t 的普通名字。
+    return "_t_" in low
+
+
+def _calibration_label(node_path: str) -> str:
+    """按命名惯例给出更精确的标定标签（外参/内参/通用）。
+
+    Args:
+        node_path: 节点路径或文件名。
+
+    Returns:
+        语义标签。
+    """
+    low = node_path.lower()
+    if any(t in low for t in _CALIB_EXTRINSIC_TOKENS) or "_t_" in low:
+        return "相机外参（变换矩阵）"
+    if any(t in low for t in _CALIB_INTRINSIC_TOKENS):
+        return "相机内参"
+    return "标定数据"
+
+
+# state/* 叶子名 → (kind, 语义标签) 的确定性映射（2026-09-21，缺陷 A）。
+#
+# 顺序敏感：**先匹配更具体的语义词**（wrench/effort/mode 等），再落到通用的
+# 位置/速度。否则 ``state/end/arm_position`` 会被通用规则先吃掉。
+#
+# kind 取值刻意复用下游已识别的 ``pose``/``force``，并为状态类新增
+# ``joint_state``/``effort``/``status``——这三个在 inspect_streams 的
+# 分流里落入 ``other_streams``（不进 force 单槽），不会覆盖既有语义。
+_STATE_LEAF_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    # **力/力矩不归入 ``force``**（2026-09-21 实测修正）：``kind="force"`` 在
+    # inspect_streams 里是**单槽汇总**（``force_stream`` 单个 dict，后写覆盖先写），
+    # 而 h5 的 ``state/end/wrench`` 与 ``state/left_effector/wrench`` 等可能有多条
+    # ——归入 force 会让前几条被静默覆盖，且该槽的 ``channels`` 期望列名清单，
+    # 而帧布局裸数组的 channels 恒为空 → 汇总出 ``present=True, n_channels=0``
+    # 的自相矛盾结果（实测已复现）。故用独立 kind ``wrench``，在 inspect_streams
+    # 里与 joint_state/effort/status 同走 other_streams（列表，不覆盖）。
+    (("wrench", "torque"), "wrench", "力/力矩流"),
+    # 关节力矩/电流。
+    (("effort", "current", "motor_current"), "effort", "关节力矩/电流流"),
+    # 控制器状态码/错误码（低信息量但语义重要：mode / errcode / status）。
+    (("errcode", "errmsg", "error_code", "status", "mode", "state_code",
+      "controller_state"), "status", "控制器状态流"),
+    # 位姿（含 orientation / arm_position 这类末端位姿）。
+    (("orientation", "pose", "arm_position", "eef_position", "tcp"), "pose", "位姿流"),
+    # 关节状态（位置/速度/加速度）。
+    (("position", "qpos", "velocity", "qvel", "acceleration", "qacc", "joint"),
+     "joint_state", "关节状态流"),
+)
+
+
+def _classify_state_leaf(node_path: str) -> tuple[str, str] | None:
+    """按叶子名判定 ``state/*`` 节点的 kind 与语义标签。
+
+    参数是 **路径**（而非 fields）——因为帧布局下 state 节点的 fields 恒为空，
+    只能靠命名判定。
+
+    Args:
+        node_path: 节点路径（如 state/joint/position）。
+
+    Returns:
+        (kind, semantic_label)；无法归类时返回 None（交由调用方标 unknown）。
+    """
+    leaf = node_path.rsplit("/", 1)[-1].lower()
+    parts = [p for p in node_path.lower().split("/") if p]
+    for keys, kind, label in _STATE_LEAF_RULES:
+        if any(k in leaf for k in keys):
+            return kind, label
+    # 叶子名未命中时，用中间路径段兜底（如 state/waist/<未知名>）。
+    for seg in reversed(parts[:-1]):
+        if seg in ("state",):
+            continue
+        for keys, kind, label in _STATE_LEAF_RULES:
+            if any(k in seg for k in keys):
+                return kind, label
+    return None
 
 
 def read_hdf5_node_field_fast(
@@ -1182,6 +1306,18 @@ def register_h5_node_streams(
                 f"HDF5 每帧一组布局（{nd.get('n_frames')} 帧 × 同名叶子节点，"
                 f"读取时按帧纵向拼接）"
             )
+        # 语义假设免责标注（2026-09-21）：state/* 与 extrinsic 标定的标签是
+        # **按路径命名**判定的语义假设（帧布局下这些节点 fields 恒为空，
+        # 没有列名可作证据），不是内容验证的结论。按 AGENTS.md §3.4
+        # 「LLM 假设不得替代工具验证」，此处显式告知模型：标签仅供理解清单，
+        # **不得据此做数值结论**，需要时用工具实测。
+        # unknown / 空流不加（避免噪声）。
+        if kind in ("joint_state", "effort", "status", "wrench", "calibration"):
+            entry["label_evidence"] = (
+                f"{entry['label_evidence']}；标签按**节点路径命名**判定"
+                "（语义假设，未经内容验证，不得用于数值结论）"
+            )
+            entry["label_source"] = "h5_node_scan_path"  # 与字段特征判定区分
         entries.append(entry)
     if entries:
         context.meta.setdefault("streams", []).extend(entries)

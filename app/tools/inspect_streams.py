@@ -654,12 +654,18 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         if kind == "imu":
             imu_streams.append(entry)
         elif kind == "force":
-            force_stream = entry
+            # **单槽汇总**：只保留首个 force 流。若数据里有多个力流会被静默覆盖，
+            # 故 h5 的 state/*/wrench 一律不归入 force（用独立 kind="wrench"，
+            # 走 other_streams 列表，见 load_dataset._STATE_LEAF_RULES 的说明）。
+            if force_stream is None:
+                force_stream = entry
+            else:
+                other_streams.append(entry)
         elif kind == "actions":
             action_streams.append(entry)
-        elif kind == "pose":
-            other_streams.append(entry)
         else:
+            # pose / joint_state / effort / status / wrench / timestamp_index /
+            # unknown（含空流）等一律进列表，不覆盖。
             other_streams.append(entry)
 
     # IMU 汇总。优先用流配对（accel+gyro=六轴）标注轴数，否则用能力标签。
