@@ -44,6 +44,7 @@ from app.tools import (
     generate_report,
     inspect_streams,
     inspect_video_frame,
+    list_tables,
     load_dataset,
     plot_chart,
     profile_data,
@@ -119,6 +120,7 @@ _CLI_TOOL_NAMES = [
     "plot_chart", "generate_report",
     "propose_stream_semantics", "unpack_mcap", "align_container_streams",
     "inspect_video_frame", "compare_datasets", "compare_table_columns",
+    "list_tables",
     "segment_actions",
     "annotate_task", "save_annotations", "check_annotation_qc",
 ]
@@ -151,6 +153,7 @@ def _build_main_agent() -> tuple[Agent[RunContext], list[str]]:
         inspect_video_frame,
         compare_datasets,
         compare_table_columns,
+        list_tables,
         check_dataset_quality,
         segment_actions,
         annotate_task,

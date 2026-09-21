@@ -46,6 +46,7 @@ from app.tools.inspect_video_frame import (
     inspect_video_frame,
     inspect_video_frame_impl,
 )
+from app.tools.list_tables import list_tables, list_tables_impl
 from app.tools.load_dataset import (
     confirm_stream_semantic_impl,
     load_dataset,
@@ -70,6 +71,8 @@ __all__ = [
     "profile_data_impl",
     "inspect_streams",
     "inspect_streams_impl",
+    "list_tables",
+    "list_tables_impl",
     "check_temporal_sync",
     "check_temporal_sync_impl",
     "check_sensor_sanity",
