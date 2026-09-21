@@ -367,6 +367,89 @@ def test_describe_handles_missing_values() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_report_stream_detail_reads_authoritative_metrics(tmp_path: Path) -> None:
+    """**批次四核心**：报告流明细必须读权威指标，不再显示"未知"。
+
+    事故现场：报告流明细显示"未知"，而时间同步检查能算出 120.007Hz。
+    根因是报告直接读旧缓存（load_dataset 写入时漏传列名导致 None）。
+    """
+    from app.tools.generate_report import _build_dataset_overview
+
+    n = 200
+    hz = 120.0
+    df = pd.DataFrame({
+        "timestamp_ns": (np.arange(n) * (1e9 / hz)).astype("int64"),
+        "a": np.sin(np.arange(n) * 0.1),
+    })
+    ctx = _ctx(df)
+    ctx.output_dir = str(tmp_path)
+    ctx.meta.update({
+        "capabilities": {"has_pose": True},
+        # 模拟旧缓存缺失（正是事故发生时的状态）。
+        "streams": [{"path": "j.csv", "format": "csv", "measured_rate": None}],
+        "format": "csv",
+        "n_rows": n,
+    })
+    ms.materialize(ctx)
+
+    text = _build_dataset_overview(ctx)
+    assert "120" in text, f"流明细未显示实测采样率：{text}"
+    assert "未知" not in text.split("**流明细**")[1].split("**模态矩阵**")[0], (
+        "流明细仍显示未知（未读权威指标）"
+    )
+
+
+def test_report_shows_both_measured_and_nominal(tmp_path: Path) -> None:
+    """报告须同时给出实测与声明值（呈现纪律）。"""
+    from app.tools.generate_report import _build_dataset_overview
+
+    n = 200
+    df = pd.DataFrame({
+        "timestamp_ns": (np.arange(n) * (1e9 / 120.007)).astype("int64"),
+        "fps": [120.0] * n,
+        "a": np.sin(np.arange(n) * 0.1),
+    })
+    ctx = _ctx(df)
+    ctx.output_dir = str(tmp_path)
+    ctx.meta.update({"streams": [], "capabilities": {}, "format": "csv"})
+    ms.materialize(ctx)
+
+    text = _build_dataset_overview(ctx)
+    assert "采样率口径" in text, f"报告未给出采样率口径说明：{text}"
+    assert "实测" in text and "声明" in text
+
+
+def test_temporal_sync_cross_checks_authoritative_rate() -> None:
+    """时间同步检查须与权威指标**交叉核对**并标注一致性。
+
+    该工具必须自己算（同时要判乱序/缺口），但两条路径可能分歧——
+    因此做显式核对，让分歧可见而非静默。
+    """
+    from app.tools.check_temporal_sync import _cross_check_metrics_rate
+
+    ctx = _ctx(_ns_df(n=200, hz=120.0))
+    ms.materialize(ctx)
+
+    same = _cross_check_metrics_rate(ctx, 120.0)
+    assert same["consistent"] is True
+    assert same["authoritative_rate_hz"] == pytest.approx(120.0, rel=1e-3)
+
+    # 明显分歧 → 标为不一致（可见）。
+    diff = _cross_check_metrics_rate(ctx, 60.0)
+    assert diff["consistent"] is False
+    assert "不一致" in diff["explain"]
+
+
+def test_cross_check_says_unknown_when_metrics_missing() -> None:
+    """无权威值时如实返回无法核对（不猜）。"""
+    from app.tools.check_temporal_sync import _cross_check_metrics_rate
+
+    ctx = _ctx(None)
+    res = _cross_check_metrics_rate(ctx, 120.0)
+    assert res["consistent"] is None
+    assert "无法交叉核对" in res["explain"]
+
+
 def test_cross_tool_rate_consistency(tmp_path: Path) -> None:
     """**核心验收**：同一数据集在质检与时间同步两处得到的采样率必须一致。
 

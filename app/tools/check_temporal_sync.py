@@ -179,6 +179,74 @@ def _normalize_to_ns(ts: np.ndarray, unit: str) -> tuple[np.ndarray, dict[str, A
     }
 
 
+def _cross_check_metrics_rate(
+    context: Any, local_rate: float | None,
+) -> dict[str, Any]:
+    """把本工具算出的采样率与 ``metrics_store`` 的权威值交叉核对。
+
+    **为什么需要（防止"工具互相矛盾"再现）**：本工具必须自己逐流算采样率
+    （因为它同时还要检查乱序/重复/缺口，需要逐流的时间序列），
+    无法简单地读缓存。但两条计算路径独立演化就可能再次分歧——实测事故正是
+    "报告显示未知、本工具显示 120.007Hz"。
+
+    因此这里做**显式交叉核对**：若两者相对偏差超过容差，就在结果中明确标出
+    ``consistent=False`` 并给出两个数值，让分歧**可见**而不是静默存在
+    （借鉴 Blackboard 架构的 conflict-resolver 思路）。
+
+    Args:
+        context: 运行时上下文（读 ``meta["metrics"]``）。
+        local_rate: 本工具算出的采样率。
+
+    Returns:
+        dict，含 ``authoritative_rate_hz`` / ``local_rate_hz`` / ``consistent``
+        （True/False/None）/ ``explain``。任一侧缺失时 consistent=None。
+    """
+    try:
+        from app.tools.metrics_store import get_measured_rate_hz
+
+        auth = get_measured_rate_hz(context)
+    except (ImportError, AttributeError, TypeError):
+        auth = None
+
+    auth_v = float(auth["value"]) if auth else None
+    if auth_v is None or local_rate is None:
+        return {
+            "authoritative_rate_hz": auth_v,
+            "local_rate_hz": local_rate,
+            "consistent": None,
+            "explain": "缺少一侧数值，无法交叉核对（不推测）",
+        }
+
+    if auth_v <= 0:
+        return {
+            "authoritative_rate_hz": auth_v,
+            "local_rate_hz": local_rate,
+            "consistent": None,
+            "explain": "权威值非正，无法比较",
+        }
+
+    dev = abs(auth_v - local_rate) / auth_v
+    tol = 0.05
+    try:
+        tol = float(get_settings().metrics_rate_tolerance_ratio)
+    except (AttributeError, ValueError, TypeError):
+        pass
+
+    ok = dev <= tol
+    return {
+        "authoritative_rate_hz": auth_v,
+        "local_rate_hz": local_rate,
+        "deviation_ratio": round(dev, 8),
+        "tolerance_ratio": tol,
+        "consistent": ok,
+        "explain": (
+            f"权威实测 {auth_v} Hz 与本工具计算 {local_rate} Hz 偏差 "
+            f"{dev * 100:.4f}%（容差 {tol * 100:.2f}%）→ "
+            + ("一致" if ok else "**不一致**，请核查时间列口径或单位推断")
+        ),
+    }
+
+
 def _nominal_rate(stream: dict[str, Any], context: Any = None) -> float | None:
     """读取**标称**采样率（声明值）；缺省返回 None。
 
@@ -361,6 +429,7 @@ def _single_stream_checks(
     nominal: float | None,
     unit_known: bool = True,
     settings: Any = None,
+    context: Any = None,
 ) -> dict[str, Any]:
     """单流时间戳检查：单调性、重复、丢帧率、实际采样率、时长、形态分类。
 
@@ -371,6 +440,8 @@ def _single_stream_checks(
             间隔 / 采样率）一律置 None 并在 absolute_note 注明不可用，仅保留
             单位无关的检查项（乱序 / 重复 / 丢帧率——丢帧率是比值，与单位无关）。
         settings: 应用配置（形态分类阈值）；缺省时读取 get_settings()。
+        context: 运行时上下文；给出时与 ``metrics_store`` 的权威采样率交叉核对
+            （让两条独立计算路径的分歧**可见**而非静默）。
 
     Returns:
         dict，含各项测量值与判定标记（含 stream_shape；burst 流的
@@ -457,7 +528,10 @@ def _single_stream_checks(
         "nominal_rate_hz": nominal,
         "rate_deviation": rate_deviation,
         "nominal_check": nominal_check,
+        # 与权威指标的一致性交叉核对（见 _cross_check_metrics_rate）。
+        "metrics_consistency": _cross_check_metrics_rate(context, actual_rate),
     }
+    # 为兼容既有调用点（不传 context）保留 None 语义，不影响原行为。
     if shape == "burst":
         result["frame_loss_ratio"] = None
         result["frame_loss_status"] = "not_applicable"
@@ -941,7 +1015,9 @@ def check_temporal_sync_impl(
             continue
         # 单流检查直接用纳秒基准数组；单位未知时绝对量由函数内置 None。
         unit_known = p.get("unit_known", is_unit_known(p.get("unit_info")))
-        checks = _single_stream_checks(p["ts"], p.get("nominal"), unit_known, settings)
+        checks = _single_stream_checks(
+            p["ts"], p.get("nominal"), unit_known, settings, context
+        )
         checks["present"] = True
         # 透出该流时间戳的原始单位与换算说明（供核对归一化是否正确）。
         if p.get("unit_info"):

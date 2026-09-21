@@ -108,17 +108,39 @@ def _build_dataset_overview(context: RunContext) -> str:
     lines.append("")
     lines.append("**流明细**")
     if streams:
-        lines.append("| 流 | 角色 | 格式 | 采样率/帧率 | 来源文件 |")
+        # 采样率读取优先级（指标单一来源，2026-09-21）：
+        # ① meta["metrics"]（唯一权威，由 metrics_store 物化，含实测与标称）；
+        # ② 流缓存 measured_rate（兼容旧数据/未物化场景）。
+        #
+        # 为什么优先读 metrics：此前本表直接读流缓存，而该缓存由 load_dataset
+        # 与 inspect_streams 两处分别写入、算法不同（漏传列名 / 传了列名），
+        # 导致同一数据集在这里显示"未知"、在时间同步检查里却是 120.007Hz。
+        # 现统一以 metrics_store 为准，消除分歧。
+        from app.tools.metrics_store import get_measured_rate_hz
+
+        _ms_measured = get_measured_rate_hz(context)
+
+        lines.append("| 流 | 角色 | 格式 | 采样率 | 来源文件 |")
         lines.append("|---|---|---|---|---|")
         for s in streams:
             name = Path(s.get("path", "")).name if s.get("path") else "(main)"
             role = (s.get("role") or {}).get("role", s.get("kind", "unknown"))
             fmt = s.get("format", "?")
             mr = s.get("measured_rate")
-            rate = (mr or {}).get("sample_rate_hz") if isinstance(mr, dict) else None
+            stream_rate = (
+                (mr or {}).get("sample_rate_hz") if isinstance(mr, dict) else None
+            )
+            rate = stream_rate
+            if _ms_measured is not None and stream_rate is not None:
+                # 有权威值时以它为准（两者都存在时说明口径可能不同）。
+                rate = _ms_measured["value"]
+            elif _ms_measured is not None and stream_rate is None:
+                # 流缓存缺失但已有权威实测值 → 用它（不再显示"未知"）。
+                rate = _ms_measured["value"]
             rate_str = f"{rate} Hz" if rate is not None else "未知"
             src = s.get("path", "N/A")
             lines.append(f"| {name} | {role} | {fmt} | {rate_str} | `{src}` |")
+
     else:
         # 单文件数据集没有流概念；说明清楚而非笼统的"无流登记表"。
         if context.meta.get("source"):
@@ -127,6 +149,22 @@ def _build_dataset_overview(context: RunContext) -> str:
             )
         else:
             lines.append("（无流登记表）")
+
+    # ---- 采样率口径（不依赖流登记表，单文件数据集同样需要）----
+    #
+    # 呈现纪律：即使实测与声明一致也**同时给出两个数值**，
+    # 否则用户无法判断偏差的方向与量级。
+    from app.tools.metrics_store import describe as _describe_rate
+
+    rate_desc = _describe_rate(context)
+    if rate_desc.get("measured_hz") is not None or rate_desc.get("nominal_hz"):
+        lines.append("")
+        lines.append(f"**采样率口径**：{rate_desc['text']}")
+        if rate_desc.get("nominal_hz") is not None:
+            lines.append(
+                "> 说明：声明值是设备设置的设计目标，实测值才是数据的实际表现，"
+                "二者用容差判断是否一致——接近但不完全相等属正常。"
+            )
 
     # ---- 模态矩阵（能力标签有无对照表）----
     #
