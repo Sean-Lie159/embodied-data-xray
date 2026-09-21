@@ -37,6 +37,7 @@ from agents.decorators import tool
 
 from app.agent.context import RunContext
 from app.config import get_settings
+from app.tools._data_access import resolve_default_table_name, resolve_table_name
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -896,16 +897,21 @@ def _diagnose_visual(
 
 
 def check_dataset_quality_impl(
-    context: RunContext, settings=None,
+    context: RunContext, settings=None, table: str | None = None,
 ) -> dict[str, Any]:
     """执行数据集质检（L1 硬门禁 + L2/L3 诊断，分层判定）。
 
     Args:
         context: 运行时上下文（读 df / meta）。
         settings: 可选配置覆盖（测试注入用）。
+        table: 可选，要质检的表名（缺省=主表）。多表数据集里"每张表各自的
+            质量问题完全不同"——主时钟表该查时间戳单调性，末端位置表该查
+            越界与抖动。此前本工具无此参数，**只能质检主表**，是唯一无法
+            对非主表做质检的分析工具（见设计文档 §4.4）。
 
     Returns:
         分层质检返回结构，见模块 docstring 与设计文档 §5.3.2。
+        表不存在时返回 table_not_found（含 available_tables 等候选信息）。
     """
     settings = settings or get_settings()
 
@@ -918,19 +924,49 @@ def check_dataset_quality_impl(
         }
 
     dataset = context.dataset_id
-    df = context.df
+
+    # 取表：显式给 table 时经统一入口解析（惰性读取，**不替换主表**）。
+    #
+    # 纪律：表不存在时**如实返回 table_not_found 并附候选清单**，不得静默回退
+    # 主表——静默回退会让模型以为"我质检了末端表"，实际质检的是主表，
+    # 结论被张冠李戴（比报错危险得多）。
+    checked_table: str | None = None
+    if table is not None:
+        resolved = resolve_table_name(context, table)
+        if not resolved.get("success"):
+            # 原样透传结构化错误（含 available_tables / default_table），
+            # 只补上这是"质检"场景与本工具的 check 名，便于模型理解。
+            out = dict(resolved)
+            out["check"] = "check_dataset_quality"
+            out["user_message"] = f"质检未能执行：{resolved.get('user_message', '')}"
+            return out
+        df = resolved.get("df")
+        checked_table = resolved.get("table_name")
+    else:
+        df = context.df
+        checked_table = resolve_default_table_name(context)
+
     not_audited: list[str] = []
 
     # ---------- L1 硬门禁 ----------
     gate_checks: dict[str, Any] = {}
 
     if df is None or df.empty:
-        # 只有流登记表、无主表（如纯容器/多流目录未合并）。
-        gate_checks["main_table"] = {
-            "result": "skip",
-            "detail": "无主数据表（仅流登记表），L1 主表检查未执行",
-        }
-        not_audited.append("main_table_gate_checks")
+        # 无表可查：只有流登记表（纯容器/多流目录未合并），或指定表的 df 为空。
+        #
+        # 保持既有行为：**标 skip 而非报错**——纯媒体数据集"无有效主表"是合法
+        # 状态，不得因无表就判 fail 或抛错。detail 须区分是"整体无表"还是
+        # "指定表为空"，否则用户会误以为是数据集的问题。
+        if table is not None:
+            detail = f"指定的表 {checked_table or table} 无数据行，L1 检查未执行"
+            gate_checks["main_table"] = {"result": "skip", "detail": detail}
+            not_audited.append("requested_table_gate_checks")
+        else:
+            gate_checks["main_table"] = {
+                "result": "skip",
+                "detail": "无主数据表（仅流登记表），L1 主表检查未执行",
+            }
+            not_audited.append("main_table_gate_checks")
         cols: list[str] = []
     else:
         cols = _numeric_cols(df)
@@ -1120,7 +1156,12 @@ def check_dataset_quality_impl(
     }
 
     # ---- 用户消息：gate 与 diagnostics 必须分别转述（纪律 17）----
-    parts = [f"数据集质检判定：{result}。"]
+    #
+    # 【阶段 4】必须**明确说明质检的是哪张表**：多表数据集里，同一份数据的不同表
+    # 结论可能完全相反（末端表抖动超阈、主时钟表干净）。若不说表名，用户会把
+    # "某张表有问题"误读为"整个数据集有问题"，反之亦然。
+    table_clause = f"（质检对象：表 {checked_table}）" if checked_table else ""
+    parts = [f"数据集质检判定：{result}。{table_clause}"]
     if gate_fails:
         parts.append(f"硬门禁未通过 {len(gate_fails)} 项：{'、'.join(gate_fails)}。")
     elif gate_warns:
@@ -1145,12 +1186,23 @@ def check_dataset_quality_impl(
     user_message = "".join(parts)
 
     # 写回 meta["qc"]，与既有质检工具同款（供 compute_stats / generate_report 读取）。
+    #
+    # 【阶段 4】键名按质检对象区分：对非主表质检时写
+    # `check_dataset_quality::<表名>`，**避免覆盖主表的质检结论**（此前只用一个
+    # 固定键，多表场景下后一次质检会静默覆盖前一次，generate_report 读到的
+    # 是哪张表的结论全看调用顺序——典型的静默数据丢失）。
     qc = context.meta.setdefault("qc", {})
-    qc["check_dataset_quality"] = {
+    qc_key = (
+        "check_dataset_quality"
+        if table is None
+        else f"check_dataset_quality::{checked_table or table}"
+    )
+    qc[qc_key] = {
         "result": result,
         "gate_result": gate_result,
         "diagnostics_result": diag_result,
         "dataset": dataset,
+        "table": checked_table,
         "detail": {
             "gate_failures": gate_fails,
             "gate_warnings": gate_warns,
@@ -1164,6 +1216,10 @@ def check_dataset_quality_impl(
         "success": True,
         "dataset": dataset,
         "check": "check_dataset_quality",
+        # 【阶段 4】质检对象：多表数据集里结果必须连同表名一起被引用，
+        # 否则"某张表有问题"会被误读为"整个数据集有问题"。
+        "table": checked_table,
+        "is_default_table": table is None,
         "result": result,
         # 分层语义必须分别给出，模型据此分别转述。
         "gate": {
@@ -1195,7 +1251,9 @@ def check_dataset_quality_impl(
 
 
 @tool
-def check_dataset_quality(wrapper: RunContextWrapper[RunContext]) -> dict:
+def check_dataset_quality(
+    wrapper: RunContextWrapper[RunContext], table: str | None = None
+) -> dict:
     """对已加载数据集做质检（分层：硬门禁 + 诊断项）。
 
     一次调用即返回全部检查结果，不需逐项调用。返回结构分两层，**必须分别
@@ -1213,10 +1271,20 @@ def check_dataset_quality(wrapper: RunContextWrapper[RunContext]) -> dict:
     中的项是**未检查**，不得说成"通过了质检"。所有阈值均为默认值、
     未经该数据集验证，如需按数据集调整请提示用户改配置。
 
+    涉及多张表时**每张表须分别质检**：不同表的质量问题性质不同（主时钟表查
+    时间戳单调性，末端位置表查越界与抖动），结论不可互相代替。转述时必须带上
+    ``table`` 字段说明质检对象，不得把某张表的结论说成整个数据集的结论。
+
+    Args:
+        table: 可选，要质检的表名（缺省=主表）。表名先经 list_tables 确认；
+            不确定表名时不要猜测。传了不存在的表会返回 table_not_found 及
+            可用表清单，**不会**静默回退到主表。
+
     Returns:
-        分层质检返回：result（pass/warn/fail，只有 gate 能判 fail）、gate
-        （{result, checks, failed}）、diagnostics（{result, checks, warned}）、
-        measurements、thresholds、threshold_source（default/dataset_override）、
+        分层质检返回：table（实际质检的表名）、is_default_table、result
+        （pass/warn/fail，只有 gate 能判 fail）、gate（{result, checks,
+        failed}）、diagnostics（{result, checks, warned}）、measurements、
+        thresholds、threshold_source（default/dataset_override）、
         affected_episodes、not_audited、user_message。
     """
-    return check_dataset_quality_impl(wrapper.context)
+    return check_dataset_quality_impl(wrapper.context, table=table)
