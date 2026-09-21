@@ -741,6 +741,7 @@ def classify_table_stream(
     columns: list[str],
     sample: pd.DataFrame | None,
     nrows: int,
+    fmt: str | None = None,
 ) -> dict[str, Any]:
     """综合第 1 层词典线索与第 2 层内容指纹，给出流的语义标签（裁判）。
 
@@ -758,6 +759,11 @@ def classify_table_stream(
         columns: 列名列表。
         sample: 表格样本 DataFrame（前若干行）；可为 None（无样本时仅用词典）。
         nrows: 全表行数（不含表头）。
+        fmt: 可选格式提示（如 "json"/"csv"）。**仅用于区分"配置型 JSON"**：
+            JSON 顶层若为单对象（无行列表键），其列名即对象的键、行数为 0——
+            这是**有内容的配置**而非空流。CSV 不存在这种形态，故只有显式
+            std 为 json（或由扩展名判定）时才启用该分支，避免把"只有少数几行
+            的 CSV"误判成配置文件（实测：`controller_poses.csv` 2 行曾被误判）。
 
     Returns:
         dict，含 kind、semantic_label、label_evidence、label_confidence、
@@ -769,11 +775,59 @@ def classify_table_stream(
         docs/技术债.md）或第 4 层用户确认。
     """
     # 1. 空流检测。
+    #
+    # **关键区分（真实缺陷修正，2026-09-21）**：`nrows == 0` 有两种完全不同的
+    # 成因，必须分开处理，否则会把有内容的配置文件误判成"空流"：
+    #
+    #   (a) 文件确实是逐行数据但一行都没有 → 真·空流；
+    #   (b) 文件是**单个 JSON 对象（配置/元信息）**，不是行列表 → 无法用
+    #       "行数"衡量，但它**有内容**（如 session.json 的 nominal_hz、
+    #       hand_mode 等）。
+    #
+    # 事故场景：Forsense-G7 手套数据的 session.json（322 字节、9 个字段）
+    # 被判为"未使用/空流"、status="empty"，导致关键录制参数（标称采样率
+    # 120Hz、双手模式）对下游完全不可见，模型只能看到"空"。
+    #
+    # 判据：列名即 JSON 顶层键（`_read_frame_impl` 对 dict 型 JSON 走
+    # `_json_row_list`；解析失败/无行列表键才是 0 行）。因此**有键但 0 行**
+    # → 配置型 JSON；**无键且 0 行** → 真·空流。
+    #
+    # 必须同时确认"这是 JSON 形态"：CSV 也会有少量行 + 有列名，若只看
+    # "有列名"就会把 2 行的 CSV 误判成配置文件（实测回归：
+    # `controller_poses.csv` 被判 config 而非 empty）。
+    _is_json_like = (
+        (fmt or "").lower() in ("json",)
+        or name.lower().endswith(".json")
+    )
+    if nrows <= EMPTY_STREAM_MAX_ROWS and columns and _is_json_like:
+        return {
+            "kind": "config",
+            "semantic_label": "配置文件（非逐行数据）",
+            "label_evidence": (
+                f"该文件是单个 JSON 对象而非逐行表格（顶层 {len(columns)} 个字段："
+                f"{'、'.join(str(c) for c in columns[:8])}"
+                f"{'…' if len(columns) > 8 else ''}）——"
+                "内容按「配置/元信息」处理，不作为数据流参与对齐与统计"
+            ),
+            "label_confidence": "high",
+            "status": "config",
+            "channels": [],
+            "timestamp_column": None,
+            "quaternion_groups": [],
+            "imu_axes": None,
+            # 顶层键原样透出：这是配置型文件唯一的意义所在，不能让下游
+            # 只看到"空"而看不到内容。
+            "config_keys": [str(c) for c in columns],
+        }
+
     if nrows <= EMPTY_STREAM_MAX_ROWS:
         return {
             "kind": "unknown",
             "semantic_label": "未使用/空流",
-            "label_evidence": f"行数 {nrows} ≤ {EMPTY_STREAM_MAX_ROWS}，判定为空流",
+            "label_evidence": (
+                f"该文件解析后无任何数据行（行数 {nrows} ≤ "
+                f"{EMPTY_STREAM_MAX_ROWS}）且无字段信息，判定为空流"
+            ),
             "label_confidence": "high",
             "status": "empty",
             "channels": [],

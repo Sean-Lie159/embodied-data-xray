@@ -132,7 +132,11 @@ def test_diagnostics_note_is_communicated(settings) -> None:
 
 
 def test_user_message_separates_gate_and_diagnostics(settings) -> None:
-    """user_message 必须分别转述 gate 与 diagnostics（纪律 17 的落地）。"""
+    """user_message 必须分别转述两层，且**面向用户可读**（纪律 16 的落地）。
+
+    2026-09-21 起措辞改为面向用户的中文（如「必须处理的问题」「参考提示」），
+    不再直接抛 `gate`/`diagnostics` 这类内部术语。
+    """
     n = 300
     rng = np.random.default_rng(1)
     t = np.arange(n) * 0.1
@@ -144,10 +148,127 @@ def test_user_message_separates_gate_and_diagnostics(settings) -> None:
     })
     res = check_dataset_quality_impl(_ctx(df), settings)
     msg = res["user_message"]
-    assert "硬门禁" in msg
-    assert "诊断项" in msg
-    # 必须明确诊断项不等于数据有问题。
+    # 两层必须分开表述。
+    assert "必须处理的问题" in msg
+    assert "参考提示" in msg
+    # 必须明确参考提示不等于数据有问题。
     assert "不等于数据有问题" in msg
+
+
+def test_user_message_avoids_internal_jargon(settings) -> None:
+    """**可读性守护**：面向用户的消息不得直接出现内部规则码与层级术语。
+
+    用户反馈原话："gate、Diagnostics、idle_ratio、action_spike....这些都是什么？"
+    因此这些标识只能出现在结构化字段里，不得出现在 user_message 中。
+    """
+    n = 200
+    rng = np.random.default_rng(3)
+    t = np.arange(n) * 0.1
+    df = pd.DataFrame({
+        "episode_index": [0] * n,
+        "timestamp": t,
+        "action_joint0": np.sin(2 * np.pi * 6 * t) * 10 + rng.normal(0, 0.4, n),
+        "action_joint1": np.linspace(0, 5, n),
+        "action_joint2": np.zeros(n),
+    })
+    df.loc[0:15, "action_joint2"] = np.nan  # 触发硬门禁，确保两层都有内容
+
+    res = check_dataset_quality_impl(_ctx(df), settings)
+    msg = res["user_message"]
+
+    for jargon in (
+        "gate", "diagnostics", "nan_inf", "idle_ratio", "action_spike",
+        "action_jerk", "robot_induced_pause", "arm_shaking", "path_efficiency",
+        "actuator_saturation", "visual_quality", "not_audited",
+        "timestamp_monotonic", "frame_loss", "schema_consistency",
+        "fps_valid", "episode_bounds",
+    ):
+        assert jargon not in msg, f"用户消息不应出现内部术语 {jargon!r}：{msg}"
+
+
+def test_every_rule_has_chinese_metadata(settings) -> None:
+    """**每条规则都必须有中文名与白话说明**（防新增规则时漏配）。"""
+    from app.tools.check_dataset_quality import _RULE_META
+
+    n = 100
+    df = pd.DataFrame({
+        "timestamp": np.arange(n) * 0.01,
+        "action_joint0": np.sin(np.arange(n) * 0.2),
+    })
+    res = check_dataset_quality_impl(_ctx(df), settings)
+
+    all_codes = set(res["gate"]["checks"]) | set(res["diagnostics"]["checks"])
+    for code in all_codes:
+        assert code in _RULE_META, f"规则 {code} 未登记中文说明"
+        meta = _RULE_META[code]
+        for field in ("label", "what", "terms", "advice"):
+            assert meta.get(field), f"规则 {code} 缺少 {field}"
+
+
+def test_readable_summary_is_all_chinese_keys(settings) -> None:
+    """可读摘要必须使用中文键（供 UI 面板与模型直接转述）。"""
+    n = 200
+    df = pd.DataFrame({
+        "episode_index": [0] * n,
+        "timestamp": np.arange(n) * 0.01,
+        "action_joint0": np.sin(np.arange(n) * 0.3) * 10,
+        "action_joint1": np.linspace(0, 5, n),
+    })
+    df.loc[0:20, "action_joint1"] = np.nan
+    res = check_dataset_quality_impl(_ctx(df), settings)
+
+    rs = res["readable_summary"]
+    assert set(rs) == {
+        "结论", "检查对象", "必须处理的问题", "需要注意", "参考提示", "本次未检查",
+    }
+    # 未检查项必须已中文化（不是内部码）。
+    assert "visual_quality" not in rs["本次未检查"]
+
+
+def test_layer_labels_are_human_readable(settings) -> None:
+    """两层结构须带中文名与说明，便于模型转述时取用。"""
+    res = check_dataset_quality_impl(_ctx(_clean_df()), settings)
+    assert "必须处理的问题" in res["gate"]["label"]
+    assert "参考提示" in res["diagnostics"]["label"]
+    assert res["gate"]["explain"]
+    assert res["diagnostics"]["explain"]
+    # 每层的 result 也要有中文版。
+    assert res["gate"]["result_zh"]
+    assert res["diagnostics"]["result_zh"]
+
+
+def test_glossary_provides_plain_language(settings) -> None:
+    """glossary 须提供术语白话解释（模型首次提到指标时应转述）。"""
+    res = check_dataset_quality_impl(_ctx(_clean_df()), settings)
+    g = res["glossary"]
+    assert "path_efficiency" in g
+    assert "白话" in g["path_efficiency"]
+    assert g["path_efficiency"]["名称"] == "路径效率"
+
+
+def test_nan_inf_reports_judged_by_column(settings) -> None:
+    """nan_inf 须说明判定依据是逐字段（否则会出现"整体很低却 fail"的困惑）。
+
+    构造：50 列中仅 1 列全空 → 整体比例 1/50 = 2%（低于 5% 阈值），
+    但该列 100% 缺失必须判 fail。这正是让用户困惑的场景，
+    因此返回里必须同时给出整体值、最差列值，并在详情中解释。
+    """
+    n = 300
+    data = {"timestamp": np.arange(n) * 0.01}
+    for i in range(49):
+        data[f"ok_{i}"] = np.sin(np.arange(n) * 0.1)
+    data["broken"] = np.full(n, np.nan)  # 单列全空
+
+    res = check_dataset_quality_impl(_ctx(pd.DataFrame(data)), settings)
+    chk = res["gate"]["checks"]["nan_inf"]
+    assert chk["result"] == "fail"
+    assert chk["judged_by"] == "per_column"
+    assert chk["worst_column"] == "broken"
+    assert chk["value_worst_column"] == 1.0
+    # 整体值确实低于阈值（被摊薄），但判定仍为 fail —— 这正是需要解释的点。
+    assert chk["value_overall"] < chk["threshold"]
+    assert "摊薄" in chk["detail"]
+    assert "broken" in chk["detail"]
 
 
 # ---------------------------------------------------------------------------

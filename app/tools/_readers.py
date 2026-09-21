@@ -426,6 +426,7 @@ class _JsonReader:
         # 改经注册表，回调将造成无限递归）。
         from app.tools._data_access import _json_row_list
         from app.tools.load_dataset import _detect_encoding
+        from app.tools._sniffing import _JSON_ROW_LIST_KEYS
 
         import json as _json
 
@@ -434,7 +435,25 @@ class _JsonReader:
                 Path(path).read_text(encoding=_detect_encoding(Path(path).read_bytes()))
             )
             rows = _json_row_list(obj)
-            return [str(k) for k in rows[0].keys()] if rows else []
+            if rows:
+                return [str(k) for k in rows[0].keys()]
+            # **配置型 JSON（顶层是单个对象、无行列表键）**：返回顶层键。
+            #
+            # 为什么必须返回键而不是空列表（真实缺陷修正，2026-09-21）：
+            # 此前返回 []，导致调用方（classify_table_stream）既看不到行、
+            # 也看不到字段，只能判成"空流"——而文件其实有内容（如
+            # session.json 的 nominal_hz/hand_mode）。返回顶层键后，分类器
+            # 可据"有键但 0 行"识别出这是配置而非空文件，并把键透传给下游。
+            #
+            # **例外：显式空数据文件**。若顶层**已含行列表键但该键为空**
+            # （如 ``{"data": []}``），这是文件在明确声明"没有数据行"，
+            # 不属配置——返回 [] 走"空流"分支（否则会把空数据表误标成
+            # 配置，实测：骨架里的 schema/camera JSON 正是这种）。
+            if isinstance(obj, dict) and obj:
+                if any(k in obj for k in _JSON_ROW_LIST_KEYS):
+                    return []
+                return [str(k) for k in obj.keys()]
+            return []
         except Exception:  # noqa: BLE001
             return None
 

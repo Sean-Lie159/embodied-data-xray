@@ -67,6 +67,163 @@ _NON_ACTION_HINTS = (
     "sequence", "step", "id",
 )
 
+# ---------------------------------------------------------------------------
+# 可读性元数据：把内部规则码翻译成用户能懂的说明
+# ---------------------------------------------------------------------------
+#
+# **为什么需要（真实可用性缺陷，2026-09-21）**：初版返回的键名是
+# `gate` / `diagnostics` / `idle_ratio` / `action_spike` 等内部术语，
+# 用户在对话里看到"action_spike: warn"完全不知道在说什么——工具是给人用的，
+# 内部命名不该直接暴露。这里为每条规则提供：
+#   label  —— 中文名（给人看）
+#   what   —— 这条在检查什么（一句话，含"为什么重要"）
+#   terms  —— 关键术语的白话解释（首次出现时模型应转述）
+#   advice —— 检出后建议怎么做
+_RULE_META: dict[str, dict[str, str]] = {
+    # ---- 硬门禁（确定性错误）----
+    "nan_inf": {
+        "label": "缺失值与异常值",
+        "what": "统计空值（NaN）与无穷值（Inf）的比例。",
+        "terms": "NaN=该格没有数据；Inf=数值溢出到无穷大。二者都会让下游计算失真。",
+        "advice": "定位到具体列后，确认是设备未输出该通道还是导出遗漏。",
+    },
+    "timestamp_monotonic": {
+        "label": "时间戳顺序",
+        "what": "检查时间戳是否单调递增（时间只能往前走）。",
+        "terms": "单调递增=后一帧的时间不早于前一帧。回退通常意味着时钟跳变或行乱序。",
+        "advice": "回退需查时钟源；仅重复（时间相等）通常是正常的，确认后可忽略。",
+    },
+    "frame_loss": {
+        "label": "丢帧",
+        "what": "按声明的采样率推算本应有多少帧，与实际行数比较。",
+        "terms": "丢帧=录制过程中某些时刻的数据没被记录，表现为时间上出现空档。",
+        "advice": "若数据本身是低频采样，请先声明正确的 fps，否则会误判。",
+    },
+    "schema_consistency": {
+        "label": "跨段结构一致性",
+        "what": "比较各 episode 的列集合是否一致。",
+        "terms": "结构不一致=不同片段的字段对不上，拼接后会出现错列。",
+        "advice": "确认是否存在部分片段缺字段的情况。",
+    },
+    "fps_valid": {
+        "label": "采样率声明合法性",
+        "what": "检查声明的 fps 是否为正数，并与实测采样率对照。",
+        "terms": "fps=每秒记录多少帧。声明 120 但实测 100 说明实际未达标。",
+        "advice": "以实测值为准；声明与实测不符时请核对设备配置。",
+    },
+    "episode_bounds": {
+        "label": "片段边界自洽性",
+        "what": "检查每个 episode 的时间是否有倒流或空片段。",
+        "terms": "episode=一段独立的录制片段。",
+        "advice": "边界矛盾的片段建议单独排查。",
+    },
+    # ---- 诊断项（启发式提示）----
+    "idle_ratio": {
+        "label": "静止占比",
+        "what": "统计动作幅度很小（近似不动）的时间占多少。",
+        "terms": "占比高说明机器人大段时间没动，可能是等待指令，也可能是任务正常需要停顿。",
+        "advice": "结合任务判断：放置、按压类任务本来就多停顿。",
+    },
+    "action_spike": {
+        "label": "动作突跳",
+        "what": "找出动作曲线里突然大幅度跳变的时刻。",
+        "terms": "突跳=相邻两帧之间动作量剧变，常见于碰撞、人工拖拽或急停。",
+        "advice": "对照信号曲线确认是真实操作还是异常；快速动作本身也会产生突跳。",
+    },
+    "actuator_saturation": {
+        "label": "执行器饱和",
+        "what": "比较下发的指令与下一时刻的实际状态差多少。",
+        "terms": "饱和=指令要求的位置实际达不到，可能是到了关节限位或电机力矩不足。",
+        "advice": "需要同时有指令列与状态列才能检查；无配对时该项跳过。",
+    },
+    "action_jerk": {
+        "label": "动作抖动程度",
+        "what": "衡量动作里高频抖动占多大比例（低频趋势之外的部分）。",
+        "terms": "抖动=本应平滑的动作里出现细碎的高频波动，手抖或信号噪声都会造成。",
+        "advice": "手套/遥操作数据普遍偏抖，属正常；若影响训练可考虑滤波。",
+    },
+    "robot_induced_pause": {
+        "label": "中途停顿段",
+        "what": "找出持续时间较长的完全静止段。",
+        "terms": "停顿=机器人停下来了。可能是等待、演示中断，也可能是人为暂停。",
+        "advice": "若为演示中断，可考虑切分或标记为噪声片段。",
+    },
+    "arm_shaking": {
+        "label": "异常振动",
+        "what": "用加速度的符号翻转频率衡量高频振动程度。",
+        "terms": "振动=机械臂/手部出现来回抖动，可能是机械共振或信号噪声。",
+        "advice": "手套类数据本身抖动大，需结合设备特性判断。",
+    },
+    "path_efficiency": {
+        "label": "路径效率",
+        "what": "比较起点到终点的直线距离与实际走过的总路程。",
+        "terms": "效率=直线距离÷实际路程，接近 1 表示走得很直接，接近 0 表示来回绕。",
+        "advice": "手的自然往返（如反复擦拭）会天然偏低，不一定是问题。",
+    },
+    "visual_quality": {
+        "label": "视频质量",
+        "what": "检查视频的分辨率、时长等元信息。",
+        "terms": "逐帧的明暗与模糊检查需要额外解码依赖，当前未做。",
+        "advice": "若需要逐帧画质检查，请告知。",
+    },
+}
+
+
+# 判定结果的中文表述（避免把 pass/fail 这类英文直接抛给用户）。
+_RESULT_ZH = {
+    "pass": "通过",
+    "warn": "有提示项（数据可用，但有指标偏高需关注）",
+    "fail": "未通过（存在必须处理的确定性错误）",
+}
+
+
+def _decorate_checks(checks: dict[str, Any]) -> dict[str, Any]:
+    """给每条检查结果附加中文名与白话说明（提升可读性）。
+
+    Args:
+        checks: {规则码: 结果 dict}。
+
+    Returns:
+        同结构的新 dict，每项多了 label / what / terms / advice（若该规则已登记）。
+        未登记的规则原样保留——**不编造说明**。
+    """
+    out: dict[str, Any] = {}
+    for code, payload in checks.items():
+        if not isinstance(payload, dict):
+            out[code] = payload
+            continue
+        meta = _RULE_META.get(code)
+        merged = dict(payload)
+        if meta:
+            # label 放前面更易读；其余键顺序不变。
+            ordered: dict[str, Any] = {
+                "label": meta["label"],
+                "what": meta["what"],
+                "terms": meta["terms"],
+                "advice": meta["advice"],
+            }
+            ordered.update(merged)
+            out[code] = ordered
+        else:
+            out[code] = merged
+    return out
+
+
+def _humanize_rule_list(codes: list[str]) -> str:
+    """把规则码列表转成**纯中文**名称串（面向用户，不带内部码）。
+
+    设计取舍（2026-09-21 用户反馈）：初版写成"中文名（规则码）"以便追溯，
+    但用户明确表示看不懂 `action_spike` 这类标识——**面向用户的文字里
+    不应出现内部术语**。内部码仍在结构化字段中保留（`failed`/`warned`/
+    `readable_summary.规则码`），需要追溯时程序可读，不必污染给用户的表述。
+    """
+    if not codes:
+        return ""
+    return "、".join(
+        _RULE_META[c]["label"] if c in _RULE_META else c
+        for c in codes
+    )
+
 
 # ---------------------------------------------------------------------------
 # 小工具
@@ -972,17 +1129,40 @@ def check_dataset_quality_impl(
         cols = _numeric_cols(df)
 
         # 1) NaN/Inf
+        #
+        # **可读性要点**：把"总体比例"与"逐列比例"分别标注清楚。
+        # 此前只给一个 value（总体），但判定用的是逐列——于是会出现
+        # "value 2% < threshold 5% 却判 fail"这种看起来自相矛盾的结果
+        # （某一列 100% 为空，整体被摊薄）。这会让人怀疑工具算错了。
         nan_ratio, nan_per_col = _nan_inf_ratio(df, cols)
         offenders = {k: v for k, v in nan_per_col.items() if v > settings.quality_gate_nan_ratio}
+        sorted_offenders = dict(sorted(offenders.items(), key=lambda kv: -kv[1])[:10])
+        if offenders:
+            worst_col, worst_ratio = next(iter(sorted_offenders.items()))
+            detail = (
+                f"共 {len(offenders)} 个字段的缺失/异常值比例超过 "
+                f"{settings.quality_gate_nan_ratio:.0%}，最严重的是「{worst_col}」"
+                f"（{worst_ratio:.1%} 为空）。表格整体缺失率为 {nan_ratio:.1%}"
+                "（整体值被未缺失的字段摊薄，因此要按字段看）。"
+            )
+        else:
+            detail = (
+                f"各字段缺失/异常值比例均未超过 "
+                f"{settings.quality_gate_nan_ratio:.0%}（整体 {nan_ratio:.1%}）。"
+            )
         gate_checks["nan_inf"] = {
             "result": _FAIL if offenders else _PASS,
-            "value": nan_ratio,
+            # 判定依据：逐字段（而非整体）——避免被摊薄掩盖。
+            "judged_by": "per_column",
+            "worst_column": (
+                next(iter(sorted_offenders)) if sorted_offenders else None),
+            "value_overall": nan_ratio,
+            "value_worst_column": (
+                next(iter(sorted_offenders.values()))
+                if sorted_offenders else None),
             "threshold": settings.quality_gate_nan_ratio,
-            "per_column": dict(sorted(offenders.items(), key=lambda kv: -kv[1])[:10]),
-            "detail": (
-                f"NaN/Inf 总体比例 {nan_ratio}，{len(offenders)} 个列超阈"
-                if offenders else f"NaN/Inf 总体比例 {nan_ratio}，未超阈"
-            ),
+            "per_column": sorted_offenders,
+            "detail": detail,
         }
 
         # 2) 时间戳单调性
@@ -1160,30 +1340,86 @@ def check_dataset_quality_impl(
     # 【阶段 4】必须**明确说明质检的是哪张表**：多表数据集里，同一份数据的不同表
     # 结论可能完全相反（末端表抖动超阈、主时钟表干净）。若不说表名，用户会把
     # "某张表有问题"误读为"整个数据集有问题"，反之亦然。
-    table_clause = f"（质检对象：表 {checked_table}）" if checked_table else ""
-    parts = [f"数据集质检判定：{result}。{table_clause}"]
+    #
+    # **可读性要求（2026-09-21 用户反馈）**：此前消息里直接出现 `gate` /
+    # `diagnostics` / `idle_ratio` 等内部术语，用户看不懂"action_spike: warn"
+    # 是什么意思。现在一律使用中文标签，并在括号内说明白话含义。
+    table_clause = f"（本次检查对象：{checked_table}）" if checked_table else ""
+    parts = [
+        f"质检结论：{_RESULT_ZH.get(result, result)}{table_clause}。"
+    ]
     if gate_fails:
-        parts.append(f"硬门禁未通过 {len(gate_fails)} 项：{'、'.join(gate_fails)}。")
+        parts.append(
+            f"\n\n【必须处理的问题】{len(gate_fails)} 项——"
+            + _humanize_rule_list(gate_fails)
+            + "。这类是确定性错误（不是「可能有问题」，而是确实不对），"
+            "建议修正后再使用数据。"
+        )
     elif gate_warns:
-        parts.append(f"硬门禁有 {len(gate_warns)} 项提示：{'、'.join(gate_warns)}。")
+        parts.append(
+            f"\n\n【需要注意】{len(gate_warns)} 项——"
+            + _humanize_rule_list(gate_warns)
+            + "。不一定是错误，确认后可忽略。"
+        )
     else:
-        parts.append("硬门禁全部通过。")
+        parts.append("\n\n【必须处理的问题】无——数据的基本完整性没有问题（无缺失值、时间顺序正常、无明显丢帧等）。")
+
     if diag_warns:
         parts.append(
-            f"诊断项有 {len(diag_warns)} 项超阈（{'、'.join(diag_warns)}）——"
-            "诊断项为启发式提示，**不等于数据有问题**（阈值与任务相关，"
-            "高空闲比对 push/放置类任务可能是正常的），请结合任务类型判断。"
+            f"\n\n【参考提示】{len(diag_warns)} 项指标偏高——"
+            + _humanize_rule_list(diag_warns)
+            + "。**这些只是提示，不等于数据有问题**：判定阈值与任务类型强相关，"
+            "比如「静止占比高」对放置、按压类任务完全正常，对连续抓取类才可疑。"
+            "请结合你的任务特点判断。"
         )
     else:
-        parts.append("诊断项未见异常。")
+        parts.append("\n\n【参考提示】各诊断指标均在正常范围。")
+
     if not_audited:
+        readable = []
+        for code in dict.fromkeys(not_audited):
+            readable.append(
+                _RULE_META[code]["label"] if code in _RULE_META else code)
         parts.append(
-            f"另有 {len(not_audited)} 项未检查（{'、'.join(dict.fromkeys(not_audited))}）"
-            "——**未检查不等于通过**。"
+            f"\n\n【本次未检查】{len(readable)} 项——"
+            + "、".join(readable)
+            + "。**未检查不等于通过**，这些项目前无法判定。"
         )
-    parts.append("阈值均为默认值，未经该数据集验证，可在配置中按数据集调整。")
+    parts.append(
+        "\n\n说明：以上判定阈值均为默认值，未针对本数据集校准；"
+        "不同任务类型的合理范围差异很大，如需按数据集调整请告知。"
+    )
 
     user_message = "".join(parts)
+
+    # 结构化可读摘要：供 UI 面板与模型转述使用（键名全中文，避免内部术语）。
+    readable_summary = {
+        "结论": _RESULT_ZH.get(result, result),
+        "检查对象": checked_table or "主表",
+        "必须处理的问题": [
+            {"名称": _RULE_META[c]["label"] if c in _RULE_META else c,
+             "含义": _RULE_META[c]["what"] if c in _RULE_META else "",
+             "建议": _RULE_META[c]["advice"] if c in _RULE_META else "",
+             "规则码": c}
+            for c in gate_fails
+        ],
+        "需要注意": [
+            {"名称": _RULE_META[c]["label"] if c in _RULE_META else c,
+             "规则码": c}
+            for c in gate_warns
+        ],
+        "参考提示": [
+            {"名称": _RULE_META[c]["label"] if c in _RULE_META else c,
+             "含义": _RULE_META[c]["what"] if c in _RULE_META else "",
+             "建议": _RULE_META[c]["advice"] if c in _RULE_META else "",
+             "规则码": c}
+            for c in diag_warns
+        ],
+        "本次未检查": [
+            _RULE_META[c]["label"] if c in _RULE_META else c
+            for c in dict.fromkeys(not_audited)
+        ],
+    }
 
     # 写回 meta["qc"]，与既有质检工具同款（供 compute_stats / generate_report 读取）。
     #
@@ -1221,20 +1457,41 @@ def check_dataset_quality_impl(
         "table": checked_table,
         "is_default_table": table is None,
         "result": result,
+        "result_zh": _RESULT_ZH.get(result, result),
         # 分层语义必须分别给出，模型据此分别转述。
+        # 每层附中文名与说明，避免把 gate/diagnostics 这类内部术语直接抛给用户。
         "gate": {
+            "label": "必须处理的问题（确定性检查）",
+            "explain": (
+                "这一层的任何一项不通过，都说明数据确实存在错误——"
+                "不是「可能有问题」，而是客观上不对。"
+            ),
             "result": gate_result,
-            "checks": gate_checks,
+            "result_zh": _RESULT_ZH.get(gate_result, gate_result),
+            "checks": _decorate_checks(gate_checks),
             "failed": gate_fails,
         },
         "diagnostics": {
+            "label": "参考提示（统计性观察）",
+            "explain": (
+                "这一层是统计指标的观察结果，**超阈不等于数据有问题**："
+                "判定阈值与任务类型强相关（如静止占比高对放置类任务完全正常），"
+                "仅供你结合任务特点参考。这一层**永远不会**把结论升级为「未通过」。"
+            ),
             "result": diag_result,
-            "checks": diag_checks,
+            "result_zh": _RESULT_ZH.get(diag_result, diag_result),
+            "checks": _decorate_checks(diag_checks),
             "warned": diag_warns,
             "note": (
                 "诊断项为启发式提示，**永不自动升级为 fail**。"
                 "阈值与任务相关，请结合任务类型判断。"
             ),
+        },
+        # 纯中文的可读摘要（供 UI 面板与模型转述；无内部术语）。
+        "readable_summary": readable_summary,
+        "glossary": {
+            code: {"名称": m["label"], "含义": m["what"], "白话": m["terms"]}
+            for code, m in _RULE_META.items()
         },
         "measurements": {
             "n_rows": int(df.shape[0]) if df is not None else 0,

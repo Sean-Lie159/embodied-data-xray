@@ -1818,6 +1818,80 @@ def _read_table_columns(path: Path) -> list[str] | None:
     return list(result.columns) if result.ok else None
 
 
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    """读取配置型 JSON 的顶层对象（**只用于非逐行数据的配置/元信息文件**）。
+
+    与 ``_read_frame_impl`` 的分工：后者把 JSON 展成 DataFrame（面向数据表），
+    本函数保留原始的键值结构（面向配置），因为配置的语义在"键 → 值"映射里，
+    展成表反而丢失信息。
+
+    Args:
+        path: JSON 文件路径。
+
+    Returns:
+        顶层 dict；文件是数组/标量或解析失败时返回 None。
+    """
+    import json as _json
+
+    try:
+        obj = _json.loads(
+            path.read_text(encoding=_detect_encoding(path.read_bytes()))
+        )
+    except (ValueError, OSError, UnicodeDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+# 配置值透出上限：单个值的字符串长度与列表元素数（防长数组撑爆上下文）。
+_CONFIG_VALUE_MAX_CHARS = 200
+_CONFIG_LIST_MAX_ITEMS = 20
+_CONFIG_MAX_KEYS = 60
+
+
+def _compact_config(obj: dict[str, Any]) -> dict[str, Any]:
+    """压缩配置 JSON 以便安全透出到模型上下文（保留语义、抑制体积）。
+
+    规则：
+    - 标量（str/int/float/bool/None）原样保留；
+    - 短列表（元素为标量且 ≤ 上限）保留，超限截断并标注总数；
+    - 长字符串截断；
+    - 嵌套 dict/list 只报类型与规模（不递归展开），避免深层结构膨胀。
+
+    Args:
+        obj: 配置顶层对象。
+
+    Returns:
+        压缩后的 dict（键数亦受上限约束，超出标注 ``_truncated_keys``）。
+    """
+    out: dict[str, Any] = {}
+    keys = list(obj.keys())
+    for k in keys[:_CONFIG_MAX_KEYS]:
+        v = obj[k]
+        if isinstance(v, (bool, int, float)) or v is None:
+            out[str(k)] = v
+        elif isinstance(v, str):
+            out[str(k)] = (
+                v if len(v) <= _CONFIG_VALUE_MAX_CHARS
+                else v[:_CONFIG_VALUE_MAX_CHARS] + "…"
+            )
+        elif isinstance(v, list):
+            if all(isinstance(x, (bool, int, float, str)) or x is None for x in v):
+                shown = v[:_CONFIG_LIST_MAX_ITEMS]
+                out[str(k)] = (
+                    shown if len(v) <= _CONFIG_LIST_MAX_ITEMS
+                    else [*shown, f"…（共 {len(v)} 项）"]
+                )
+            else:
+                out[str(k)] = f"[嵌套列表，{len(v)} 项]"
+        elif isinstance(v, dict):
+            out[str(k)] = f"{{嵌套对象，{len(v)} 个键}}"
+        else:
+            out[str(k)] = f"<{type(v).__name__}>"
+    if len(keys) > _CONFIG_MAX_KEYS:
+        out["_truncated_keys"] = len(keys) - _CONFIG_MAX_KEYS
+    return out
+
+
 # file_survey 序列化体积上限（字符数）；超出则压缩为分组计数摘要。
 _MAX_SURVEY_CHARS = 50_000
 
@@ -2024,7 +2098,8 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
             raw_sniff = _sniffing.sniff_table_columns(cols)  # 第 1 层词典线索
             sample = _read_table_sample(p)  # 第 2 层内容指纹样本
             klass = _sniffing.classify_table_stream(
-                p.name, cols, sample, nrows or 0
+                p.name, cols, sample, nrows or 0,
+                fmt=p.suffix.lstrip(".").lower(),
             )
             table_sniffs.append(klass)
             candidates.append({
@@ -2035,13 +2110,25 @@ def _load_directory_impl(context: RunContext, dir_path: Path) -> dict[str, Any]:
                 "nrows": nrows,
                 "ncols": ncols,
             })
-            table_info.append({
+            entry: dict[str, Any] = {
                 "file": str(p),  # 完整路径，供流登记表按需定位
                 "name": p.name,
                 "columns": cols[:20],
                 "sniff": klass,
                 "nrows": nrows,
-            })
+            }
+            # 配置型 JSON（顶层单对象、非逐行数据）：把**字段值**解析出来透出。
+            #
+            # 为什么需要：这类文件的全部价值就在内容里（如 session.json 的
+            # nominal_hz=120、hand_mode=both、delay_ns 等录制参数）。若只报
+            # "0 行"，下游（含模型）就完全看不到这些参数——实测正是这样导致
+            # 用户提供的标称采样率无法与工具实测值对照。
+            if klass.get("kind") == "config":
+                cfg = _read_json_object(p)
+                if cfg is not None:
+                    # 只透出标量/短列表，长数组不进上下文（防体积膨胀）。
+                    entry["config"] = _compact_config(cfg)
+            table_info.append(entry)
         except Exception as exc:  # noqa: BLE001 - 单文件探测异常兜底，绝不中断加载
             probe_errors.append({
                 "file": str(p),

@@ -708,6 +708,22 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         for s in streams if s.get("status") == "empty"
     ]
 
+    # 配置文件清单（**不是空流**）：单对象 JSON，无数据行但有配置内容。
+    #
+    # 为什么单列（真实缺陷修正，2026-09-21）：这类文件此前被归入"空流"，
+    # 于是 session.json 里的 nominal_hz=120、hand_mode=both 等关键录制参数
+    # 对模型完全不可见。它们与"空流"的语义正好相反——**空流没有内容，
+    # 配置文件有内容但不是逐行数据**，必须分开呈现。
+    config_files = [
+        {
+            "source": s.get("path"),
+            "semantic_label": s.get("semantic_label"),
+            "label_evidence": s.get("label_evidence"),
+            "keys": s.get("config_keys") or [],
+        }
+        for s in streams if s.get("status") == "config"
+    ]
+
     # --- 标定 -------------------------------------------------------------
     has_calib = bool(capabilities.get("has_calibration"))
     calibration = {"present": has_calib, "parameters": "unknown"}
@@ -762,6 +778,7 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
             p.get("type") == "media_metainfo" for p in context.meta.get("stream_pairs", [])
         ),
         "n_empty_streams": len(empty_streams),
+        "n_config_files": len(config_files),
         "n_user_confirmed": len(user_confirmed_overrides),
         "clock_source": clock_source,
         "n_table_streams": len([s for s in streams if s.get("kind") != "video"]),
@@ -799,6 +816,7 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
         "calibration": calibration,
         "table_streams": other_stream_list,
         "empty_streams": empty_streams,
+        "config_files": config_files,
         "stream_pairs": context.meta.get("stream_pairs", []),
         "user_confirmed_overrides": user_confirmed_overrides,
         "summary": summary,
@@ -808,6 +826,12 @@ def inspect_streams_impl(context: RunContext) -> dict[str, Any]:
             f"已生成设备清单：{len(video_streams)} 路视频、{len(imus)} 个 IMU、"
             f"力通道 {'有' if force['present'] else '无'}、标定{'有' if has_calib else '无'}；"
             f"空流 {len(empty_streams)} 条（已标记未使用）；时钟来源 {clock_source}。"
+            + (
+                f" 另有 {len(config_files)} 个配置文件（"
+                f"{'、'.join(c['source'].split(chr(92))[-1].split('/')[-1] for c in config_files[:5])}"
+                "）——**它们不是空流**，内容含录制参数，见 config_files。"
+                if config_files else ""
+            )
             + (f" {unclassified_hint}" if unclassified_hint else "")
         ),
     }
