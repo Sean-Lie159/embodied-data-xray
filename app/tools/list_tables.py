@@ -26,6 +26,10 @@ from agents import RunContextWrapper
 from agents.decorators import tool
 
 from app.agent.context import RunContext
+from app.tools._data_access import (
+    main_table_candidates,
+    resolve_default_table_name,
+)
 
 # 单次返回的表条目上限（体积护栏）。
 #
@@ -89,58 +93,17 @@ def list_tables_impl(context: RunContext) -> dict[str, Any]:
     from app.tools.inspect_streams import _usable_table_name
 
     streams = context.meta.get("streams", []) or []
-    main_table_meta = context.meta.get("main_table") or {}
-    if not isinstance(main_table_meta, dict):
-        main_table_meta = {}
 
-    # --- 缺省表名：**两条加载路径的 meta 形态不同，必须分别处理** --------------
+    # 缺省表名与规模：**统一经 _data_access 的共享实现**，不自带一套。
     #
-    # 这是本工具最容易出错的地方（实测踩中）：
-    #   - 目录型加载（load_dataset.py:2369-2371）：main_table = {file, name,
-    #     selection:{selected, reason, candidates:[{name,nrows,ncols}]}}
-    #     → name 就是「state.csv」，**可直接用作 table 名**；
-    #   - 单文件加载（load_dataset.py:2613-2626）：main_table = {name, reason,
-    #     candidates:[{table_name,rows,cols}]}
-    #     → **name 是裸节点路径「state/joint」，不能用作 table 名**，
-    #       可用名在 candidates[*].table_name（「joints::state/joint」）。
-    #
-    # 若一律直接读 name，HDF5/MCAP 单文件场景下 is_default 永远为 False——
-    # 而这恰是最需要 is_default 的场景（几十个节点，模型分不清当前是哪张）。
-    # 故统一从 candidates 反查可用名，找不到才退回 name。
-    #
-    # **candidates 的位置也随路径而变**（实测）：
-    #   - 目录型：main_table["selection"]["candidates"]（name/nrows/ncols）
-    #   - 单文件型：main_table["candidates"]（table_name/rows/cols）
-    # 故两处都要取，合并后再查。
-    selection = main_table_meta.get("selection") or {}
-    if not isinstance(selection, dict):
-        selection = {}
-    candidates = list(main_table_meta.get("candidates") or [])
-    candidates.extend(selection.get("candidates") or [])
-    selected_name = selection.get("selected")
-
-    default_table: str | None = None
-    if selected_name:
-        # 目录型：selected 即可用表名（如 state.csv）。
-        default_table = str(selected_name)
-    else:
-        # 单文件型：main_table.name 是**裸节点/裸 topic**，须从 candidates 的
-        # table_name 里找含该节点的条目，取其完整可用名。
-        raw_name = main_table_meta.get("name")
-        if raw_name:
-            raw_str = str(raw_name)
-            for c in candidates:
-                cand_name = c.get("table_name") or c.get("name")
-                if not cand_name:
-                    continue
-                # 匹配「joints::state/joint」的末段 == 「state/joint」。
-                if str(cand_name) == raw_str or str(cand_name).endswith("::" + raw_str):
-                    default_table = str(cand_name)
-                    break
-            if default_table is None:
-                # 找不到对应候选：原样透出，但其不匹配任何表 → is_default 恒 False，
-                # 避免给出一个"照抄必失败"的假可用名。
-                default_table = raw_str
+    # 为什么必须共享（2026-09-21 实测踩中）：`meta["main_table"]["name"]` **不是
+    # 可靠的表名**，且 candidates 的位置随加载路径而变（目录型在
+    # `selection.candidates` 用 name/nrows/ncols；单文件型在顶层 `candidates`
+    # 用 table_name/rows/cols）。若本工具另写一套解析，一旦与
+    # `resolve_table_name` 的口径分叉，就会出现"清单给的 default_table 与
+    # 不传 table 时实际分析的表不是同一张"的静默错位——比报错更危险。
+    # 故统一调用 `resolve_default_table_name` / `main_table_candidates`。
+    default_table = resolve_default_table_name(context)
     default_lower = default_table.strip().lower() if default_table else None
 
     # 规模来源：流登记项的 n_rows/n_cols **只在容器子流（h5 节点/mcap topic）上存在**，
@@ -151,7 +114,7 @@ def list_tables_impl(context: RunContext) -> dict[str, Any]:
     # 为什么必须从这里取：否则模型看到全部 rows=None，无法判断"哪张是明细表、
     # 哪张是 2 行的清单"，本工具"给出规模"的核心价值即归零。
     size_by_name: dict[str, tuple[Any, Any]] = {}
-    for c in candidates:
+    for c in main_table_candidates(context):
         # 目录路径用 name（=文件名），单文件路径用 table_name（=stem::node）。
         key = c.get("table_name") or c.get("name")
         if key:

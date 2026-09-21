@@ -22,6 +22,14 @@ _SUCCESS_COLS = ("success", "successful", "done")
 # 关节列前缀（状态/动作）。
 _JOINT_PREFIXES = ("qpos", "qvel", "qacc", "joint")
 
+# 「表不存在」错误里附带可用清单的条数上限（体积护栏）。
+#
+# 为什么需要：真实数据集 ``aligned_joints.h5`` 的「每帧一组」布局在早期实现里
+# 登记出 84,810 条流（docs/行为测试.md:623-630），虽已合并到数十条，但 MCAP
+# 多 topic、超大规模目录仍可能上百。给清单是为了让模型**自我纠正**，不是让它
+# 读完整目录——超限时截断但仍如实声明总数。
+_MAX_AVAILABLE_TABLES = 60
+
 
 def find_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
     """在 df 中查找候选列（大小写不敏感）。
@@ -574,6 +582,90 @@ def expand_with_focus(
     return expand_envelope(df, focus=names)
 
 
+def get_main_table_meta(context: RunContext) -> dict[str, Any]:
+    """取 ``meta["main_table"]``，并保证返回 dict（可能是 None/缺失）。
+
+    Args:
+        context: 运行时上下文。
+
+    Returns:
+        main_table 元信息字典（缺失时返回空 dict）。
+    """
+    meta = context.meta.get("main_table")
+    return meta if isinstance(meta, dict) else {}
+
+
+def main_table_candidates(context: RunContext) -> list[dict[str, Any]]:
+    """取主表候选清单，**统一两条加载路径的位置差异**（唯一取用点）。
+
+    load_dataset 的两条加载路径写入的 meta 形态不同（实测）：
+
+    - 目录型（``load_dataset.py:2369-2371``）：候选在
+      ``main_table["selection"]["candidates"]``，字段为 ``name / nrows / ncols``；
+    - 单文件型（``load_dataset.py:2613-2626``）：候选在顶层
+      ``main_table["candidates"]``，字段为 ``table_name / rows / cols``。
+
+    Args:
+        context: 运行时上下文。
+
+    Returns:
+        候选字典列表（合并两处，原顺序保持）；无候选时为空列表。
+    """
+    meta = get_main_table_meta(context)
+    out: list[dict[str, Any]] = list(meta.get("candidates") or [])
+    selection = meta.get("selection")
+    if isinstance(selection, dict):
+        out.extend(selection.get("candidates") or [])
+    return out
+
+
+def resolve_default_table_name(context: RunContext) -> str | None:
+    """解析「当前缺省表」的**可用表名**（唯一权威实现）。
+
+    **为什么需要这个函数**（2026-09-21 实测发现，这是本模块最易踩的坑）：
+
+    ``meta["main_table"]["name"]`` **不是可靠的表名**，两条加载路径语义不同：
+
+    - 目录型：``name`` = ``"state.csv"`` —— 可直接用作 ``table`` 参数；
+    - 单文件型：``name`` = ``"state/joint"``（**裸节点路径**）—— 照抄去调用
+      ``resolve_table_name`` **必然失败**，可用名是同目录 candidates 里的
+      ``table_name`` = ``"joints::state/joint"``。
+
+    此前直接读 ``name``，导致 HDF5/MCAP 数据集在 ``table=None`` 时返回的
+    ``table_name`` 是一个**不可回用的假表名**，并随各工具的结果标注扩散出去
+    ——这正是 2026-09-20「清单与调用口径自相矛盾」事故的同型缺陷。
+
+    解析顺序：目录型的 ``selection.selected`` 优先（它本身就是可用名）；
+    否则用 ``name`` 去 candidates 里按「完全相等」或「以 ``::<name>`` 结尾」
+    反查，取完整可用名；反查不到才退回原 ``name``。
+
+    Args:
+        context: 运行时上下文。
+
+    Returns:
+        可用表名；无主表（纯媒体数据集）时返回 None。
+    """
+    meta = get_main_table_meta(context)
+    selection = meta.get("selection")
+    if isinstance(selection, dict) and selection.get("selected"):
+        # 目录型：selected 即文件名，本身就是可用名。
+        return str(selection["selected"])
+
+    raw_name = meta.get("name")
+    if not raw_name:
+        return None
+    raw_str = str(raw_name)
+    for c in main_table_candidates(context):
+        cand_name = c.get("table_name") or c.get("name")
+        if not cand_name:
+            continue
+        cand_str = str(cand_name)
+        if cand_str == raw_str or cand_str.endswith("::" + raw_str):
+            return cand_str
+    # 反查不到：如实返回原名（下游按名匹配会失败，但不伪造可用名）。
+    return raw_str
+
+
 def resolve_table_name(
     context: RunContext,
     table: str | None,
@@ -596,7 +688,8 @@ def resolve_table_name(
 
     Returns:
         dict，含 success、df、table_name、dataset、source；表不存在时
-        success=False 且 error="table_not_found"。
+        success=False 且 error="table_not_found"，并附 ``available_tables``
+        （全部可用表名清单，供模型自我纠正）与 ``default_table``（当前缺省表）。
     """
     dataset_id = context.dataset_id
     # 未加载任何数据集：无论是否指定表都返回 no_data_loaded（优先于表不存在）。
@@ -621,7 +714,11 @@ def resolve_table_name(
         result = {
             "success": df is not None,
             "df": df,
-            "table_name": context.meta.get("main_table", {}).get("name"),
+            # **必须用 resolve_default_table_name 而非直接读 name**（2026-09-21）：
+            # 单文件（h5/mcap）加载路径下 meta["main_table"]["name"] 是裸节点路径
+            # （如 "state/joint"），直接透出会得到一个**照抄必失败**的表名，
+            # 并随各工具的结果标注扩散——同型于 2026-09-20 事故。
+            "table_name": resolve_default_table_name(context),
             "dataset": dataset_id,
             "source": "main",
         }
@@ -751,8 +848,17 @@ def resolve_table_name(
     # "可用表见流登记表/inspect_streams 的表格流清单"，而 agent 照 inspect_streams
     # 的 `source`（完整路径）抄表名**必然失败**——既没示例可对照，也没说明格式
     # 要求，于是"能力可达"被误判为"工具不支持"。
+    #
+    # 【阶段 2，2026-09-21】此前只给 **3 个示例**，模型无从判断"是真的没有这张表，
+    # 还是我写法不对"，只能放弃或凭猜重试。现改为返回**完整可用清单**
+    # （available_tables，受 _MAX_AVAILABLE_TABLES 上限保护）与 default_table，
+    # 使模型能据清单自我纠正。纪律不变：**仍不做模糊/子串猜表**（防误命中，
+    # 见 docs/表访问与跨表改造设计.md:83-84）——给清单，但不替模型做匹配。
     usable: list[str] = []
     for s in context.meta.get("streams", []):
+        # 视频不是表，不列入候选（口径与 inspect_streams 的 n_table_streams 一致）。
+        if s.get("kind") == "video":
+            continue
         p = s.get("path", "")
         if not p:
             continue
@@ -763,14 +869,35 @@ def resolve_table_name(
                 usable.append(f"{Path(fp).stem}::{sub_name}")
         else:
             usable.append(Path(p).name)
-    examples = usable[:3]
+    # 去重且保持原顺序（同一 path 可能有重复登记）。
+    seen: set[str] = set()
+    usable_unique: list[str] = []
+    for n in usable:
+        if n not in seen:
+            seen.add(n)
+            usable_unique.append(n)
+
+    default_table = resolve_default_table_name(context)
+    shown = usable_unique[:_MAX_AVAILABLE_TABLES]
+    truncated_tables = len(usable_unique) > _MAX_AVAILABLE_TABLES
+    table_hint = (
+        f"当前可用表共 {len(usable_unique)} 张"
+        + (f"（此处列出前 {_MAX_AVAILABLE_TABLES} 张）：{shown}"
+           if truncated_tables else f"：{shown}")
+        + "。"
+        if usable_unique
+        else "当前数据集没有可作为分析对象的表。"
+    )
     hint = (
         f"表名形如「<文件stem>::<节点>」（h5/mcap 子流，**不含扩展名**）"
-        f"或「<文件名>」（独立文件）。"
-        + (f"当前可用的前几个表名：{examples}。" if examples else "")
-        + "完整清单见 inspect_streams 返回里各条流的 table_name 字段。"
+        f"或「<文件名>」（独立文件）。{table_hint}"
+        + (
+            f"若你想分析的是主表，不传 table 参数即可（当前缺省表是 {default_table}）。"
+            if default_table else ""
+        )
+        + "也可用 list_tables 工具查看完整清单与各表规模。"
     )
-    return {
+    result: dict[str, Any] = {
         "success": False,
         "error": "table_not_found",
         "reason": f"数据集中不存在表 {table}",
@@ -778,11 +905,16 @@ def resolve_table_name(
         "table_name": table,
         "dataset": dataset_id,
         "source": "error",
-        "available_examples": examples,
+        "available_examples": shown[:3],
+        # 【阶段 2】完整可用清单 + 缺省表：让模型能自行纠正，而不是直接放弃。
+        "available_tables": shown,
+        "available_tables_truncated": truncated_tables,
+        "default_table": default_table,
         "user_message": (
             f"当前数据集 {dataset_id} 中不存在表 {table}。{hint}"
         ),
     }
+    return result
 
 
 def locate_action_table(context: RunContext) -> tuple[pd.DataFrame | None, str | None]:
