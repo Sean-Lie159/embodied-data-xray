@@ -1122,6 +1122,117 @@ def read_hdf5_nodes_metadata(
     return out
 
 
+def pick_container_master_clock(
+    path: str, nodes: list[str]
+) -> str | None:
+    """在容器内挑出**主时钟**节点（供无时间戳的子流按帧序回退）。
+
+    为什么需要（2026-09-21）：真实数据集 ``aligned_joints.h5`` 里 27 条
+    action/state 流与 ``main_timestamp`` **共享同一 14135 帧**，事实上可时间
+    对齐，但它们自身无时间戳列 → ``align_container_streams`` 报
+    ``no_timestamp``，用户拿不到"帧 ↔ 时间"映射。
+
+    选取规则（确定性，不猜；结果必须告知用户）：
+        1. 名称为 ``main_timestamp`` 的节点**优先**（语义最明确）；
+        2. 否则取**非相机**的时间戳节点（路径含 timestamp 但不含 camera）；
+        3. 多个候选时按节点名字典序取首（保证可复现）。
+
+    Args:
+        path: 容器文件路径。
+        nodes: 候选节点名清单（容器内全部子流）。
+
+    Returns:
+        主时钟节点名；无合适候选返回 None。
+    """
+    def _is_ts_node(n: str) -> bool:
+        leaf = n.rsplit("/", 1)[-1]
+        return bool(
+            is_timestamp_like_field(leaf) or is_timestamp_like_field(n)
+        )
+
+    ts_nodes = [n for n in nodes if _is_ts_node(n)]
+    if not ts_nodes:
+        return None
+    # 规则 1：main_timestamp 优先。
+    for n in ts_nodes:
+        if n.rsplit("/", 1)[-1].lower() == "main_timestamp":
+            return n
+    # 规则 2：排除相机时间戳（它们是各相机自身时刻，不是全局主时钟）。
+    non_camera = [n for n in ts_nodes if "camera" not in n.lower()]
+    pool = non_camera or ts_nodes
+    # 规则 3：字典序取首（可复现）。
+    return sorted(pool)[0]
+
+
+def read_frame_index_aligned_master_clock(
+    path: str,
+    sub: str,
+    master_node: str,
+) -> tuple[np.ndarray | None, str]:
+    """按 **frame_index 严格校验**后用容器主时钟给子流配时间轴。
+
+    **四个条件必须同时满足**才回退（见 docs/帧序时间轴回退设计.md §3.1），
+    任一不满足即返回 (None, 原因) —— 宁可如实报"无时间轴"，也不做可能错误的
+    对齐：
+
+        1. 子流带 ``frame_index`` 列；
+        2. 主时钟行数 == 子流行数 == ``frame_index`` 唯一值个数；
+           （**不做截断/补齐**——帧数一致必须是真的逐帧对应）
+        3. ``frame_index`` 是 0…N-1 连续整数（无重复、无缺口、无乱序）；
+        4. 主时钟可读出且长度非零。
+
+    为什么要校验得这么死：帧数相同**可能是巧合同长**，不能据此认定逐帧对应；
+    真实数据集里 txt 侧 14140~14142 行 vs h5 侧 14135 帧就不一致。只有
+    ``frame_index`` 的连续性 + 严格等长才能证明是同一帧序。
+
+    Args:
+        path: 容器文件路径。
+        sub: 子流节点名（自身无时间戳列者）。
+        master_node: 主时钟节点名。
+
+    Returns:
+        (时间戳数组, 依据说明)；不满足条件返回 (None, 不满足的原因)。
+    """
+    try:
+        df = read_hdf5_node(path, sub)
+        if df is None or df.empty:
+            return (None, "该子流读取失败或为空")
+        if "frame_index" not in df.columns:
+            return (None, "该子流无 frame_index 列，无法建立帧序对应")
+
+        fi = pd.to_numeric(df["frame_index"], errors="coerce")
+        if fi.isna().any():
+            return (None, "该子流 frame_index 含非法值")
+        fi_arr = fi.to_numpy()
+        n_rows = len(fi_arr)
+        uniq = np.unique(fi_arr)
+
+        if len(uniq) != n_rows:
+            return (None, f"该子流 frame_index 有重复（{n_rows} 行 / "
+                          f"{len(uniq)} 个唯一值），帧序不唯一")
+        if uniq[0] != 0 or uniq[-1] != n_rows - 1:
+            return (None, f"该子流 frame_index 非 0..{n_rows - 1} 连续"
+                          f"（实际 {uniq[0]}..{uniq[-1]}）")
+
+        master_df = read_hdf5_node(path, master_node)
+        if master_df is None or master_df.empty:
+            return (None, f"主时钟节点 {master_node} 读取失败")
+        # 主时钟单列（剥离 frame_index 辅助列）。
+        cand = [c for c in master_df.columns if str(c) != "frame_index"]
+        if not cand:
+            return (None, f"主时钟节点 {master_node} 无可用的时间列")
+        ts = pd.to_numeric(master_df[cand[0]], errors="coerce").to_numpy()
+        if len(ts) == 0:
+            return (None, f"主时钟节点 {master_node} 长度为 0")
+        if len(ts) != n_rows:
+            return (None, f"主时钟长度（{len(ts)}）与子流行数（{n_rows}）"
+                          f"不一致，不做截断/补齐对齐")
+
+        return (ts, f"frame_index 逐帧对应，{n_rows} 帧严格一致")
+    except Exception as e:  # noqa: BLE001
+        return (None, f"帧序校验失败：{type(e).__name__}")
+
+
 def _dataset_to_frame(data: Any) -> pd.DataFrame | None:
     """把 h5py 数据集内容转为 DataFrame（含 compound 子数组字段的降级处理）。"""
     try:

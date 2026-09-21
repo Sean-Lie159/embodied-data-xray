@@ -271,6 +271,21 @@ def align_container_streams_impl(
         # 同一容器文件（本工具的 target_file）一次性取齐。
         mcap_ts = read_mcap_all_timestamps(target_file, list(mcap_paths))
 
+    # 容器主时钟（供无时间戳子流按帧序回退）——见 docs/帧序时间轴回退设计.md。
+    #
+    # 背景：真实数据集 aligned_joints.h5 里 27 条 action/state 流与
+    # ``main_timestamp`` 共享同一 14135 帧（frame_index 0..14134 逐帧对应），
+    # 事实上可时间对齐，但它们自身无时间戳列 → 全部报 no_timestamp，用户拿不到
+    # "帧 ↔ 时间"映射。本节按**严格校验**（frame_index 连续 + 长度严格一致）后
+    # 用主时钟配轴，并**全程标注时间轴来源**（不得让用户误以为该流自带时间戳）。
+    master_clock_node: str | None = None
+    if any(s.get("format") == "h5" for s in subs):
+        from app.tools.load_dataset import pick_container_master_clock
+
+        master_clock_node = pick_container_master_clock(
+            target_file, [s.get("path", "").partition("::")[2] for s in subs]
+        )
+
     rows: list[dict[str, Any]] = []
     for s in subs:
         spec = s.get("path", "")
@@ -281,15 +296,60 @@ def align_container_streams_impl(
         else:
             timing = _stream_timing(spec)
         label = s.get("semantic_label") or s.get("kind") or ""
-        if timing is None:
+        if timing is not None:
+            # 自带时间戳列（原有情形）。
             rows.append({
-                "sub": sub_name, "label": label, "status": "no_timestamp",
-                "reason": "该子流无时间戳字段（或读取失败）",
+                "sub": sub_name, "label": label, "status": "ok",
+                "time_source": "stream", **timing,
             })
             continue
-        rows.append({"sub": sub_name, "label": label, "status": "ok", **timing})
+        # 自身无时间戳列 → 尝试按帧序回退到容器主时钟（严格校验后才用）。
+        if (s.get("format") == "h5" and master_clock_node
+                and sub_name != master_clock_node):
+            from app.tools.load_dataset import (
+                read_frame_index_aligned_master_clock,
+            )
+
+            ts_arr, basis = read_frame_index_aligned_master_clock(
+                target_file, sub_name, master_clock_node)
+            if ts_arr is not None:
+                from app.tools.timestamp_units import infer_unit
+
+                unit = infer_unit(ts_arr, master_clock_node)["unit"]
+                timing = _timing_from_array(ts_arr, unit)
+                if timing is not None:
+                    rows.append({
+                        "sub": sub_name, "label": label, "status": "ok",
+                        # **可溯源**：明确这是容器主时钟，非该流自身携带。
+                        "time_source": "container_master",
+                        "time_source_node": master_clock_node,
+                        "time_source_basis": basis,
+                        **timing,
+                    })
+                    continue
+            rows.append({
+                "sub": sub_name, "label": label, "status": "no_timestamp",
+                "time_source": "none",
+                "reason": f"该子流无时间戳字段，且无法按帧序回退到容器主时钟"
+                          f"（{basis}）。"
+                          + ("注意：每帧多行的流（如双手 (2,4) 布局）其 "
+                             "frame_index 会重复，按逐帧 1:1 校验不通过——"
+                             "这是**有意的严格校验**，不做截断/补齐式对齐。"
+                             if "重复" in basis else ""),
+            })
+            continue
+        rows.append({
+            "sub": sub_name, "label": label, "status": "no_timestamp",
+            "time_source": "none",
+            "reason": "该子流无时间戳字段（或读取失败）",
+        })
 
     ok_rows = [r for r in rows if r["status"] == "ok"]
+    # 区分"自带时间戳"与"按容器主时钟回退"——不得混计，否则用户会误以为
+    # 回退的那些流自身也有时间戳。
+    own_ts_rows = [r for r in ok_rows if r.get("time_source") == "stream"]
+    fallback_rows = [r for r in ok_rows
+                     if r.get("time_source") == "container_master"]
     if not ok_rows:
         return {
             "success": False,
@@ -301,7 +361,15 @@ def align_container_streams_impl(
         }
 
     # 主时钟 = 跨度最大者（覆盖最全，作对齐参照）。
-    master = max(ok_rows, key=lambda r: r["span_s"])
+    #
+    # **但优先取真正的时钟节点**（2026-09-21）：帧序回退的流（time_source=
+    # container_master）其时间轴是**从主时钟借来的**——若让它们参选，回退流会
+    # 与主时钟同跨度而在 max() 中按字典序"赢"过 main_timestamp，导致
+    # master 报成 action/joint/position 这种数据流（实测已发生）。主时钟必须是
+    # 时钟节点本身，故把回退流排除在候选外；仅有回退流时则回报其来源节点。
+    own_clock_rows = [r for r in own_ts_rows]
+    master_pool = own_clock_rows or ok_rows
+    master = max(master_pool, key=lambda r: r["span_s"])
     master_start, master_span = master["start_ns"], master["span_s"]
 
     warnings: list[str] = []
@@ -353,12 +421,32 @@ def align_container_streams_impl(
     # 只在一侧存在"，不补齐缺失侧。真实案例 h5 6 路 vs 目录 9 路。
     camera_note = _collect_camera_names(context, target_file)
 
+    # 回退说明（诚实性核心，见设计文档 §3.3）：必须让用户知道这部分时间轴
+    # **来自容器主时钟、非该流自身携带**，否则会误以为每个传感器都独立打了时间戳。
+    fallback_note: str | None = None
+    if fallback_rows:
+        fb_names = [r["sub"] for r in fallback_rows]
+        sample = "、".join(fb_names[:3]) + ("…" if len(fb_names) > 3 else "")
+        fallback_note = (
+            f"另有 {len(fallback_rows)} 条子流（如 {sample}）**自身无时间戳列**，"
+            f"但经 frame_index 与容器主时钟 {master_clock_node} 逐帧严格校验一致"
+            f"（{fallback_rows[0].get('time_source_basis')}），"
+            f"已按容器主时钟给出对齐。**这些流的时间轴来自容器主时钟、"
+            f"非自身携带**（见各行 time_source=container_master），"
+            f"不得据此认为它们自带时间戳。"
+        )
+
     return {
         "success": True,
         "dataset": context.dataset_id,
         "container": Path(target_file).name,
         "n_substreams": len(subs),
-        "n_with_timestamp": len(ok_rows),
+        # **拆开计数**（设计文档 §3.3）：n_with_timestamp 只含自身有时间戳的流，
+        # 回退得到的另计 n_by_container_clock——不混计，避免用户误以为 27 条
+        # 流自身都有时间戳。
+        "n_with_timestamp": len(own_ts_rows),
+        "n_by_container_clock": len(fallback_rows),
+        "container_master_clock": master_clock_node,
         "truncated": truncated,
         "master": {"sub": master["sub"], "span_s": master["span_s"],
                    "rate_hz": master["rate_hz"]},
@@ -369,11 +457,14 @@ def align_container_streams_impl(
         "camera_coverage": camera_note,
         "user_message": (
             f"容器 {Path(target_file).name}：{len(ok_rows)}/{len(subs)} 个子流"
-            f"有可用时间戳；主时钟为 {master['sub']}（跨度 {master['span_s']}s，"
+            f"可参与时间对齐（其中 {len(own_ts_rows)} 条自带时间戳"
+            + (f"，{len(fallback_rows)} 条按容器主时钟回退" if fallback_rows else "")
+            + f"）；主时钟为 {master['sub']}（跨度 {master['span_s']}s，"
             f"约 {master['rate_hz']}Hz）。"
             + (f" 发现 {len(warnings)} 条可疑：{'；'.join(warnings[:3])}"
                + ("…" if len(warnings) > 3 else "") if warnings else " 各子流首尾对齐良好。")
             + (" （子流数超上限，已截断）" if truncated else "")
+            + (f" {fallback_note}" if fallback_note else "")
             + (f" {clock_note}" if clock_note else "")
             + (f" {camera_note['note']}" if camera_note.get("note") else "")
         ),
@@ -403,9 +494,19 @@ def align_container_streams(
 
     Returns:
         dict，含 container、master（主时钟子流）、streams（逐子流 采样率/
-        跨度/样本数/缺口数/相对主时钟首尾偏移/截断标注）、warnings、
+        跨度/样本数/缺口数/相对主时钟首尾偏移/截断标注/``time_source``）、
+        warnings、``n_with_timestamp``（**仅自身有时间戳的流数**）、
+        ``n_by_container_clock``（按容器主时钟回退得到的流数）、
+        ``container_master_clock``（回退所用的主时钟节点名）、
         camera_coverage（相机路数对称性：h5 内路数 vs camera/ 目录 txt 路数，
         含 only_in_h5 / only_in_dir / note）、user_message。
-        **相机路数可能不对称**——本工具只如实标注存在哪侧，不补齐缺失侧。
+
+    两点诚实性约束：
+
+    - **帧序回退**：自身无时间戳的子流，若能经 ``frame_index`` 与容器主时钟
+      **严格校验一致**（连续且长度相等），则按主时钟配轴，并标注
+      ``time_source="container_master"`` + ``time_source_node`` + 依据。
+      这类流**不计入** ``n_with_timestamp``。
+    - **相机路数可能不对称**：本工具只如实标注存在哪侧，不补齐缺失侧。
     """
     return align_container_streams_impl(wrapper.context, container, max_streams)
