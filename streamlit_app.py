@@ -179,22 +179,75 @@ def _run_agent_turn(service, prompt: str, body_placeholder,
     final_turn = None
     # 流式期间累积的过程快照（供实时渲染"思考中"）。
     live_steps: list = []
-    for chunk in service.reply_stream(prompt):
-        if chunk.kind == "reasoning":
-            _merge_live_step(live_steps, "reasoning", chunk.text)
-            if process_placeholder is not None:
-                with process_placeholder.container():
-                    render_reasoning_and_steps(live_steps, streaming=True)
-        elif chunk.kind == "tool":
-            _merge_live_step(live_steps, "tool", chunk.text)
-            if process_placeholder is not None:
-                with process_placeholder.container():
-                    render_reasoning_and_steps(live_steps, streaming=True)
-        elif chunk.kind == "delta":
-            acc += chunk.text
-            body_placeholder.markdown(acc + STREAM_CURSOR)
-        elif chunk.kind == "final":
-            final_turn = chunk.turn
+
+    # ---- 过程区渲染节流（2026-09-22 事故后新增）----
+    #
+    # **为什么必须节流**：reasoning 事件是**逐 token** 到达的（真实事故：
+    # 单轮 8501 个事件）。若对每个增量都执行"新建容器 + 全量重渲染"，
+    # 渲染成本随事件数**平方级增长** → 脚本跑 196 秒后被 Streamlit 执行控制
+    # 中断（StopException）→ 整轮内容丢失。详见
+    # docs/流式渲染节流与中断恢复设计.md。
+    #
+    # 策略：时间 + 字符双阈值（任一满足即渲染），把渲染次数与思考速度**解耦**；
+    # 收尾时**无条件**渲染一次，保证最终内容完整。
+    from app.ui.constants import (
+        PROCESS_RENDER_INTERVAL_S as _RENDER_INTERVAL_S,
+        PROCESS_RENDER_MIN_CHARS as _RENDER_MIN_CHARS,
+    )
+
+    import time as _time
+
+    _proc_dirty = False        # 是否有尚未渲染的过程增量
+    _proc_last_render = _time.monotonic()
+    _proc_pending_chars = 0    # 距上次渲染累积的字符数
+
+    def _flush_process(*, force: bool = False) -> None:
+        """按节流策略渲染过程区（force=True 时忽略阈值强制渲染）。"""
+        nonlocal _proc_dirty, _proc_last_render, _proc_pending_chars
+        if process_placeholder is None or not _proc_dirty:
+            return
+        if not force:
+            elapsed = _time.monotonic() - _proc_last_render
+            if (elapsed < _RENDER_INTERVAL_S
+                    and _proc_pending_chars < _RENDER_MIN_CHARS):
+                return
+        with process_placeholder.container():
+            render_reasoning_and_steps(live_steps, streaming=True)
+        _proc_dirty = False
+        _proc_last_render = _time.monotonic()
+        _proc_pending_chars = 0
+
+    try:
+        for chunk in service.reply_stream(prompt):
+            if chunk.kind == "reasoning":
+                _merge_live_step(live_steps, "reasoning", chunk.text)
+                _proc_dirty = True
+                _proc_pending_chars += len(chunk.text or "")
+                _flush_process()
+            elif chunk.kind == "tool":
+                _merge_live_step(live_steps, "tool", chunk.text)
+                _proc_dirty = True
+                _proc_pending_chars += len(chunk.text or "")
+                # 工具播报是稀疏且重要的节点，直接渲染（不等阈值）。
+                _flush_process(force=True)
+            elif chunk.kind == "delta":
+                acc += chunk.text
+                body_placeholder.markdown(acc + STREAM_CURSOR)
+            elif chunk.kind == "final":
+                final_turn = chunk.turn
+    except BaseException as _exc:  # noqa: BLE001
+        # **中断恢复（关键）**：此前此处抛异常会让 `_record_turn` 永不执行
+        # → assistant 消息从未写入 messages → 刷新后**整轮内容丢失且无提示**。
+        # 现在：先把已产出的过程渲染出去（用户至少看得到做到哪一步），
+        # 再重新抛出由调用方转成"可见的失败轮"（内容不丢、可重试）。
+        if isinstance(_exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        _flush_process(force=True)
+        raise
+
+    # 收尾：无条件渲染一次（节流只影响中间过程，不影响最终状态）。
+    _flush_process(force=True)
+
     if final_turn is None:
         # 理论上不会发生（reply_stream 必 yield final）；兜底为空轮。
         final_turn = service.reply(prompt)
@@ -217,6 +270,66 @@ def _merge_live_step(steps: list, kind: str, text: str) -> None:
         steps[-1].text += text
     else:
         steps.append(StreamStep(kind=kind, text=text))
+
+
+def _build_interrupted_turn(exc: BaseException) -> ChatTurn:
+    """把「本轮被中断」转成**可见、可重试、可持久**的失败轮。
+
+    为什么必须在 UI 层兜底（2026-09-22 事故）：`_record_turn` 在
+    ``_run_agent_turn`` **返回之后**才执行，因此任何异常都会让 assistant
+    消息**从未写入 messages** —— 用户刷新后整轮内容凭空消失，且因为
+    Streamlit 的 ``StopException`` 属控制流异常（不显示红框），**毫无提示**。
+
+    本函数保证三件事：
+    1. **不丢**：产出一个完整 ChatTurn，供 `_record_turn` 写进 messages；
+    2. **说明白**：区分 ``StopException``（执行被中断，通常是任务量过大）
+       与其它异常，给出**可操作的建议**；
+    3. **可恢复**：标 ``completed=False``，UI 会渲染"重试本轮"入口。
+
+    Args:
+        exc: 捕获到的异常。
+
+    Returns:
+        失败轮 ChatTurn。
+    """
+    from app.services.chat_service import ChatTurn
+
+    name = type(exc).__name__
+    # StopException：Streamlit 的执行控制信号。真实事故（2026-09-22）中，
+    # 单轮 4 项分析导致思考链极长、UI 逐 token 重渲染耗时 196 秒，
+    # 触发 Streamlit 中断。用户应"拆分提问"而非重试同样的超大轮次。
+    is_stop = name == "StopException"
+    if is_stop:
+        reply = (
+            "**本轮因执行时间过长被中断**（不是数据或分析本身的问题）。\n\n"
+            "常见原因是**单轮包含的任务过多**：任务越多 → 模型思考链越长 → "
+            "界面渲染耗时越高，最终触发执行超时。\n\n"
+            "**建议**：把问题拆成几次提问（例如先「加载数据」，再「时间对齐」，"
+            "再「质检」，最后「对称性对比」），每次聚焦一件事。\n\n"
+            "已产出的思考过程仍可在上方查看；本轮记录已保留，可直接重试。"
+        )
+    else:
+        reply = (
+            f"**本轮未能完成**（执行过程异常：{name}）。\n\n"
+            "这通常不是数据或分析本身的问题。可以直接重试本轮；"
+            "若反复出现，请检查模型服务状态与 `.env` 配置。"
+        )
+
+    return ChatTurn(
+        reply=reply,
+        tool_activity="",
+        metrics={
+            "completed": False,
+            "error_kind": "interrupted" if is_stop else "ui_exception",
+            "duration_ms": 0,
+            "n_model_calls": 0,
+            "n_tool_calls": 0,
+        },
+        error=(
+            "本轮被中断（执行时间过长）。" if is_stop
+            else f"本轮未正常完成：{name}"
+        ),
+    )
 
 
 def _is_failed(turn) -> bool:
@@ -517,7 +630,21 @@ def _main() -> None:
                     # 二者互不覆盖，过程得以保留（此前共用一个会被覆写的格子）。
                     process_ph = st.empty()
                     body_ph = st.empty()
-                    turn = _run_agent_turn(service, prompt, body_ph, process_ph)
+                    # ---- 中断恢复：整轮不得静默丢失 ----
+                    #
+                    # 此前 `_run_agent_turn` 抛异常时脚本中断、assistant 消息
+                    # **永不写入 messages** → 刷新后整轮内容丢失且无任何提示。
+                    # 这违反「诚实降级」原则。
+                    #
+                    # 现在兜底成"可见的失败轮"：即使失败也要
+                    # ① 显示明确原因；② 写入 messages（刷新后仍在）；③ 可重试。
+                    try:
+                        turn = _run_agent_turn(
+                            service, prompt, body_ph, process_ph)
+                    except BaseException as _exc:  # noqa: BLE001
+                        if isinstance(_exc, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        turn = _build_interrupted_turn(_exc)
                     render_tool_activity(turn)
 
             # 累计本轮统计并追加 assistant 消息（集中入口，防漏加）。

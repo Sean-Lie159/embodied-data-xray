@@ -12,7 +12,11 @@ import streamlit as st
 
 from app.config import get_settings
 from app.services.chat_service import ChatTurn
-from app.ui.constants import REASONING_BOX_HEIGHT, REASONING_BOX_TITLE
+from app.ui.constants import (
+    PROCESS_RENDER_MAX_BLOCKS as _PROCESS_RENDER_MAX_BLOCKS,
+    REASONING_BOX_HEIGHT,
+    REASONING_BOX_TITLE,
+)
 
 
 def _harmonize_steps(steps: list) -> list[str]:
@@ -53,20 +57,38 @@ def render_reasoning_and_steps(steps: list, *, streaming: bool = False) -> None:
       （``autoscroll=True`` 使新增内容自动贴底，看到最新思考）；
     - **小字区分**：思考与工具播报都用 ``st.caption``。
 
+    **渲染规模上限（2026-09-22 事故后新增）**：流式渲染时 `steps` 可能极长
+    （真实事故：单轮 8501 个事件）。此处**只渲染尾部若干条**并在开头说明省略，
+    避免把超长文本反复送入渲染管线。
+
+    **注意这是渲染层的截断，不是存储层的**：持久化到 ``messages`` 的 steps
+    不截断，历史轮次展开时仍可看到完整过程（`streaming=False` 时不截断）。
+
     **优雅降级（硬性要求，见设计 5 节）**：无思考且无工具播报时**整块不渲染**
     （不显示空框）；旧会话消息无 steps 字段时同理（缺省空列表）。
 
     Args:
         steps: 过程时间线（StreamStep 列表；可为空）。
-        streaming: 是否流式进行中（True → 默认展开；历史轮次 False → 收起）。
+        streaming: 是否流式进行中（True → 默认展开 + 应用尾部截断；
+            历史轮次 False → 收起且**不截断**）。
     """
     blocks = _harmonize_steps(steps)
     if not blocks:
         return  # 降级：无过程内容则整块不渲染。
 
+    omitted = 0
+    if streaming and len(blocks) > _PROCESS_RENDER_MAX_BLOCKS:
+        # 只保留尾部：用户关心"当前在做什么"，早期步骤价值随时间递减；
+        # 保留尾部也更贴合"跟着思考走"的预期。
+        omitted = len(blocks) - _PROCESS_RENDER_MAX_BLOCKS
+        blocks = blocks[-_PROCESS_RENDER_MAX_BLOCKS:]
+
     with st.expander(REASONING_BOX_TITLE, expanded=streaming):
         # 固定高度 + 自动贴底：长摘要内部滚动，不挤占正文空间；新增内容贴底。
         with st.container(height=REASONING_BOX_HEIGHT, autoscroll=streaming):
+            if omitted:
+                # 如实说明省略（不静默）；完整内容仍在 messages 的 steps 里。
+                st.caption(f"（已省略较早的 {omitted} 条过程，完整过程见历史）")
             for block in blocks:
                 # 小字（st.caption）：与正文的 st.markdown 形成字号/透明度区分。
                 st.caption(block)
