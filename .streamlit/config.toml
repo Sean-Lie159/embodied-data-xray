@@ -18,7 +18,18 @@ primaryColor = "#2E6F8E"
 baseRadius = "medium"
 baseFontSize = 16
 # 标题层级：建立"从哪开始读"的视觉引导（h1 明显大于 h2，h3 起收紧）
-headingFontSizes = [30, 22, 18, 16, 15, 14]
+#
+# **必须带单位字符串**（2026-09-22 修复）：此前写成整数数组
+# `[30, 22, 18, 16, 15, 14]`，Streamlit 解析时会报
+# "Failed to parse the theme.headingFontSizes config option: 14" +
+# `TypeError: bad argument type for built-in operation`，导致
+# **标题字号层级完全未生效**（配置形同虚设）。
+# 依据：`HeadingFontSizes` 的每个元素是 CSS 长度字符串，不是裸数字。
+# 30px/22px/18px/16px/15px/14px 对应 h1..h6（数值与原意图一致）。
+headingFontSizes = ["30px", "22px", "18px", "16px", "15px", "14px"]
+# 字重**保持整数**（与字号相反）：Streamlit 源码明确 headingFontWeights
+# "is either an integer or a list of integers"，append 到的字段本就是数值型。
+# 因此这一项原本正确，无需修改——只有 headingFontSizes 需要带单位字符串。
 headingFontWeights = [700, 600, 600, 600, 600, 600]
 # 图表配色：与主色同族的 10 色序列
 chartCategoricalColors = [

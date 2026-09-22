@@ -329,11 +329,81 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
 }
 
 
-def guard_tools(tools: list[Any], *, budget_tokens: int) -> list[Any]:
-    """给工具套上"返回体积护栏"（第 2 层防御，安全网）。
+def _normalize_tool_input(input_json: str, tool_name: str) -> str:
+    """归一工具入参中的"空值字面量"（**所有工具的统一拦截点**）。
 
-    为什么在 agent 层统一做：即使某个工具自身漏做结构化降级，本层也保证返回
-    绝不超出预算——宁可信息不全，不可撑爆上下文导致 HTTP 400。
+    ## 为什么在 agent 层统一做（2026-09-22 真实事故）
+
+    模型经 OpenAI 兼容接口调用工具时，会把 **JSON 的 `null` 传成字符串
+    `"null"`**（上游/网关序列化的常见偏差）。工具拿到 `"null"` 不会报错，
+    而是当作合法字符串去匹配：``check_temporal_sync(baseline_stream="null")``
+    会拿 "null" 去匹配文件名（必然失败）→ 返回 ``baseline_no_match`` →
+    模型误以为参数无效而**重试整轮**（白耗一次工具循环 + 模型往返）。
+
+    同类风险遍布 14 个工具的 31 个可选参数（``table`` / ``sensor`` /
+    ``metric`` / ``columns_a`` / ``episode_key`` …）。逐个工具改必然遗漏，
+    故在**唯一经过点**（工具调用入口）统一处理。
+
+    ## 规则
+
+    - 顶层值为 ``null`` 字面量字符串（``"null"`` / ``"none"`` / ``"undefined"``
+      / `""` / `"自动"` / `"无"` 等）→ **从入参中删除**（等价于"未指定"），
+      让工具自己的缺省逻辑生效；
+    - 列表内元素为字面量 → 从列表中剔除；列表因此变空 → 删除该键；
+    - **不改动**其它值（含合法字符串、数字、布尔）。
+
+    Args:
+        input_json: SDK 传入的工具入参 JSON 字符串。
+        tool_name: 工具名（仅用于日志/调试，不影响行为）。
+
+    Returns:
+        归一后的 JSON 字符串；解析失败时**原样返回**（不干扰正常流程）。
+    """
+    import json
+
+    from app.tools._arg_normalize import NULLISH_LITERALS
+
+    try:
+        obj = json.loads(input_json) if input_json else {}
+    except (ValueError, TypeError):
+        return input_json
+    if not isinstance(obj, dict):
+        return input_json
+
+    def _is_nullish(v: Any) -> bool:
+        return isinstance(v, str) and v.strip().lower() in NULLISH_LITERALS
+
+    changed = False
+    cleaned: dict[str, Any] = {}
+    for key, value in obj.items():
+        if _is_nullish(value):
+            # 语义上等于"未指定"——删除键，交工具的缺省逻辑处理。
+            changed = True
+            continue
+        if isinstance(value, list):
+            kept = [v for v in value if not _is_nullish(v)]
+            if len(kept) != len(value):
+                changed = True
+            if not kept:
+                changed = True
+                continue  # 列表被剔空 → 删除该键（等价于未指定）
+            cleaned[key] = kept
+            continue
+        cleaned[key] = value
+
+    if not changed:
+        return input_json
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def guard_tools(tools: list[Any], *, budget_tokens: int) -> list[Any]:
+    """给工具套上"返回体积护栏"（第 2 层防御，安全网）+ 入参归一。
+
+    为什么在 agent 层统一做：
+    - **返回护栏**：即使某个工具自身漏做结构化降级，本层也保证返回绝不超出
+      预算——宁可信息不全，不可撑爆上下文导致 HTTP 400；
+    - **入参归一**：见 :func:`_normalize_tool_input`（模型把 JSON null 传成
+      字符串会导致误匹配与无谓重试）。
 
     Args:
         tools: FunctionTool 列表。
@@ -358,6 +428,11 @@ def guard_tools(tools: list[Any], *, budget_tokens: int) -> list[Any]:
                           _orig: Any = original_invoke,
                           _name: str = tool.name,
                           _droppable: tuple[str, ...] = droppable) -> Any:
+            # 入参归一（在工具执行之前）：把 'null' 之类字面量当作"未指定"。
+            try:
+                input_json = _normalize_tool_input(input_json, _name)
+            except Exception:  # noqa: BLE001
+                pass  # 归一失败不得阻断工具调用（原样透传）
             raw = await _orig(ctx, input_json)
             try:
                 return enforce_output_limit(

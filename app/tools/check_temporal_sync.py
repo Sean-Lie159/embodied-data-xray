@@ -20,6 +20,10 @@ from agents.decorators import tool
 
 from app.agent.context import RunContext
 from app.config import get_settings
+from app.tools._arg_normalize import (
+    normalize_optional_list as _normalize_optional_list,
+    normalize_optional_str as _normalize_optional_str,
+)
 from app.tools._readers import split_path_spec
 from app.tools.inspect_streams import _read_timestamp_only
 from app.tools.timestamp_units import (
@@ -772,6 +776,16 @@ def check_temporal_sync_impl(
         不直接抛出异常；错误以结构化 dict 返回。
     """
     settings = settings or get_settings()
+
+    # 入参归一（2026-09-22）：模型可能把 JSON 的 null 传成字符串 'null'，
+    # 或把列表传成单个字符串。这些在语义上等于"未指定"，必须在**匹配之前**
+    # 归一为 None——否则工具会拿 'null' 去匹配文件名（必然失败）并返回
+    # baseline_no_match，模型误以为参数无效而重试（白耗轮次）。
+    # 归一逻辑收敛在 _arg_normalize（全项目共用，避免各处重复实现）。
+    baseline_stream = _normalize_optional_str(baseline_stream)
+    streams = _normalize_optional_list(streams)
+    time_column = _normalize_optional_str(time_column)
+
     all_streams = context.meta.get("streams", [])
     capabilities = context.meta.get("capabilities", {})
 

@@ -377,6 +377,18 @@ class ChatService:
         q: "queue.Queue[Any]" = queue.Queue()
         _DONE = object()
 
+        # ---- 线程桥的健康检查与防永久阻塞 ----
+        #
+        # 背景（2026-09-22 事故定位）：后台线程经队列桥接回同步消费端。
+        # 若异常发生在 `_pump` 的 try **之外**（如 `new_event_loop()` 或
+        # `run_until_complete()` 自身崩溃），旧实现会**静默吞掉异常且不投
+        # `_DONE`** —— 消费端将**永久阻塞**在 `q.get()`，表现为"界面卡死
+        # 但 CPU 不涨、无任何报错"。
+        #
+        # 现在：`_run` 顶层补投 `(异常, _DONE)`，保证消费端**必然**能退出。
+        # 这条兜底是**永久性**的（不是临时诊断）——它把"可能永久阻塞"变成
+        # "必然优雅退出"，属于诚实降级要求。
+
         async def _pump() -> None:
             try:
                 async for ev in stream_turn(
@@ -396,8 +408,17 @@ class ChatService:
             try:
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(_pump())
+            except BaseException as exc:  # noqa: BLE001
+                # _pump 未覆盖的路径（线程级崩溃）：补投异常与 _DONE，
+                # 否则消费端永久阻塞在 q.get()。
+                q.put(exc)
+                q.put(_DONE)
             finally:
-                loop.close()
+                try:
+                    loop.close()
+                except BaseException:  # noqa: BLE001
+                    # loop 关闭失败不该覆盖已有结果；忽略（上面已投递）。
+                    pass
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
@@ -405,7 +426,30 @@ class ChatService:
         done_event = None
         try:
             while True:
-                item = q.get()
+                # **超时等待（防永久阻塞）**：30 秒无任何新事件时检查线程
+                # 存活——线程已死说明它异常退出且未能投递 _DONE，
+                # 此时**主动收尾**而不是无限等待。
+                #
+                # 为什么设 30 秒：单次工具调用（大表统计/绘图）可能耗时较长，
+                # 但**事件流中断** 30 秒意味着线程已不在工作。宁可报错退出，
+                # 不可让界面永久卡死。
+                try:
+                    item = q.get(timeout=30.0)
+                except queue.Empty:
+                    if not thread.is_alive():
+                        from app.agent.agent import TurnEvent
+
+                        done_event = TurnEvent(
+                            kind="done", final="",
+                            error=(
+                                "流式执行线程异常退出且未正常收尾"
+                                "（已主动中止以避免界面卡死）。请重试本轮。"
+                            ),
+                            next_input=None,
+                        )
+                        break
+                    # 线程仍活着：继续等待（长时间工具调用属正常）。
+                    continue
                 if item is _DONE:
                     break
                 if isinstance(item, BaseException):
