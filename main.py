@@ -50,6 +50,7 @@ from app.tools import (
     profile_data,
     confirm_dataset_profile,
     propose_stream_semantics,
+    read_file_content,
     save_annotations,
     segment_actions,
     unpack_mcap,
@@ -124,7 +125,7 @@ _CLI_TOOL_NAMES = [
     "list_tables",
     "segment_actions",
     "annotate_task", "save_annotations", "check_annotation_qc",
-    "confirm_dataset_profile",
+    "confirm_dataset_profile", "read_file_content",
 ]
 
 
@@ -162,6 +163,7 @@ def _build_main_agent() -> tuple[Agent[RunContext], list[str]]:
         save_annotations,
         check_annotation_qc,
         confirm_dataset_profile,
+        read_file_content,
     ]
     # 与 chat_service 一致：套上工具返回体积护栏（第 2 层防御）。
     # CLI 自行组装工具（不经 chat_service），故此处必须补上，否则 CLI 路径

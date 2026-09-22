@@ -233,6 +233,17 @@ action_description——当前模型不支持视觉输入，你无法看到画�
 ⑤ check_annotation_qc 的 failures（重叠/超界/序号/噪声无原因/来源用途不兼容）\
 是**必须修正**的问题，warnings 是提示（如片段间隙可能确实不属于任何动作）\
 ——两者须分别转述，不要一律说成"标注有问题"。
+19. 文件内容查看纪律（read_file_content 专用）：问"这个数据集是干什么的 /\
+采集设备是什么 / 字段怎么定义 / 标定参数是多少"时，这些信息通常在 README、\
+文档、meta/info.json、标定 JSON 里——**它们不属于数据表，但可以直接查看**，\
+**不要**说"工具够不到"或建议用户"重新加载单文件"（那会替换当前数据集，\
+且 .md 等格式本就不支持单文件加载）。用 read_file_content 读取：\
+路径可只给文件名；长文件用 keyword 定位（如 keyword="emg" 找肌电相关行）、\
+用 start_line 分段续读。三条纪律：① 该工具**返回原文，不做内容理解**——\
+你**不得**把它没返回的内容当作已知，也不得把"原文里没写"推断为"数据里没有"；\
+② content 被截断（truncated=true）时须如实告知并说明可续读；\
+③ 遇到表格类文件该工具会引导你去 profile_data/compute_stats，按引导行事，\
+不要用本工具读数据表。
 19. 表选择纪律（多表数据集，违反即分析错对象）：一个数据集常含多张表\
 （如 state.csv / accel.csv / gyro.csv，或 h5 内的多个节点）。\
 ① **不确定有哪些表时，先用 list_tables 查看清单**，不要凭文件名或上下文猜测表名；\
@@ -302,6 +313,9 @@ _TOOL_DROPPABLE: dict[str, tuple[str, ...]] = {
     "check_annotation_qc": ("failures", "warnings", "per_episode"),
     # 画像确认：内容摘要保留，明细可丢。
     "confirm_dataset_profile": ("confirmed",),
+    # 文件内容查看：content 是原文（最易膨胀且可再生——可重新读或加
+    # keyword/start_line 收窄）；路径与行数等元信息保留。
+    "read_file_content": ("content", "available_documents"),
     "compute_stats": ("per_episode", "episodes"),
     "plot_chart": (),
     "generate_report": ("report_markdown", "content"),
@@ -770,6 +784,7 @@ _TOOL_FUNCTION_TEXT: dict[str, str] = {
     "save_annotations": "正在保存标注",
     "check_annotation_qc": "正在检查标注质量",
     "confirm_dataset_profile": "正在确认数据集画像",
+    "read_file_content": "正在查看文件内容",
     "compute_stats": "正在计算统计指标",
     "plot_chart": "正在绘图",
     "generate_report": "正在生成报告",

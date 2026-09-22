@@ -57,6 +57,7 @@ from app.tools import (
     plot_chart,
     profile_data,
     propose_stream_semantics,
+    read_file_content,
     save_annotations,
     segment_actions,
     unpack_mcap,
@@ -85,6 +86,7 @@ _ALL_TOOLS = [
     save_annotations,
     check_annotation_qc,
     confirm_dataset_profile,
+    read_file_content,
 ]
 
 

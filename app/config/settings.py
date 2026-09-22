@@ -130,6 +130,13 @@ class Settings(BaseSettings):
     # 离群 episode 检测（IQR 法）的 k 值：Q1 - k*IQR / Q3 + k*IQR 之外视为离群。
     stats_outlier_k: float = Field(default=1.5, ge=0.0)
 
+    # --- 文件内容查看（read_file_content）------------------------------------
+    # 单次返回的最大字符数（默认 4000，约 1.5 页）。
+    # 依据：既要覆盖典型 README 的关键段落（设备说明/字段定义），
+    # 又不能挤占单工具返回预算（预算由 tool_output_budget_ratio 决定）。
+    # 超出时如实标注 truncated 并可用 start_line 续读。
+    read_content_max_chars: int = Field(default=4000, ge=200)
+
     # --- 指标口径（metrics_store）--------------------------------------------
     # 采样率"实测值 vs 声明值"的一致性容差（相对偏差比例）。
     # 默认 0.05（5%）——依据：Soda 的 percent_threshold 默认 0.05、

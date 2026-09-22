@@ -31,6 +31,10 @@ from app.tools.confirm_dataset import (
     confirm_dataset_profile,
     confirm_dataset_profile_impl,
 )
+from app.tools.read_file_content import (
+    read_file_content,
+    read_file_content_impl,
+)
 from app.tools.segment_actions import segment_actions, segment_actions_impl
 from app.tools.check_dataset_quality import (
     check_dataset_quality,
@@ -87,6 +91,8 @@ __all__ = [
     "segment_actions_impl",
     "confirm_dataset_profile",
     "confirm_dataset_profile_impl",
+    "read_file_content",
+    "read_file_content_impl",
     "annotate_task",
     "annotate_task_impl",
     "save_annotations",
